@@ -45,12 +45,26 @@ const defaults = {
   partial_images: 0,
 };
 
+function readJsonStorage(key, fallback) {
+  try {
+    const saved = localStorage.getItem(key);
+    return saved ? { ...fallback, ...JSON.parse(saved) } : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function persistableForm(form) {
+  const { prompt, ...settings } = form;
+  return settings;
+}
+
 function App() {
-  const [config, setConfig] = useState(() => {
-    const saved = localStorage.getItem("gpt-image-config");
-    return saved ? JSON.parse(saved) : defaultConfig;
-  });
-  const [form, setForm] = useState(defaults);
+  const [config, setConfig] = useState(() => readJsonStorage("gpt-image-config", defaultConfig));
+  const [form, setForm] = useState(() => ({
+    ...readJsonStorage("gpt-image-form-settings", defaults),
+    prompt: "",
+  }));
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -66,6 +80,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("gpt-image-config", JSON.stringify(config));
   }, [config]);
+
+  useEffect(() => {
+    localStorage.setItem("gpt-image-form-settings", JSON.stringify(persistableForm(form)));
+  }, [form]);
 
   useEffect(() => {
     fetch(`${API}/api/settings`)
@@ -527,4 +545,3 @@ function formatError(err) {
 }
 
 createRoot(document.getElementById("root")).render(<App />);
-
