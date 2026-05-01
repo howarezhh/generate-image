@@ -398,7 +398,8 @@ textarea:focus {
 }
 
 .chatPane,
-.galleryPane {
+.galleryPane,
+.promptLibrary {
   overflow: auto;
   padding: 22px;
 }
@@ -1093,6 +1094,96 @@ textarea {
   gap: 4px;
 }
 
+.promptLibrary {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+}
+
+.promptEditor {
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.055);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.promptEditor textarea {
+  min-height: 108px;
+}
+
+.promptEditorActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.promptGrid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+
+.promptCard {
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.045);
+  border-radius: 8px;
+  padding: 13px;
+  display: grid;
+  gap: 11px;
+}
+
+.promptCardMeta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.promptCardMeta span {
+  color: #2d927f;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.promptCardMeta small {
+  color: rgba(245, 243, 234, 0.54);
+  white-space: nowrap;
+}
+
+.promptCard p {
+  color: #f5f3ea;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.promptCardActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.promptCardActions button {
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  background: rgba(17, 19, 15, 0.34);
+  color: rgba(245, 243, 234, 0.8);
+  border-radius: 7px;
+  min-height: 32px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.promptCardActions button:nth-child(2) {
+  background: #eecb70;
+  color: #11130f;
+  border-color: transparent;
+}
+
 .spin {
   animation: spin 1s linear infinite;
 }
@@ -1152,7 +1243,8 @@ textarea {
   }
 
   .chatPane,
-  .galleryPane {
+  .galleryPane,
+  .promptLibrary {
     padding: 14px;
   }
 
@@ -1241,5 +1333,18 @@ textarea {
   .taskDetailActions .ghostButton,
   .taskDetailActions .secondaryButton {
     width: 100%;
+  }
+
+  .promptEditorActions {
+    display: grid;
+  }
+
+  .promptEditorActions .secondaryButton,
+  .promptEditorActions .ghostButton {
+    width: 100%;
+  }
+
+  .promptGrid {
+    grid-template-columns: 1fr;
   }
 }

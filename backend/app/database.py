@@ -94,6 +94,15 @@ def init_db() -> None:
                 created_at text not null,
                 updated_at text
             );
+
+            create table if not exists prompts (
+                id integer primary key autoincrement,
+                content text not null,
+                source text not null default 'manual',
+                mode text,
+                created_at text not null,
+                updated_at text not null
+            );
             """
         )
         ensure_column(conn, "images", "title", "text")
@@ -106,6 +115,24 @@ def init_db() -> None:
         ensure_column(conn, "tasks", "user_message_id", "integer")
         ensure_column(conn, "tasks", "assistant_message_id", "integer")
         ensure_column(conn, "tasks", "cancel_requested", "integer not null default 0")
+        ensure_column(conn, "prompts", "source", "text not null default 'manual'")
+        ensure_column(conn, "prompts", "mode", "text")
+
+
+def add_prompt(content: str, *, source: str = "manual", mode: str | None = None) -> int | None:
+    text = content.strip()
+    if not text:
+        return None
+    stamp = now_iso()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            insert into prompts (content, source, mode, created_at, updated_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (text, source, mode, stamp, stamp),
+        )
+        return int(cursor.lastrowid)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

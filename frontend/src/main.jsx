@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  BookOpen,
   Bot,
   Brush,
   Check,
@@ -164,8 +165,11 @@ function App() {
   const [openGroups, setOpenGroups] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [gallery, setGallery] = useState([]);
   const [galleryHistory, setGalleryHistory] = useState([]);
+  const [prompts, setPrompts] = useState([]);
+  const [promptDraft, setPromptDraft] = useState("");
+  const [editingPromptId, setEditingPromptId] = useState(null);
+  const [promptCopyId, setPromptCopyId] = useState(null);
   const [conversations, setConversations] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
@@ -202,6 +206,7 @@ function App() {
   useEffect(() => {
     refreshHistory();
     refreshGallery();
+    refreshPrompts();
     refreshTasks();
   }, []);
 
@@ -312,6 +317,7 @@ function App() {
     mergeTask(data.task);
     await refreshTasks();
     await refreshHistory();
+    await refreshPrompts();
     return data.task;
   }
 
@@ -344,6 +350,7 @@ function App() {
     mergeTask(result.task);
     await refreshTasks();
     await refreshHistory();
+    await refreshPrompts();
     return result.task;
   }
 
@@ -387,6 +394,7 @@ function App() {
     setChatImages([]);
     await refreshHistory();
     await refreshTasks();
+    await refreshPrompts();
     return result.task;
   }
 
@@ -458,19 +466,6 @@ function App() {
       });
       taskStatusRef.current = Object.fromEntries(items.map((task) => [task.id, task.status]));
       setTasks(items);
-      setGallery(
-        items
-          .filter((task) => ["generate", "edit"].includes(task.mode) && task.status === "done" && task.images?.length)
-          .map((task) => ({
-            prompt: task.prompt,
-            mode: task.mode,
-            images: task.images.map((image) => ({
-              ...image,
-              url: image.public_url,
-              filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
-            })),
-          }))
-      );
       setTaskMeta({ active_count: data.active_count || 0, max_concurrent: data.max_concurrent || 3 });
       if (selectedTask) {
         const latestSelected = items.find((task) => task.id === selectedTask.id);
@@ -599,6 +594,72 @@ function App() {
     } catch (err) {
       setError(describeError(err));
     }
+  }
+
+  async function refreshPrompts() {
+    try {
+      const res = await fetch(`${API}/api/prompts?limit=300`);
+      const data = await parse(res);
+      setPrompts(data.items || []);
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function savePromptEntry() {
+    try {
+      const content = promptDraft.trim();
+      if (!content) {
+        setError(describeError({ detail: { message: "提示词内容不能为空" } }));
+        return;
+      }
+      const url = editingPromptId ? `${API}/api/prompts/${editingPromptId}` : `${API}/api/prompts`;
+      const res = await fetch(url, {
+        method: editingPromptId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, source: "manual", mode: null }),
+      });
+      await parse(res);
+      setPromptDraft("");
+      setEditingPromptId(null);
+      await refreshPrompts();
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  function editPromptEntry(item) {
+    setPromptDraft(item.content || "");
+    setEditingPromptId(item.id);
+  }
+
+  async function deletePromptEntry(id) {
+    try {
+      const res = await fetch(`${API}/api/prompts/${id}`, { method: "DELETE" });
+      await parse(res);
+      if (editingPromptId === id) {
+        setPromptDraft("");
+        setEditingPromptId(null);
+      }
+      await refreshPrompts();
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function copyPromptEntry(item) {
+    try {
+      await navigator.clipboard.writeText(item.content || "");
+      setPromptCopyId(item.id);
+      setTimeout(() => setPromptCopyId(null), 1400);
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  function usePromptEntry(item) {
+    setForm((value) => ({ ...value, prompt: item.content || "" }));
+    setActiveView("studio");
   }
 
   async function loadConversation(id, { openStudio = true } = {}) {
@@ -914,6 +975,7 @@ function App() {
               ["studio", Sparkles, "工作台"],
               ["history", Clock3, "历史"],
               ["gallery", Images, "图库"],
+              ["prompts", BookOpen, "提示词"],
             ].map(([value, Icon, label]) => (
               <button key={value} className={activeView === value ? "active" : ""} onClick={() => setActiveView(value)}>
                 <Icon size={16} />
@@ -924,7 +986,7 @@ function App() {
           <div className="stageHead">
             <div>
               <p><ModeIcon size={18} /> {modeMeta.title}</p>
-              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
+              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
             </div>
             {activeView === "studio" && (
               <div className="headActions">
@@ -959,6 +1021,21 @@ function App() {
             />
           ) : activeView === "gallery" ? (
             <GalleryHistory items={galleryHistory} onRefresh={refreshGallery} onDownload={downloadImage} onUseImage={useImageAsReference} />
+          ) : activeView === "prompts" ? (
+            <PromptLibrary
+              items={prompts}
+              draft={promptDraft}
+              editingId={editingPromptId}
+              copiedId={promptCopyId}
+              onDraft={setPromptDraft}
+              onSave={savePromptEntry}
+              onCancel={() => { setPromptDraft(""); setEditingPromptId(null); }}
+              onEdit={editPromptEntry}
+              onDelete={deletePromptEntry}
+              onCopy={copyPromptEntry}
+              onUse={usePromptEntry}
+              onRefresh={refreshPrompts}
+            />
           ) : form.mode === "chat" ? (
             <div className="chatPane" ref={scrollRef}>
               {messages.length === 0 && (
@@ -979,7 +1056,7 @@ function App() {
               )}
             </div>
           ) : (
-            <Gallery items={gallery} loading={loading} onDownload={downloadImage} />
+            <Gallery items={[]} loading={loading} onDownload={downloadImage} />
           )}
 
           {activeView === "studio" && <form className="composer" onSubmit={handleSubmit}>
@@ -1331,6 +1408,73 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
   );
 }
 
+function PromptLibrary({
+  items,
+  draft,
+  editingId,
+  copiedId,
+  onDraft,
+  onSave,
+  onCancel,
+  onEdit,
+  onDelete,
+  onCopy,
+  onUse,
+  onRefresh,
+}) {
+  return (
+    <div className="promptLibrary">
+      <section className="promptEditor">
+        <div className="paneToolbar">
+          <strong>{editingId ? "修改提示词" : "新增提示词"}</strong>
+          <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
+        </div>
+        <textarea
+          value={draft}
+          onChange={(event) => onDraft(event.target.value)}
+          placeholder="写入一条常用提示词，只保存文字，不保存图片。"
+        />
+        <div className="promptEditorActions">
+          <button className="secondaryButton compact" type="button" onClick={onSave}>
+            <Check size={16} /> {editingId ? "保存修改" : "保存到库"}
+          </button>
+          {editingId && (
+            <button className="ghostButton" type="button" onClick={onCancel}>
+              <X size={16} /> 取消
+            </button>
+          )}
+        </div>
+      </section>
+
+      {items.length === 0 ? (
+        <div className="emptyState">
+          <BookOpen size={34} />
+          <h3>提示词库还是空的</h3>
+          <p>之后每次对话、生图、编辑都会自动保存文字提示词，也可以手动新增。</p>
+        </div>
+      ) : (
+        <div className="promptGrid">
+          {items.map((item) => (
+            <article className="promptCard" key={item.id}>
+              <div className="promptCardMeta">
+                <span>{item.source === "auto" ? "自动保存" : "手动保存"}</span>
+                <small>{item.mode ? modeLabel(item.mode) : "通用"} · {formatTime(item.created_at)}</small>
+              </div>
+              <p>{item.content}</p>
+              <div className="promptCardActions">
+                <button type="button" onClick={() => onCopy(item)}><Copy size={15} /> {copiedId === item.id ? "已复制" : "复制"}</button>
+                <button type="button" onClick={() => onUse(item)}><Send size={15} /> 使用</button>
+                <button type="button" onClick={() => onEdit(item)}><Edit3 size={15} /> 修改</button>
+                <button type="button" onClick={() => onDelete(item.id)}><Trash2 size={15} /> 删除</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GalleryHistory({ items, onRefresh, onDownload, onUseImage }) {
   const groups = groupImages(items);
   return (
@@ -1387,8 +1531,8 @@ function Gallery({ items, loading, onDownload }) {
       {items.length === 0 && !loading && (
         <div className="emptyState">
           <ImagePlus size={34} />
-          <h3>生成结果会出现在这里</h3>
-          <p>普通生成可一次生成多张，编辑模式支持参考图和透明 mask。</p>
+          <h3>当前工作台是空的</h3>
+          <p>历史图片不再显示在这里。新任务会进入历史记录，生成完成后也可以在图库查看。</p>
         </div>
       )}
       {loading && (

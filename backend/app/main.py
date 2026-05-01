@@ -59,6 +59,12 @@ class AppSettingsRequest(BaseModel):
     value: dict[str, Any] = Field(default_factory=dict)
 
 
+class PromptRequest(BaseModel):
+    content: str = Field(min_length=1)
+    source: str = "manual"
+    mode: str | None = None
+
+
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = "gpt-5.4"
@@ -646,9 +652,60 @@ def delete_provider(provider_id: int) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.get("/api/prompts")
+def list_prompts(limit: int = 300) -> dict[str, Any]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            "select * from prompts order by id desc limit ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()
+    return {"items": [db.row_to_dict(row) for row in rows]}
+
+
+@app.post("/api/prompts")
+def create_prompt(request: PromptRequest) -> dict[str, Any]:
+    content = request.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="prompt content is required")
+    prompt_id = db.add_prompt(content, source=request.source.strip() or "manual", mode=request.mode)
+    with db.connect() as conn:
+        row = conn.execute("select * from prompts where id = ?", (prompt_id,)).fetchone()
+    return db.row_to_dict(row)
+
+
+@app.put("/api/prompts/{prompt_id}")
+def update_prompt(prompt_id: int, request: PromptRequest) -> dict[str, Any]:
+    content = request.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="prompt content is required")
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            update prompts
+            set content = ?, source = ?, mode = ?, updated_at = ?
+            where id = ?
+            """,
+            (content, request.source.strip() or "manual", request.mode, db.now_iso(), prompt_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="prompt not found")
+        row = conn.execute("select * from prompts where id = ?", (prompt_id,)).fetchone()
+    return db.row_to_dict(row)
+
+
+@app.delete("/api/prompts/{prompt_id}")
+def delete_prompt(prompt_id: int) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = conn.execute("delete from prompts where id = ?", (prompt_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="prompt not found")
+    return {"ok": True}
+
+
 @app.post("/api/images/generate")
 async def generate_image(request: GenerateRequest) -> dict[str, Any]:
     ensure_task_slot()
+    db.add_prompt(request.prompt, source="auto", mode="generate")
     payload = compact_params(
         {
             "endpoint": "/v1/responses",
@@ -733,6 +790,7 @@ async def edit_image(
     prompt = str(params.get("prompt") or "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
+    db.add_prompt(prompt, source="auto", mode="edit")
 
     saved_images = [await save_upload(upload) for upload in images]
     saved_mask: tuple[Path, str] | None = None
@@ -1032,6 +1090,7 @@ async def chat_message(
     ensure_task_slot()
     params = ChatRequest(**normalize_text_fields(parse_params(params_json)))
     uploaded = [await save_upload(upload) for upload in images or []]
+    db.add_prompt(params.prompt, source="auto", mode="chat")
 
     with db.connect() as conn:
         conversation = conn.execute(
