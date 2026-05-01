@@ -889,7 +889,31 @@ def list_conversations() -> dict[str, Any]:
             """
             select c.*,
                 (select count(*) from messages m where m.conversation_id = c.id) as message_count,
-                (select count(*) from images i where i.conversation_id = c.id) as image_count
+                (select count(*) from images i where i.conversation_id = c.id) as image_count,
+                (
+                    select t.status from tasks t
+                    where t.conversation_id = c.id
+                    order by t.id desc
+                    limit 1
+                ) as latest_task_status,
+                (
+                    select t.progress from tasks t
+                    where t.conversation_id = c.id
+                    order by t.id desc
+                    limit 1
+                ) as latest_task_progress,
+                (
+                    select t.stage from tasks t
+                    where t.conversation_id = c.id
+                    order by t.id desc
+                    limit 1
+                ) as latest_task_stage,
+                (
+                    select t.id from tasks t
+                    where t.conversation_id = c.id
+                    order by t.id desc
+                    limit 1
+                ) as latest_task_id
             from conversations c
             order by c.updated_at desc
             """

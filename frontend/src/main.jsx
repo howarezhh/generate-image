@@ -21,7 +21,6 @@ import {
   Plus,
   RefreshCw,
   Send,
-  Settings2,
   Sparkles,
   Trash2,
   Wand2,
@@ -138,7 +137,7 @@ function optionLabel(options, value) {
 }
 
 function modeLabel(mode) {
-  return { chat: "对话", generate: "生成", edit: "编辑" }[mode] || mode;
+  return { chat: "对话", generate: "生图", edit: "编辑" }[mode] || mode;
 }
 
 function statusLabel(status) {
@@ -169,6 +168,7 @@ function App() {
   const [galleryHistory, setGalleryHistory] = useState([]);
   const [conversations, setConversations] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
+  const [selectedTask, setSelectedTask] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [taskMeta, setTaskMeta] = useState({ active_count: 0, max_concurrent: 3 });
   const [activeView, setActiveView] = useState("studio");
@@ -208,9 +208,10 @@ function App() {
   useEffect(() => {
     const timer = setInterval(() => {
       refreshTasks();
+      refreshHistory();
     }, 1800);
     return () => clearInterval(timer);
-  }, []);
+  }, [selectedTask?.id, conversation?.id, activeView]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -259,21 +260,25 @@ function App() {
     await startTask();
   }
 
-  async function startTask() {
+  async function startTask({ openCreatedTask = false } = {}) {
     if (atTaskLimit) {
       setError(describeError({ detail: { message: "已有 3 个任务运行或排队，请等待完成后再创建新任务。" } }));
       return;
     }
     setLoading(true);
     try {
+      let createdTask = null;
       if (form.mode === "generate") {
-        await runGenerate();
+        createdTask = await runGenerate();
       } else if (form.mode === "edit") {
-        await runEdit();
+        createdTask = await runEdit();
       } else {
-        await runChat();
+        createdTask = await runChat();
       }
       setForm((value) => ({ ...value, prompt: "" }));
+      if (openCreatedTask && createdTask?.id) {
+        await loadTask(createdTask.id);
+      }
     } catch (err) {
       setError(describeError(err));
     } finally {
@@ -306,6 +311,8 @@ function App() {
     const data = await parse(res);
     mergeTask(data.task);
     await refreshTasks();
+    await refreshHistory();
+    return data.task;
   }
 
   async function runEdit() {
@@ -336,6 +343,8 @@ function App() {
     const result = await parse(res);
     mergeTask(result.task);
     await refreshTasks();
+    await refreshHistory();
+    return result.task;
   }
 
   async function runChat() {
@@ -376,8 +385,9 @@ function App() {
     setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
     mergeTask(result.task);
     setChatImages([]);
-    refreshHistory();
-    refreshTasks();
+    await refreshHistory();
+    await refreshTasks();
+    return result.task;
   }
 
   async function loadAppSettings() {
@@ -462,6 +472,10 @@ function App() {
           }))
       );
       setTaskMeta({ active_count: data.active_count || 0, max_concurrent: data.max_concurrent || 3 });
+      if (selectedTask) {
+        const latestSelected = items.find((task) => task.id === selectedTask.id);
+        if (latestSelected) setSelectedTask(latestSelected);
+      }
       const activeConversationTask = conversation && items.some(
         (task) => task.mode === "chat" && task.conversation_id === conversation.id && ["queued", "running", "done"].includes(task.status)
       );
@@ -611,7 +625,16 @@ function App() {
     setMessages(hydrated);
     setForm((value) => ({ ...value, mode: "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
     setSelectedHistory({ ...data, messages: hydrated });
+    setSelectedTask(null);
     if (openStudio) setActiveView("studio");
+  }
+
+  async function loadTask(taskId) {
+    const res = await fetch(`${API}/api/tasks/${taskId}`);
+    const data = await parse(res);
+    setSelectedTask(data.task);
+    setSelectedHistory(null);
+    setActiveView("history");
   }
 
   async function saveConversationMeta(next) {
@@ -906,7 +929,7 @@ function App() {
             {activeView === "studio" && (
               <div className="headActions">
                 {form.mode === "chat" && <button className="ghostButton" onClick={newChat}><RefreshCw size={17} /> 新对话</button>}
-                <button className="ghostButton" onClick={startTask} disabled={!form.prompt.trim() || atTaskLimit}>
+                <button className="ghostButton" onClick={() => startTask({ openCreatedTask: true })} disabled={!form.prompt.trim() || atTaskLimit}>
                   <Plus size={17} /> 新任务
                 </button>
               </div>
@@ -914,21 +937,25 @@ function App() {
           </div>
 
           {error && <ErrorPanel error={error} onClose={() => setError(null)} />}
-          {activeView === "studio" && (
-            <TaskBoard tasks={tasks} currentMode={form.mode} meta={taskMeta} onCancel={cancelTask} onDownload={downloadImage} />
-          )}
 
           {activeView === "history" ? (
             <HistoryPane
               conversations={conversations}
+              tasks={tasks}
               selected={selectedHistory}
-              onRefresh={refreshHistory}
+              selectedTask={selectedTask}
+              onRefresh={async () => {
+                await refreshHistory();
+                await refreshTasks();
+              }}
               onOpen={(id) => loadConversation(id, { openStudio: false })}
+              onOpenTask={loadTask}
               onContinue={(id) => loadConversation(id, { openStudio: true })}
               onSaveMeta={saveConversationMeta}
               onSaveMessage={saveMessage}
               onDownload={downloadImage}
               onUseImage={useImageAsReference}
+              onCancelTask={cancelTask}
             />
           ) : activeView === "gallery" ? (
             <GalleryHistory items={galleryHistory} onRefresh={refreshGallery} onDownload={downloadImage} onUseImage={useImageAsReference} />
@@ -994,25 +1021,6 @@ function App() {
             </div>
           </form>}
         </section>
-        <aside className="sideInfo">
-          <div className="infoBlock">
-            <Settings2 size={18} />
-            <h3>参数提示</h3>
-            <p>生成、编辑和对话都走 Responses API + image_generation。任务会在后台继续运行，最多同时 3 个。</p>
-          </div>
-          <div className="quickPrompts">
-            {[
-              "一只玻璃质感的未来耳机，电商白底产品图，高级摄影",
-              "把参考图改成赛博朋克夜景，保持主体轮廓和构图",
-              "连续分镜第一帧：少女打开一扇发光的门，油画厚涂，电影感",
-            ].map((text) => (
-              <button key={text} onClick={() => setForm((f) => ({ ...f, prompt: text }))}>
-                <Copy size={15} />
-                {text}
-              </button>
-            ))}
-          </div>
-        </aside>
       </section>
     </main>
   );
@@ -1066,71 +1074,28 @@ function ErrorPanel({ error, onClose }) {
   );
 }
 
-function TaskBoard({ tasks, currentMode, meta, onCancel, onDownload }) {
-  const recent = tasks.slice(0, 8);
-  const active = recent.filter((task) => ["queued", "running"].includes(task.status));
-  if (!recent.length) return null;
-  return (
-    <section className="taskBoard">
-      <div className="taskBoardHead">
-        <strong>后台任务</strong>
-        <span>{active.length}/{meta.max_concurrent || 3} 运行或排队</span>
-      </div>
-      <div className="taskRail">
-        {recent.map((task) => (
-          <TaskCard
-            key={task.id}
-            task={task}
-            active={task.mode === currentMode}
-            onCancel={onCancel}
-            onDownload={onDownload}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function TaskCard({ task, active, onCancel, onDownload }) {
-  const progress = Number(task.progress || 0);
-  const isLive = ["queued", "running"].includes(task.status);
-  const images = (task.images || []).map((image) => ({
-    ...image,
-    url: image.public_url,
-    filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
-  }));
-  return (
-    <article className={`taskCard ${active ? "active" : ""} ${task.status}`}>
-      <div className="taskTop">
-        <span>{modeLabel(task.mode)} #{task.id}</span>
-        <strong>{statusLabel(task.status)}</strong>
-      </div>
-      <p>{task.prompt}</p>
-      <div className="progressTrack">
-        <div style={{ width: `${Math.max(4, Math.min(progress, 100))}%` }} />
-      </div>
-      <div className="taskFoot">
-        <small>{task.stage || "等待中"} · {progress}%</small>
-        {isLive && <button type="button" onClick={() => onCancel(task.id)}><X size={14} /> 停止</button>}
-      </div>
-      {task.error_detail && <pre className="taskError">{formatTaskError(task.error_detail)}</pre>}
-      {images.length > 0 && (
-        <div className="taskThumbs">
-          {images.map((image) => (
-            <button key={image.id} type="button" onClick={() => onDownload(image)}>
-              <img src={image.public_url} alt="" />
-            </button>
-          ))}
-        </div>
-      )}
-    </article>
-  );
-}
-
-function HistoryPane({ conversations, selected, onRefresh, onOpen, onContinue, onSaveMeta, onSaveMessage, onDownload, onUseImage }) {
+function HistoryPane({
+  conversations,
+  tasks,
+  selected,
+  selectedTask,
+  onRefresh,
+  onOpen,
+  onOpenTask,
+  onContinue,
+  onSaveMeta,
+  onSaveMessage,
+  onDownload,
+  onUseImage,
+  onCancelTask,
+}) {
   const [draftTitle, setDraftTitle] = useState("");
   const [draftLimit, setDraftLimit] = useState(10);
   const [messageDrafts, setMessageDrafts] = useState({});
+  const records = useMemo(() => buildHistoryRecords(conversations, tasks), [conversations, tasks]);
+  const conversationTasks = selected?.conversation
+    ? (tasks || []).filter((task) => Number(task.conversation_id) === Number(selected.conversation.id))
+    : [];
 
   useEffect(() => {
     if (!selected?.conversation) return;
@@ -1143,24 +1108,45 @@ function HistoryPane({ conversations, selected, onRefresh, onOpen, onContinue, o
     <div className="historyPane">
       <div className="historyList">
         <div className="paneToolbar">
-          <strong>对话</strong>
+          <strong>历史记录</strong>
           <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
         </div>
-        {conversations.length === 0 ? (
-          <div className="emptyMini">暂无历史对话</div>
-        ) : conversations.map((item) => (
-          <button key={item.id} className={`historyItem ${selected?.conversation?.id === item.id ? "active" : ""}`} onClick={() => onOpen(item.id)}>
-            <span>{item.title}</span>
-            <small>{item.message_count || 0} 条消息 / {item.image_count || 0} 张图</small>
+        {records.length === 0 ? (
+          <div className="emptyMini">暂无历史记录</div>
+        ) : records.map((item) => (
+          <button
+            key={item.key}
+            className={`historyItem ${historyRecordActive(item, selected, selectedTask) ? "active" : ""} ${item.status || "idle"}`}
+            onClick={() => item.kind === "conversation" ? onOpen(item.id) : onOpenTask(item.id)}
+          >
+            <div className="historyItemTop">
+              <span title={item.title}>{item.title}</span>
+              <StatusPill mode={item.mode} status={item.status} />
+            </div>
+            <small>{item.summary}</small>
+            {item.status && (
+              <div className="historyProgress">
+                <div style={{ width: `${Math.max(4, Math.min(Number(item.progress || 0), 100))}%` }} />
+              </div>
+            )}
+            <small>{item.stage || item.timeLabel}</small>
           </button>
         ))}
       </div>
       <div className="historyDetail">
-        {!selected ? (
+        {selectedTask ? (
+          <TaskDetail
+            task={selectedTask}
+            onCancel={onCancelTask}
+            onDownload={onDownload}
+            onUseImage={onUseImage}
+            onContinue={onContinue}
+          />
+        ) : !selected ? (
           <div className="emptyState">
             <FolderOpen size={34} />
             <h3>选择一段历史</h3>
-            <p>打开后可以修改标题、上下文条数和每条消息，再继续对话生图。</p>
+            <p>打开后可以查看任务状态、失败原因、历史图片，也可以继续对话或继续改图。</p>
           </div>
         ) : (
           <>
@@ -1178,6 +1164,19 @@ function HistoryPane({ conversations, selected, onRefresh, onOpen, onContinue, o
                 <MessageCircle size={16} /> 继续对话
               </button>
             </div>
+            {conversationTasks.length > 0 && (
+              <section className="conversationTasks">
+                <div className="sectionTitle">
+                  <strong>本对话任务</strong>
+                  <small>{conversationTasks.length} 条</small>
+                </div>
+                <div className="taskMiniList">
+                  {conversationTasks.map((task) => (
+                    <TaskMiniRow key={task.id} task={task} onOpenTask={onOpenTask} onCancelTask={onCancelTask} />
+                  ))}
+                </div>
+              </section>
+            )}
             <div className="historyMessages">
               {(selected.messages || []).map((msg) => (
                 <article className="historyMessage" key={msg.id}>
@@ -1201,6 +1200,133 @@ function HistoryPane({ conversations, selected, onRefresh, onOpen, onContinue, o
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function buildHistoryRecords(conversations, tasks) {
+  const conversationRecords = (conversations || []).map((item) => ({
+    key: `conversation-${item.id}`,
+    kind: "conversation",
+    id: item.id,
+    mode: "chat",
+    title: item.title || "未命名对话",
+    status: item.latest_task_status,
+    progress: item.latest_task_progress,
+    stage: item.latest_task_stage,
+    time: item.updated_at || item.created_at,
+    timeLabel: formatTime(item.updated_at || item.created_at),
+    summary: `${item.message_count || 0} 条消息 / ${item.image_count || 0} 张图`,
+  }));
+  const taskRecords = (tasks || [])
+    .filter((task) => !task.conversation_id)
+    .map((task) => ({
+      key: `task-${task.id}`,
+      kind: "task",
+      id: task.id,
+      mode: task.mode,
+      title: task.prompt || `${modeLabel(task.mode)}任务 #${task.id}`,
+      status: task.status,
+      progress: task.progress,
+      stage: task.stage,
+      time: task.updated_at || task.created_at,
+      timeLabel: formatTime(task.updated_at || task.created_at),
+      summary: `${modeLabel(task.mode)}任务 #${task.id}`,
+    }));
+  return [...conversationRecords, ...taskRecords].sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+}
+
+function historyRecordActive(item, selected, selectedTask) {
+  if (item.kind === "conversation") {
+    return selected?.conversation?.id === item.id && !selectedTask;
+  }
+  return selectedTask?.id === item.id;
+}
+
+function StatusPill({ mode, status }) {
+  return (
+    <span className={`statusPill ${status || "idle"}`}>
+      <b>{modeLabel(mode)}</b>
+      <em>{status ? statusLabel(status) : "记录"}</em>
+    </span>
+  );
+}
+
+function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
+  const isLive = ["queued", "running"].includes(task.status);
+  return (
+    <article className={`taskMiniRow ${task.status}`}>
+      <button type="button" onClick={() => onOpenTask(task.id)}>
+        <span>{modeLabel(task.mode)}任务 #{task.id}</span>
+        <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</small>
+      </button>
+      <div className="progressTrack">
+        <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
+      </div>
+      {isLive && <button type="button" onClick={() => onCancelTask(task.id)} title="停止任务"><X size={14} /></button>}
+    </article>
+  );
+}
+
+function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
+  const [copied, setCopied] = useState(false);
+  const isLive = ["queued", "running"].includes(task.status);
+  const images = normalizeTaskImages(task);
+  const errorText = task.error_detail ? formatTaskError(task.error_detail) : "";
+
+  async function copyError() {
+    await navigator.clipboard.writeText(errorText || "暂无失败原因");
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1400);
+  }
+
+  return (
+    <div className="taskDetail">
+      <div className="taskDetailHead">
+        <div>
+          <StatusPill mode={task.mode} status={task.status} />
+          <h3>{task.prompt || `${modeLabel(task.mode)}任务 #${task.id}`}</h3>
+          <p>#{task.id} · {task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</p>
+        </div>
+        <div className="taskDetailActions">
+          {isLive && <button className="ghostButton danger" type="button" onClick={() => onCancel(task.id)}><X size={16} /> 停止</button>}
+          {task.conversation_id && (
+            <button className="secondaryButton compact" type="button" onClick={() => onContinue(task.conversation_id)}>
+              <MessageCircle size={16} /> 继续对话
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="progressTrack large">
+        <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
+      </div>
+      <div className="taskFacts">
+        <span>创建：{formatTime(task.created_at)}</span>
+        <span>更新：{formatTime(task.updated_at)}</span>
+        <span>模式：{modeLabel(task.mode)}</span>
+      </div>
+      {task.error_detail && (
+        <section className="taskErrorBox">
+          <div className="sectionTitle">
+            <strong>失败原因</strong>
+            <button type="button" onClick={copyError}><Copy size={15} /> {copied ? "已复制" : "复制原因"}</button>
+          </div>
+          <pre>{errorText}</pre>
+        </section>
+      )}
+      {images.length > 0 ? (
+        <section>
+          <div className="sectionTitle">
+            <strong>生成图片</strong>
+            <small>{images.length} 张</small>
+          </div>
+          <div className="imageGrid">
+            {images.map((image) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} onUseImage={onUseImage} />)}
+          </div>
+        </section>
+      ) : (
+        <div className="emptyMini detailEmpty">这个任务还没有可查看的图片。</div>
+      )}
     </div>
   );
 }
@@ -1441,6 +1567,21 @@ function formatTaskError(error) {
   return typeof error === "string"
     ? compactString(error)
     : JSON.stringify(compactErrorForDisplay(error), null, 2);
+}
+
+function normalizeTaskImages(task) {
+  return (task?.images || []).map((image) => ({
+    ...image,
+    url: image.public_url || image.url,
+    filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "generated-image.png",
+  }));
+}
+
+function formatTime(value) {
+  if (!value) return "未知时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }
 
 function groupImages(items) {
