@@ -41,10 +41,9 @@ git push -u origin main
 Ubuntu 服务器上：
 
 ```bash
-git clone YOUR_GITHUB_REPO_URL
-cd gpt-image-studio
-cp .env.example .env
-nano .env
+git clone https://github.com/howarezhh/generate-image.git
+cd generate-image
+IMAGE_API_KEY='sk-your-key-here' bash scripts/configure_env.sh
 bash scripts/install_ubuntu.sh
 bash scripts/start.sh
 ```
@@ -77,7 +76,7 @@ bash scripts/stop.sh
 
 - `IMAGE_API_BASE_URL`：OpenAI 或兼容服务地址，例如 `https://api.openai.com` 或你的中转地址。
 - `IMAGE_API_KEY`：API 密钥。
-- `PORT`：后端服务端口，默认 `8000`。
+- `PORT`：后端服务端口，默认 `8010`。
 - `DATABASE_PATH`：SQLite 数据库位置。
 - `STORAGE_DIR`：上传和输出图片目录。
 
