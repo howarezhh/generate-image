@@ -5,11 +5,15 @@ import {
   Brush,
   Check,
   ChevronDown,
+  Clock3,
   Copy,
   Download,
+  Edit3,
   Eraser,
   ExternalLink,
+  FolderOpen,
   ImagePlus,
+  Images,
   KeyRound,
   Loader2,
   MessageCircle,
@@ -19,6 +23,7 @@ import {
   Settings2,
   Sparkles,
   Wand2,
+  X,
 } from "lucide-react";
 import "./styles.css";
 
@@ -35,10 +40,8 @@ const chatModelOptions = [
 ];
 
 const imageModelOptions = [
-  { value: "gpt-5.4", label: "GPT-5.4" },
-  { value: "gpt-5.5", label: "GPT-5.5" },
-  { value: "gpt-image-1", label: "GPT Image 1" },
   { value: "gpt-image-2", label: "GPT Image 2" },
+  { value: "gpt-image-1", label: "GPT Image 1" },
 ];
 
 const sizeOptions = [
@@ -87,9 +90,9 @@ const moderationOptions = [
 const defaults = {
   mode: "chat",
   prompt: "",
-  model: "gpt-image-1",
+  model: "gpt-5.4",
   chatModel: "gpt-5.4",
-  imageModel: "gpt-image-1",
+  imageModel: "gpt-image-2",
   action: "auto",
   size: "1536x1024",
   quality: "high",
@@ -100,6 +103,7 @@ const defaults = {
   moderation: "auto",
   input_fidelity: "auto",
   partial_images: 0,
+  context_limit: 10,
 };
 
 function readJsonStorage(key, fallback) {
@@ -124,7 +128,7 @@ function normalizeFormSettings(settings) {
   if (!imageModelOptions.some((option) => option.value === next.imageModel)) {
     next.imageModel = defaults.imageModel;
   }
-  if (!imageModelOptions.some((option) => option.value === next.model)) {
+  if (!chatModelOptions.some((option) => option.value === next.model)) {
     next.model = defaults.model;
   }
   if (!sizeOptions.some((option) => option.value === next.size)) {
@@ -149,8 +153,12 @@ function App() {
   const [controlsOpen, setControlsOpen] = useState(() => readJsonStorage("gpt-image-controls", { open: false }).open);
   const [openGroups, setOpenGroups] = useState(() => readJsonStorage("gpt-image-open-groups", {}));
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(null);
   const [gallery, setGallery] = useState([]);
+  const [galleryHistory, setGalleryHistory] = useState([]);
+  const [conversations, setConversations] = useState([]);
+  const [selectedHistory, setSelectedHistory] = useState(null);
+  const [activeView, setActiveView] = useState("studio");
   const [conversation, setConversation] = useState(null);
   const [messages, setMessages] = useState([]);
   const [editImages, setEditImages] = useState([]);
@@ -188,6 +196,11 @@ function App() {
   }, []);
 
   useEffect(() => {
+    refreshHistory();
+    refreshGallery();
+  }, []);
+
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
@@ -200,16 +213,17 @@ function App() {
     const res = await fetch(`${API}/api/conversations`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: form.prompt.slice(0, 24) || "新的生图对话" }),
+      body: JSON.stringify({ title: form.prompt.slice(0, 24) || "新的生图对话", context_limit: Number(form.context_limit) }),
     });
     const data = await parse(res);
     setConversation(data);
+    refreshHistory();
     return data;
   }
 
   async function handleSubmit(event) {
     event.preventDefault();
-    setError("");
+    setError(null);
     setLoading(true);
     try {
       if (form.mode === "generate") {
@@ -221,7 +235,7 @@ function App() {
       }
       setForm((value) => ({ ...value, prompt: "" }));
     } catch (err) {
-      setError(formatError(err));
+      setError(describeError(err));
     } finally {
       setLoading(false);
     }
@@ -231,6 +245,7 @@ function App() {
     const body = {
       prompt: form.prompt,
       model: form.model,
+      image_model: form.imageModel,
       size: form.size,
       quality: form.quality,
       n: Number(form.n),
@@ -238,6 +253,8 @@ function App() {
       output_format: form.output_format,
       output_compression: form.output_compression === "" ? null : Number(form.output_compression),
       moderation: form.moderation,
+      action: "generate",
+      partial_images: Number(form.partial_images),
       config,
     };
     const res = await fetch(`${API}/api/images/generate`, {
@@ -247,6 +264,7 @@ function App() {
     });
     const data = await parse(res);
     setGallery((items) => [{ prompt: form.prompt, mode: "generate", images: data.images }, ...items]);
+    refreshGallery();
   }
 
   async function runEdit() {
@@ -257,6 +275,7 @@ function App() {
     const params = {
       prompt: form.prompt,
       model: form.model,
+      image_model: form.imageModel,
       size: form.size,
       quality: form.quality,
       n: Number(form.n),
@@ -264,6 +283,8 @@ function App() {
       output_format: form.output_format,
       output_compression: form.output_compression === "" ? null : Number(form.output_compression),
       moderation: form.moderation,
+      input_fidelity: form.input_fidelity,
+      partial_images: Number(form.partial_images),
       config,
     };
     data.append("params_json", JSON.stringify(params));
@@ -272,6 +293,7 @@ function App() {
     const res = await fetch(`${API}/api/images/edit`, { method: "POST", body: data });
     const result = await parse(res);
     setGallery((items) => [{ prompt: form.prompt, mode: "edit", images: result.images }, ...items]);
+    refreshGallery();
   }
 
   async function runChat() {
@@ -294,8 +316,11 @@ function App() {
       quality: form.quality,
       background: form.background,
       output_format: form.output_format,
+      output_compression: form.output_compression === "" ? null : Number(form.output_compression),
+      moderation: form.moderation,
       input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
+      context_limit: Number(form.context_limit),
       config,
     };
     data.append("params_json", JSON.stringify(params));
@@ -306,7 +331,7 @@ function App() {
     });
     const result = await parse(res);
     setMessages((items) => [
-      ...items,
+      ...items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)),
       {
         id: result.assistant_message_id,
         role: "assistant",
@@ -315,6 +340,8 @@ function App() {
       },
     ]);
     setChatImages([]);
+    refreshHistory();
+    refreshGallery();
   }
 
   async function saveSettings() {
@@ -332,15 +359,107 @@ function App() {
     setConversation(null);
     setMessages([]);
     setChatImages([]);
+    setActiveView("studio");
+  }
+
+  async function refreshHistory() {
+    try {
+      const res = await fetch(`${API}/api/conversations`);
+      const data = await parse(res);
+      setConversations(data.items || []);
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function refreshGallery() {
+    try {
+      const res = await fetch(`${API}/api/gallery`);
+      const data = await parse(res);
+      setGalleryHistory(data.items || []);
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function loadConversation(id, { openStudio = true } = {}) {
+    const res = await fetch(`${API}/api/conversations/${id}`);
+    const data = await parse(res);
+    const imagesByMessage = new Map();
+    for (const image of data.images || []) {
+      const list = imagesByMessage.get(image.message_id) || [];
+      list.push({
+        id: image.id,
+        url: image.public_url,
+        mime_type: image.mime_type,
+        conversation_id: image.conversation_id,
+        message_id: image.message_id,
+        file_path: image.file_path,
+        filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
+        title: image.title,
+        bucket: image.bucket,
+      });
+      imagesByMessage.set(image.message_id, list);
+    }
+    const hydrated = (data.messages || []).map((msg) => ({ ...msg, images: imagesByMessage.get(msg.id) || [] }));
+    setConversation(data.conversation);
+    setMessages(hydrated);
+    setForm((value) => ({ ...value, mode: "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
+    setSelectedHistory({ ...data, messages: hydrated });
+    if (openStudio) setActiveView("studio");
+  }
+
+  async function saveConversationMeta(next) {
+    if (!selectedHistory?.conversation) return;
+    const res = await fetch(`${API}/api/conversations/${selectedHistory.conversation.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(next),
+    });
+    const updated = await parse(res);
+    setSelectedHistory((current) => ({ ...current, conversation: updated }));
+    if (conversation?.id === updated.id) setConversation(updated);
+    refreshHistory();
+  }
+
+  async function saveMessage(messageId, content) {
+    const res = await fetch(`${API}/api/messages/${messageId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    const updated = await parse(res);
+    setSelectedHistory((current) => ({
+      ...current,
+      messages: current.messages.map((msg) => (msg.id === messageId ? { ...msg, ...updated } : msg)),
+    }));
+    if (conversation?.id === updated.conversation_id) {
+      setMessages((items) => items.map((msg) => (msg.id === messageId ? { ...msg, ...updated } : msg)));
+    }
+  }
+
+  async function useImageAsReference(image) {
+    const response = await fetch(image.public_url || image.url);
+    const blob = await response.blob();
+    const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
+    const file = new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
+    if (image.conversation_id) {
+      await loadConversation(image.conversation_id, { openStudio: true });
+    } else {
+      setActiveView("studio");
+      setForm((value) => ({ ...value, mode: "chat" }));
+    }
+    setChatImages([file]);
+    setForm((value) => ({ ...value, prompt: "", mode: "chat", action: "edit" }));
   }
 
   async function downloadImage(image) {
-    const response = await fetch(image.url);
+    const response = await fetch(image.public_url || image.url);
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = image.filename || "generated-image.png";
+    link.download = image.filename || image.file_path?.split(/[\\/]/).pop() || "generated-image.png";
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -418,17 +537,20 @@ function App() {
 
           <SettingsGroup
             title="模型设置"
-            summary={form.mode === "chat" ? `${form.chatModel} / ${form.imageModel}` : form.model}
+            summary={form.mode === "chat" ? `${form.chatModel} / ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
             open={!!openGroups.models}
             onToggle={() => toggleGroup("models")}
           >
             {form.mode === "chat" ? (
               <>
                 <Select label="对话模型" value={form.chatModel} onChange={(v) => setForm({ ...form, chatModel: v })} options={chatModelOptions} />
-                <Select label="生图模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
+                <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
             ) : (
-              <Select label="生图模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={imageModelOptions} />
+              <>
+                <Select label="Responses 模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
+                <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
+              </>
             )}
           </SettingsGroup>
 
@@ -460,6 +582,22 @@ function App() {
                 <Select label="动作" value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={actionOptions} />
                 <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
                 <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+                <Field label="上下文条数">
+                  <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
+                </Field>
+                <Field label="压缩 0-100">
+                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
+                </Field>
+                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+              </>
+            ) : form.mode === "edit" ? (
+              <>
+                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
+                <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+                <Field label="压缩 0-100">
+                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
+                </Field>
+                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             ) : (
               <>
@@ -474,19 +612,45 @@ function App() {
         )}
 
         <section className="stage">
+          <nav className="viewTabs">
+            {[
+              ["studio", Sparkles, "工作台"],
+              ["history", Clock3, "历史"],
+              ["gallery", Images, "图库"],
+            ].map(([value, Icon, label]) => (
+              <button key={value} className={activeView === value ? "active" : ""} onClick={() => setActiveView(value)}>
+                <Icon size={16} />
+                {label}
+              </button>
+            ))}
+          </nav>
           <div className="stageHead">
             <div>
               <p><ModeIcon size={18} /> {modeMeta.title}</p>
-              <h2>{form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
+              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
             </div>
-            {form.mode === "chat" && (
+            {activeView === "studio" && form.mode === "chat" && (
               <button className="ghostButton" onClick={newChat}><RefreshCw size={17} /> 新对话</button>
             )}
           </div>
 
-          {error && <div className="errorBox">{error}</div>}
+          {error && <ErrorPanel error={error} onClose={() => setError(null)} />}
 
-          {form.mode === "chat" ? (
+          {activeView === "history" ? (
+            <HistoryPane
+              conversations={conversations}
+              selected={selectedHistory}
+              onRefresh={refreshHistory}
+              onOpen={(id) => loadConversation(id, { openStudio: false })}
+              onContinue={(id) => loadConversation(id, { openStudio: true })}
+              onSaveMeta={saveConversationMeta}
+              onSaveMessage={saveMessage}
+              onDownload={downloadImage}
+              onUseImage={useImageAsReference}
+            />
+          ) : activeView === "gallery" ? (
+            <GalleryHistory items={galleryHistory} onRefresh={refreshGallery} onDownload={downloadImage} onUseImage={useImageAsReference} />
+          ) : form.mode === "chat" ? (
             <div className="chatPane" ref={scrollRef}>
               {messages.length === 0 && (
                 <div className="emptyState">
@@ -509,7 +673,7 @@ function App() {
             <Gallery items={gallery} loading={loading} onDownload={downloadImage} />
           )}
 
-          <form className="composer" onSubmit={handleSubmit}>
+          {activeView === "studio" && <form className="composer" onSubmit={handleSubmit}>
             {form.mode === "edit" && (
               <UploadRow
                 label="编辑图片"
@@ -543,7 +707,7 @@ function App() {
                 {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
               </button>
             </div>
-          </form>
+          </form>}
         </section>
         <aside className="sideInfo">
           <div className="infoBlock">
@@ -581,6 +745,145 @@ function SettingsGroup({ title, summary, open, onToggle, children }) {
       </button>
       {open && <div className="settingsGroupBody">{children}</div>}
     </section>
+  );
+}
+
+function ErrorPanel({ error, onClose }) {
+  const [copied, setCopied] = useState(false);
+  const detailText = error.detail || error.raw || error.summary;
+
+  async function copyError() {
+    await navigator.clipboard.writeText(detailText);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1400);
+  }
+
+  return (
+    <section className="errorPanel">
+      <div className="errorPanelHead">
+        <div>
+          <strong>生图失败</strong>
+          <span>{error.summary}</span>
+        </div>
+        <div className="errorActions">
+          <button type="button" onClick={copyError}><Copy size={15} /> {copied ? "已复制" : "复制原因"}</button>
+          <button type="button" onClick={onClose} title="关闭"><X size={15} /></button>
+        </div>
+      </div>
+      {error.meta?.length > 0 && (
+        <div className="errorMeta">
+          {error.meta.map(([label, value]) => <span key={label}>{label}: {value}</span>)}
+        </div>
+      )}
+      <pre>{detailText}</pre>
+    </section>
+  );
+}
+
+function HistoryPane({ conversations, selected, onRefresh, onOpen, onContinue, onSaveMeta, onSaveMessage, onDownload, onUseImage }) {
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftLimit, setDraftLimit] = useState(10);
+  const [messageDrafts, setMessageDrafts] = useState({});
+
+  useEffect(() => {
+    if (!selected?.conversation) return;
+    setDraftTitle(selected.conversation.title || "");
+    setDraftLimit(selected.conversation.context_limit ?? 10);
+    setMessageDrafts(Object.fromEntries((selected.messages || []).map((msg) => [msg.id, msg.content])));
+  }, [selected]);
+
+  return (
+    <div className="historyPane">
+      <div className="historyList">
+        <div className="paneToolbar">
+          <strong>对话</strong>
+          <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
+        </div>
+        {conversations.length === 0 ? (
+          <div className="emptyMini">暂无历史对话</div>
+        ) : conversations.map((item) => (
+          <button key={item.id} className={`historyItem ${selected?.conversation?.id === item.id ? "active" : ""}`} onClick={() => onOpen(item.id)}>
+            <span>{item.title}</span>
+            <small>{item.message_count || 0} 条消息 / {item.image_count || 0} 张图</small>
+          </button>
+        ))}
+      </div>
+      <div className="historyDetail">
+        {!selected ? (
+          <div className="emptyState">
+            <FolderOpen size={34} />
+            <h3>选择一段历史</h3>
+            <p>打开后可以修改标题、上下文条数和每条消息，再继续对话生图。</p>
+          </div>
+        ) : (
+          <>
+            <div className="historyMeta">
+              <Field label="对话标题">
+                <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} />
+              </Field>
+              <Field label="上下文条数">
+                <input type="number" min="0" max="50" value={draftLimit} onChange={(e) => setDraftLimit(e.target.value)} />
+              </Field>
+              <button className="secondaryButton" type="button" onClick={() => onSaveMeta({ title: draftTitle, context_limit: Number(draftLimit) })}>
+                <Check size={16} /> 保存历史设置
+              </button>
+              <button className="ghostButton" type="button" onClick={() => onContinue(selected.conversation.id)}>
+                <MessageCircle size={16} /> 继续对话
+              </button>
+            </div>
+            <div className="historyMessages">
+              {(selected.messages || []).map((msg) => (
+                <article className="historyMessage" key={msg.id}>
+                  <div className="messageRole">{msg.role === "user" ? "用户" : "助手"}</div>
+                  <textarea value={messageDrafts[msg.id] ?? msg.content} onChange={(e) => setMessageDrafts((drafts) => ({ ...drafts, [msg.id]: e.target.value }))} />
+                  <div className="historyMessageActions">
+                    <button type="button" onClick={() => onSaveMessage(msg.id, messageDrafts[msg.id] ?? msg.content)}>
+                      <Edit3 size={15} /> 保存修改
+                    </button>
+                  </div>
+                  {msg.images?.length > 0 && (
+                    <div className="imageGrid">
+                      {msg.images.map((image) => (
+                        <ImageCard key={image.url} image={image} onDownload={onDownload} onUseImage={onUseImage} />
+                      ))}
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GalleryHistory({ items, onRefresh, onDownload, onUseImage }) {
+  const groups = groupImages(items);
+  return (
+    <div className="galleryHistory">
+      <div className="paneToolbar">
+        <strong>历史图库</strong>
+        <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
+      </div>
+      {groups.length === 0 ? (
+        <div className="emptyState">
+          <Images size={34} />
+          <h3>还没有历史图片</h3>
+          <p>之后生成的图片会按对话标题和时间保存到这里。</p>
+        </div>
+      ) : groups.map((group) => (
+        <article className="galleryGroup" key={group.key}>
+          <div>
+            <span>{group.title}</span>
+            <small>{group.time}</small>
+          </div>
+          <div className="imageGrid">
+            {group.items.map((image) => <ImageCard key={image.id} image={image} onDownload={onDownload} onUseImage={onUseImage} />)}
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -635,12 +938,13 @@ function Gallery({ items, loading, onDownload }) {
   );
 }
 
-function ImageCard({ image, onDownload }) {
+function ImageCard({ image, onDownload, onUseImage }) {
+  const url = image.public_url || image.url;
   return (
     <div className="imageCard">
-      <img src={image.url} alt="generated" />
+      <img src={url} alt="generated" />
       <div className="imageActions">
-        <a href={image.url} target="_blank" rel="noreferrer">
+        <a href={url} target="_blank" rel="noreferrer">
           <ExternalLink size={14} />
           预览
         </a>
@@ -648,6 +952,12 @@ function ImageCard({ image, onDownload }) {
           <Download size={14} />
           下载
         </button>
+        {onUseImage && (
+          <button type="button" onClick={() => onUseImage(image)}>
+            <Brush size={14} />
+            继续改
+          </button>
+        )}
       </div>
     </div>
   );
@@ -692,16 +1002,59 @@ function UploadRow({ label, files, onChange, multiple = false }) {
 
 async function parse(res) {
   const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { detail: { raw: text } };
+  }
   if (!res.ok) throw data;
   return data;
 }
 
-function formatError(err) {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  if (err?.detail) return typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail, null, 2);
-  return JSON.stringify(err, null, 2);
+function describeError(err) {
+  if (err instanceof Error) {
+    return { summary: err.message, detail: err.stack || err.message, meta: [] };
+  }
+  if (typeof err === "string") {
+    return { summary: err, detail: err, meta: [] };
+  }
+  const detail = err?.detail ?? err;
+  const status = detail?.status_code || err?.status || "";
+  const endpoint = detail?.endpoint || detail?.fallback_error?.endpoint || "";
+  const url = detail?.url || detail?.fallback_error?.url || "";
+  const upstream = detail?.upstream || detail?.fallback_error?.upstream || detail;
+  const summary = detail?.message || upstream?.message || upstream?.raw || "请求失败";
+  const meta = [
+    status ? ["状态码", status] : null,
+    endpoint ? ["接口", endpoint] : null,
+    url ? ["地址", url] : null,
+  ].filter(Boolean);
+  return {
+    summary,
+    meta,
+    detail: JSON.stringify(detail, null, 2),
+    raw: JSON.stringify(err, null, 2),
+  };
+}
+
+function groupImages(items) {
+  const map = new Map();
+  for (const item of items || []) {
+    const title = item.conversation_title || item.title || item.task_prompt || "独立生成";
+    const bucket = item.bucket || item.created_at || "default";
+    const key = `${title}-${bucket}`;
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        title,
+        time: item.created_at ? new Date(item.created_at).toLocaleString() : bucket,
+        items: [],
+      });
+    }
+    map.get(key).items.push(item);
+  }
+  return [...map.values()];
 }
 
 createRoot(document.getElementById("root")).render(<App />);

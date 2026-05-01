@@ -51,6 +51,8 @@ def init_db() -> None:
                 task_id integer,
                 conversation_id integer,
                 message_id integer,
+                title text,
+                bucket text,
                 source text not null,
                 file_path text not null,
                 public_url text not null,
@@ -61,6 +63,7 @@ def init_db() -> None:
             create table if not exists conversations (
                 id integer primary key autoincrement,
                 title text not null,
+                context_limit integer not null default 10,
                 previous_response_id text,
                 created_at text not null,
                 updated_at text not null
@@ -73,10 +76,21 @@ def init_db() -> None:
                 content text not null,
                 response_id text,
                 meta_json text not null,
-                created_at text not null
+                created_at text not null,
+                updated_at text
             );
             """
         )
+        ensure_column(conn, "images", "title", "text")
+        ensure_column(conn, "images", "bucket", "text")
+        ensure_column(conn, "conversations", "context_limit", "integer not null default 10")
+        ensure_column(conn, "messages", "updated_at", "text")
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"pragma table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"alter table {table} add column {column} {definition}")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -130,6 +144,8 @@ def add_image(
     file_path: Path,
     public_url: str,
     mime_type: str,
+    title: str | None = None,
+    bucket: str | None = None,
     task_id: int | None = None,
     conversation_id: int | None = None,
     message_id: int | None = None,
@@ -138,13 +154,15 @@ def add_image(
         cursor = conn.execute(
             """
             insert into images
-                (task_id, conversation_id, message_id, source, file_path, public_url, mime_type, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+                (task_id, conversation_id, message_id, title, bucket, source, file_path, public_url, mime_type, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 conversation_id,
                 message_id,
+                title,
+                bucket,
                 source,
                 str(file_path),
                 public_url,
@@ -153,4 +171,3 @@ def add_image(
             ),
         )
         return int(cursor.lastrowid)
-

@@ -5,10 +5,12 @@
 ## 功能
 
 - 前端自定义接口地址和密钥，支持 OpenAI 兼容中转地址。
-- 普通生图：调用 `/v1/images/generations`。
-- 图片编辑：调用 `/v1/images/edits`，支持上传参考图和 mask。
+- 普通生图：强制调用 `/v1/responses` + `image_generation` 工具。
+- 图片编辑：同样走 `/v1/responses`，参考图和 mask 会作为 `input_image` 传入。
 - 对话式生图：调用 `/v1/responses` + `image_generation` 工具，支持 `auto / generate / edit`。
-- 支持常用参数：模型、尺寸、质量、数量、背景、输出格式、压缩、moderation、partial images、action。
+- 支持常用参数：Responses 模型、图片工具模型、尺寸、质量、数量、背景、输出格式、压缩、moderation、partial images、action。
+- 生图失败时前端显示完整失败原因，并支持一键复制。
+- 历史对话和历史图库会轻量保存到 SQLite，可查看、修改并继续编辑旧图。
 - 本地 SQLite 记录任务、会话、消息和生成图片。
 - 移动端适配。
 - Ubuntu 一键安装和启动脚本。

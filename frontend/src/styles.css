@@ -278,7 +278,35 @@ textarea:focus {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+.viewTabs {
+  display: flex;
+  gap: 8px;
+  padding: 12px 22px 0;
+  overflow-x: auto;
+}
+
+.viewTabs button,
+.paneToolbar button,
+.historyMessageActions button {
+  border: 1px solid rgba(245, 243, 234, 0.15);
+  background: rgba(245, 243, 234, 0.055);
+  color: rgba(245, 243, 234, 0.76);
+  min-height: 36px;
+  border-radius: 8px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.viewTabs button.active {
+  background: #eecb70;
+  color: #11130f;
+  border-color: transparent;
 }
 
 .stageHead {
@@ -497,14 +525,184 @@ textarea {
   line-height: 1.6;
 }
 
-.errorBox {
+.errorPanel {
   margin: 14px 22px 0;
   padding: 12px;
   border: 1px solid rgba(214, 76, 57, 0.5);
   background: rgba(214, 76, 57, 0.16);
   border-radius: 8px;
   color: #ffd9d1;
+}
+
+.errorPanelHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.errorPanelHead strong,
+.errorPanelHead span {
+  display: block;
+}
+
+.errorPanelHead span {
+  margin-top: 4px;
+  color: #ffe8e2;
+  line-height: 1.5;
+}
+
+.errorActions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.errorActions button {
+  border: 1px solid rgba(255, 217, 209, 0.32);
+  background: rgba(17, 19, 15, 0.34);
+  color: #ffd9d1;
+  border-radius: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.errorMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.errorMeta span {
+  border: 1px solid rgba(255, 217, 209, 0.2);
+  background: rgba(17, 19, 15, 0.28);
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-size: 12px;
+}
+
+.errorPanel pre {
+  max-height: 210px;
+  overflow: auto;
+  margin: 12px 0 0;
   white-space: pre-wrap;
+  word-break: break-word;
+  color: #ffd9d1;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.historyPane {
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+}
+
+.historyList,
+.historyDetail,
+.galleryHistory {
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+}
+
+.historyList {
+  border-right: 1px solid rgba(245, 243, 234, 0.12);
+}
+
+.paneToolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.historyItem {
+  width: 100%;
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.045);
+  color: #f5f3ea;
+  border-radius: 8px;
+  padding: 11px;
+  margin-bottom: 9px;
+  text-align: left;
+  display: grid;
+  gap: 5px;
+}
+
+.historyItem.active {
+  border-color: #eecb70;
+  background: rgba(238, 203, 112, 0.14);
+}
+
+.historyItem span,
+.galleryGroup span {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.historyItem small,
+.galleryGroup small,
+.emptyMini {
+  color: rgba(245, 243, 234, 0.58);
+}
+
+.historyMeta {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) 120px auto auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.historyMeta .field {
+  margin-bottom: 0;
+}
+
+.historyMessage {
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.045);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.messageRole {
+  color: #eecb70;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.historyMessage textarea {
+  min-height: 86px;
+}
+
+.historyMessageActions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.galleryGroup {
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.045);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+.galleryGroup > div:first-child {
+  display: grid;
+  gap: 4px;
 }
 
 .infoBlock {
@@ -596,6 +794,10 @@ textarea {
     padding: 14px;
   }
 
+  .viewTabs {
+    padding: 10px 14px 0;
+  }
+
   .stageHead h2 {
     font-size: 20px;
   }
@@ -623,5 +825,43 @@ textarea {
 
   .settingsGroupHead {
     min-height: 50px;
+  }
+
+  .errorPanel {
+    margin: 10px 14px 0;
+  }
+
+  .errorPanelHead,
+  .historyMeta {
+    grid-template-columns: 1fr;
+    display: grid;
+  }
+
+  .errorActions {
+    justify-content: flex-start;
+  }
+
+  .historyPane {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+
+  .historyList,
+  .historyDetail,
+  .galleryHistory {
+    overflow: visible;
+    padding: 14px;
+  }
+
+  .historyList {
+    border-right: 0;
+    border-bottom: 1px solid rgba(245, 243, 234, 0.12);
+    max-height: 260px;
+    overflow: auto;
+  }
+
+  .historyMeta .secondaryButton,
+  .historyMeta .ghostButton {
+    min-height: 40px;
   }
 }
