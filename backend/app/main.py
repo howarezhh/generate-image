@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MAX_CONCURRENT_TASKS = 3
+RUNNING_TASKS: dict[int, asyncio.Task[Any]] = {}
+TASK_SEMAPHORE: asyncio.Semaphore | None = None
+
 
 class ClientConfig(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
+
+
+class ProviderRequest(BaseModel):
+    name: str = Field(min_length=1)
+    base_url: str = Field(min_length=1)
+    api_key: str = ""
+
+
+class AppSettingsRequest(BaseModel):
+    value: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerateRequest(BaseModel):
@@ -167,6 +182,33 @@ def summarize_task(row: Any) -> dict[str, Any]:
     response_json = item.get("response_json")
     if isinstance(response_json, str) and len(response_json) > 2000:
         item["response_json"] = f"[response omitted, {len(response_json)} chars]"
+    if isinstance(item.get("params_json"), str):
+        try:
+            item["params"] = json.loads(item["params_json"])
+        except json.JSONDecodeError:
+            item["params"] = {}
+    if isinstance(item.get("error"), str) and item["error"]:
+        try:
+            item["error_detail"] = json.loads(item["error"])
+        except json.JSONDecodeError:
+            item["error_detail"] = item["error"]
+    return item
+
+
+def task_with_images(task_id: int) -> dict[str, Any]:
+    with db.connect() as conn:
+        row = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="task not found")
+        images = [
+            db.row_to_dict(image)
+            for image in conn.execute(
+                "select * from images where task_id = ? order by id asc",
+                (task_id,),
+            ).fetchall()
+        ]
+    item = summarize_task(row)
+    item["images"] = images
     return item
 
 
@@ -185,6 +227,64 @@ def build_context_prompt(history: list[dict[str, Any]], prompt: str) -> str:
             lines.append(f"{role}: {content}")
     lines.append(f"当前用户需求: {prompt}")
     return "\n".join(lines)
+
+
+def build_chat_planner_prompt(history: list[dict[str, Any]], prompt: str, has_images: bool) -> str:
+    context = build_context_prompt(history, prompt)
+    image_note = "本轮用户上传了参考图片。" if has_images else "本轮用户没有上传参考图片。"
+    return f"""
+你是一个中文生图对话助手。你的职责不是每次都生图，而是先理解用户意图，再决定是否需要调用生图。
+
+判断规则：
+1. 如果用户只是在聊天、询问能力、补充偏好、没有明确画面/修改目标，不要生图，应继续提问或确认需求。
+2. 如果用户明确要求生成、重画、修改、继续改图，或上下文已经足够且用户表达了开始/按这个来/生成吧，应生图。
+3. 如果用户上传了参考图，优先考虑 edit；如果没有参考图，优先考虑 generate。
+4. 如果用户在已有图片基础上提出修改意见，应把修改意见融合为新的高质量生图提示词，强调保留不应改变的部分。
+5. 生成提示词要完整、具体、适合直接传给 image_generation 工具。
+
+{image_note}
+
+请只输出 JSON，不要 Markdown，不要代码块。格式：
+{{
+  "reply": "给用户看的中文回复。若要生图，说明你将如何生成/修改；若不要生图，提出下一步问题或建议。",
+  "should_generate": true 或 false,
+  "action": "generate" 或 "edit" 或 "auto",
+  "image_prompt": "should_generate 为 true 时填写最终生图提示词，否则为空字符串",
+  "reason": "简短说明判断依据"
+}}
+
+对话上下文和当前用户输入：
+{context}
+""".strip()
+
+
+def parse_planner_json(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end >= start:
+        raw = raw[start : end + 1]
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {
+            "reply": text.strip() or "我还需要更多画面要求，再帮你生成会更稳。",
+            "should_generate": False,
+            "action": "auto",
+            "image_prompt": "",
+            "reason": "planner returned non-json text",
+        }
+    return {
+        "reply": str(parsed.get("reply") or "").strip() or "我理解了。",
+        "should_generate": bool(parsed.get("should_generate")),
+        "action": str(parsed.get("action") or "auto").strip(),
+        "image_prompt": str(parsed.get("image_prompt") or "").strip(),
+        "reason": str(parsed.get("reason") or "").strip(),
+    }
 
 
 def build_image_generation_tool(
@@ -318,10 +418,122 @@ async def call_responses_image_generation(
     )
 
 
+async def call_chat_planner(
+    *,
+    model: str,
+    prompt: str,
+    config: ClientConfig,
+    uploaded: list[tuple[Path, str]] | None = None,
+    previous_response_id: str | None = None,
+) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for idx, (path, mime_type) in enumerate(uploaded or [], start=1):
+        content.append({"type": "input_text", "text": f"Reference image {idx}: user supplied this image for possible edit context."})
+        content.append({"type": "input_image", "image_url": data_url_for_file(path, mime_type)})
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": [{"role": "user", "content": content}],
+    }
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
+    return await post_json(
+        "responses",
+        payload,
+        base_url=config.base_url,
+        api_key=config.api_key,
+        timeout=180.0,
+    )
+
+
+def active_task_count() -> int:
+    with db.connect() as conn:
+        row = conn.execute(
+            "select count(*) as count from tasks where status in ('queued', 'running')"
+        ).fetchone()
+    return int(row["count"])
+
+
+def ensure_task_slot() -> None:
+    if active_task_count() >= MAX_CONCURRENT_TASKS:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": f"当前已有 {MAX_CONCURRENT_TASKS} 个生图任务在运行或排队，请等待其中一个完成后再创建新任务。",
+                "status_code": 429,
+                "suggestion": "可以在任务卡片里停止不需要的任务，或等待任务完成。",
+            },
+        )
+
+
+def schedule_task(task_id: int, coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    RUNNING_TASKS[task_id] = task
+
+    def cleanup(done: asyncio.Task[Any]) -> None:
+        RUNNING_TASKS.pop(task_id, None)
+        if done.cancelled():
+            db.cancel_task(task_id)
+
+    task.add_done_callback(cleanup)
+
+
+async def run_with_slot(task_id: int, worker: Any) -> None:
+    global TASK_SEMAPHORE
+    if TASK_SEMAPHORE is None:
+        TASK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+    try:
+        db.update_task(task_id, status="queued", progress=3, stage="等待生图通道")
+        async with TASK_SEMAPHORE:
+            task = db.get_task(task_id)
+            if task and task.get("cancel_requested"):
+                db.cancel_task(task_id)
+                return
+            db.update_task(task_id, status="running", progress=8, stage="任务已启动")
+            await worker()
+    except asyncio.CancelledError:
+        db.cancel_task(task_id)
+        raise
+    except HTTPException as exc:
+        db.fail_task(task_id, compact_error_detail(exc.detail))
+    except Exception as exc:
+        db.fail_task(task_id, str(exc))
+
+
+def task_image_folder(task_id: int, title: str) -> str:
+    return safe_storage_folder(title, db.now_iso())
+
+
+def ensure_default_provider() -> None:
+    with db.connect() as conn:
+        row = conn.execute("select count(*) as count from providers").fetchone()
+        if int(row["count"]) > 0:
+            return
+        stamp = db.now_iso()
+        conn.execute(
+            """
+            insert into providers (name, base_url, api_key, created_at, updated_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            ("默认提供商", DEFAULT_API_BASE_URL, DEFAULT_API_KEY, stamp, stamp),
+        )
+
+
 @app.on_event("startup")
 def startup() -> None:
+    global TASK_SEMAPHORE
     ensure_dirs()
     db.init_db()
+    ensure_default_provider()
+    TASK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+    with db.connect() as conn:
+        conn.execute(
+            """
+            update tasks
+            set status = 'failed', stage = '服务重启后任务已中断', error = ?, updated_at = ?
+            where status in ('queued', 'running')
+            """,
+            ("服务重启后，内存中的后台任务已中断，请重新创建任务。", db.now_iso()),
+        )
 
 
 @app.get("/api/health")
@@ -357,8 +569,86 @@ def put_settings(config: ClientConfig) -> dict[str, str]:
     return get_settings()
 
 
+@app.get("/api/app-settings")
+def get_app_settings() -> dict[str, Any]:
+    with db.connect() as conn:
+        row = conn.execute("select value from settings where key = ?", ("app_settings",)).fetchone()
+    if not row:
+        return {"value": {}}
+    try:
+        value = json.loads(row["value"])
+    except json.JSONDecodeError:
+        value = {}
+    return {"value": value if isinstance(value, dict) else {}}
+
+
+@app.put("/api/app-settings")
+def put_app_settings(request: AppSettingsRequest) -> dict[str, Any]:
+    stamp = db.now_iso()
+    with db.connect() as conn:
+        conn.execute(
+            "insert or replace into settings (key, value, updated_at) values (?, ?, ?)",
+            ("app_settings", db.json_dumps(request.value), stamp),
+        )
+    return get_app_settings()
+
+
+@app.get("/api/providers")
+def list_providers() -> dict[str, Any]:
+    ensure_default_provider()
+    with db.connect() as conn:
+        rows = conn.execute("select * from providers order by id asc").fetchall()
+    return {"items": [db.row_to_dict(row) for row in rows]}
+
+
+@app.post("/api/providers")
+def create_provider(request: ProviderRequest) -> dict[str, Any]:
+    stamp = db.now_iso()
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            insert into providers (name, base_url, api_key, created_at, updated_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (request.name.strip(), request.base_url.strip(), request.api_key.strip(), stamp, stamp),
+        )
+        provider_id = int(cursor.lastrowid)
+        row = conn.execute("select * from providers where id = ?", (provider_id,)).fetchone()
+    return db.row_to_dict(row)
+
+
+@app.put("/api/providers/{provider_id}")
+def update_provider(provider_id: int, request: ProviderRequest) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            update providers
+            set name = ?, base_url = ?, api_key = ?, updated_at = ?
+            where id = ?
+            """,
+            (request.name.strip(), request.base_url.strip(), request.api_key.strip(), db.now_iso(), provider_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="provider not found")
+        row = conn.execute("select * from providers where id = ?", (provider_id,)).fetchone()
+    return db.row_to_dict(row)
+
+
+@app.delete("/api/providers/{provider_id}")
+def delete_provider(provider_id: int) -> dict[str, Any]:
+    with db.connect() as conn:
+        count = int(conn.execute("select count(*) as count from providers").fetchone()["count"])
+        if count <= 1:
+            raise HTTPException(status_code=400, detail="至少保留一个提供商")
+        cursor = conn.execute("delete from providers where id = ?", (provider_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="provider not found")
+    return {"ok": True}
+
+
 @app.post("/api/images/generate")
 async def generate_image(request: GenerateRequest) -> dict[str, Any]:
+    ensure_task_slot()
     payload = compact_params(
         {
             "endpoint": "/v1/responses",
@@ -378,12 +668,22 @@ async def generate_image(request: GenerateRequest) -> dict[str, Any]:
         }
     )
     task_id = db.create_task("generate", request.prompt, payload)
-    title = request.prompt[:48] or f"task-{task_id}"
-    bucket = safe_storage_folder(title, db.now_iso())
-    try:
+    schedule_task(task_id, run_generate_task(task_id, request, payload))
+    return {"task": db.get_task(task_id)}
+
+
+async def run_generate_task(task_id: int, request: GenerateRequest, payload: dict[str, Any]) -> None:
+    async def worker() -> None:
+        title = request.prompt[:48] or f"task-{task_id}"
+        bucket = task_image_folder(task_id, title)
         responses: list[dict[str, Any]] = []
         image_items = []
-        for _ in range(request.n):
+        for index in range(request.n):
+            db.update_task(
+                task_id,
+                progress=min(15 + int(index / max(request.n, 1) * 70), 85),
+                stage=f"正在生成第 {index + 1}/{request.n} 张",
+            )
             response = await call_responses_image_generation(
                 model=request.model,
                 prompt=request.prompt,
@@ -400,6 +700,11 @@ async def generate_image(request: GenerateRequest) -> dict[str, Any]:
             )
             responses.append(sanitize_response(response))
             image_items.extend(extract_images_from_responses(response, request.output_format, folder=bucket))
+            db.update_task(
+                task_id,
+                progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
+                stage=f"已收到第 {index + 1}/{request.n} 张结果",
+            )
         if not image_items:
             raise HTTPException(
                 status_code=502,
@@ -410,16 +715,11 @@ async def generate_image(request: GenerateRequest) -> dict[str, Any]:
                     "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
                 },
             )
+        db.update_task(task_id, progress=94, stage="正在保存图片")
         images = [public_task_image(item, task_id=task_id, title=title, bucket=bucket) for item in image_items]
         raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses}
         db.finish_task(task_id, raw)
-        return {"task_id": task_id, "images": images, "raw": raw}
-    except HTTPException as exc:
-        db.fail_task(task_id, compact_error_detail(exc.detail))
-        raise
-    except Exception as exc:
-        db.fail_task(task_id, str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    await run_with_slot(task_id, worker)
 
 
 @app.post("/api/images/edit")
@@ -428,16 +728,17 @@ async def edit_image(
     images: list[UploadFile] = File(...),
     mask: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
+    ensure_task_slot()
     params = normalize_text_fields(parse_params(params_json))
     prompt = str(params.get("prompt") or "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
     saved_images = [await save_upload(upload) for upload in images]
-    file_fields = [("image", path, mime_type) for path, mime_type in saved_images]
+    saved_mask: tuple[Path, str] | None = None
     if mask is not None:
         mask_path, mask_mime = await save_upload(mask)
-        file_fields.append(("mask", mask_path, mask_mime))
+        saved_mask = (mask_path, mask_mime)
 
     payload = compact_params(
         {
@@ -459,14 +760,31 @@ async def edit_image(
         }
     )
     task_id = db.create_task("edit", prompt, payload)
-    title = prompt[:48] or f"task-{task_id}"
-    bucket = safe_storage_folder(title, db.now_iso())
-    try:
+    schedule_task(task_id, run_edit_task(task_id, params, prompt, saved_images, saved_mask))
+    return {"task": db.get_task(task_id)}
+
+
+async def run_edit_task(
+    task_id: int,
+    params: dict[str, Any],
+    prompt: str,
+    saved_images: list[tuple[Path, str]],
+    saved_mask: tuple[Path, str] | None,
+) -> None:
+    async def worker() -> None:
+        title = prompt[:48] or f"task-{task_id}"
+        bucket = task_image_folder(task_id, title)
         output_format = str(params.get("output_format", "png"))
         responses: list[dict[str, Any]] = []
         image_items = []
         client_config = ClientConfig(**params.get("config", {}))
-        for _ in range(int(params.get("n", 1))):
+        count = int(params.get("n", 1))
+        for index in range(count):
+            db.update_task(
+                task_id,
+                progress=min(15 + int(index / max(count, 1) * 70), 85),
+                stage=f"正在编辑第 {index + 1}/{count} 张",
+            )
             response = await call_responses_image_generation(
                 model=str(params.get("model", "gpt-5.4")),
                 prompt=prompt,
@@ -481,11 +799,16 @@ async def edit_image(
                 partial_images=params.get("partial_images"),
                 config=client_config,
                 uploaded=saved_images,
-                mask=(mask_path, mask_mime) if mask is not None else None,
+                mask=saved_mask,
                 input_fidelity=str(params.get("input_fidelity", "auto")),
             )
             responses.append(sanitize_response(response))
             image_items.extend(extract_images_from_responses(response, output_format, folder=bucket))
+            db.update_task(
+                task_id,
+                progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
+                stage=f"已收到第 {index + 1}/{count} 张编辑结果",
+            )
         if not image_items:
             raise HTTPException(
                 status_code=502,
@@ -496,16 +819,11 @@ async def edit_image(
                     "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
                 },
             )
+        db.update_task(task_id, progress=94, stage="正在保存图片")
         images_out = [public_task_image(item, task_id=task_id, title=title, bucket=bucket) for item in image_items]
         raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses}
         db.finish_task(task_id, raw)
-        return {"task_id": task_id, "images": images_out, "raw": raw}
-    except HTTPException as exc:
-        db.fail_task(task_id, compact_error_detail(exc.detail))
-        raise
-    except Exception as exc:
-        db.fail_task(task_id, str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    await run_with_slot(task_id, worker)
 
 
 @app.get("/api/tasks")
@@ -518,7 +836,35 @@ def list_tasks(limit: int = 30) -> dict[str, Any]:
                 (limit,),
             ).fetchall()
         ]
-    return {"items": tasks}
+        for task in tasks:
+            images = [
+                db.row_to_dict(image)
+                for image in conn.execute(
+                    "select * from images where task_id = ? order by id asc",
+                    (task["id"],),
+                ).fetchall()
+            ]
+            task["images"] = images
+    return {"items": tasks, "max_concurrent": MAX_CONCURRENT_TASKS, "active_count": active_task_count()}
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: int) -> dict[str, Any]:
+    return {"task": task_with_images(task_id)}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: int) -> dict[str, Any]:
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task["status"] in {"done", "failed", "canceled"}:
+        return {"task": task_with_images(task_id)}
+    running = RUNNING_TASKS.get(task_id)
+    if running:
+        running.cancel()
+    db.cancel_task(task_id)
+    return {"task": task_with_images(task_id)}
 
 
 @app.post("/api/conversations")
@@ -601,7 +947,14 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
                 (conversation_id,),
             ).fetchall()
         ]
-    return {"conversation": db.row_to_dict(conversation), "messages": messages, "images": images}
+        tasks = [
+            summarize_task(row)
+            for row in conn.execute(
+                "select * from tasks where conversation_id = ? order by id asc",
+                (conversation_id,),
+            ).fetchall()
+        ]
+    return {"conversation": db.row_to_dict(conversation), "messages": messages, "images": images, "tasks": tasks}
 
 
 @app.put("/api/messages/{message_id}")
@@ -652,6 +1005,7 @@ async def chat_message(
     params_json: str = Form(...),
     images: list[UploadFile] | None = File(default=None),
 ) -> dict[str, Any]:
+    ensure_task_slot()
     params = ChatRequest(**normalize_text_fields(parse_params(params_json)))
     uploaded = [await save_upload(upload) for upload in images or []]
 
@@ -699,88 +1053,203 @@ async def chat_message(
             (context_limit, db.now_iso(), conversation_id),
         )
 
-    context_prompt = build_context_prompt(recent_messages, params.prompt)
-    response = await call_responses_image_generation(
-        model=params.model,
-        prompt=context_prompt,
-        image_model=params.image_model,
-        size=params.size,
-        quality=params.quality,
-        output_format=params.output_format,
-        background=params.background,
-        output_compression=params.output_compression,
-        moderation=params.moderation,
-        action=params.action,
-        partial_images=params.partial_images,
-        config=params.config,
-        uploaded=uploaded,
-        input_fidelity=params.input_fidelity,
-        previous_response_id=previous_response_id,
+    task_params = compact_params(
+        {
+            "endpoint": "/v1/responses",
+            "tool": "image_generation",
+            "model": params.model,
+            "image_model": params.image_model,
+            "prompt": params.prompt,
+            "size": params.size,
+            "quality": params.quality,
+            "background": params.background,
+            "output_format": params.output_format,
+            "output_compression": params.output_compression,
+            "moderation": params.moderation,
+            "action": params.action,
+            "partial_images": params.partial_images,
+            "context_limit": context_limit,
+        }
     )
-    text = extract_text_from_responses(response)
-    bucket = safe_storage_folder(conversation_title, db.now_iso())
-    image_items = extract_images_from_responses(response, params.output_format, folder=bucket)
-    raw_for_meta = {
-        "endpoint": "/v1/responses",
-        "tool": "image_generation",
-        "response": sanitize_response(response),
-        "context_limit": context_limit,
-    }
-    if not image_items:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                "endpoint": "responses",
-                "upstream": sanitize_response(response),
-                "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-            },
+    task_id = db.create_task(
+        "chat",
+        params.prompt,
+        task_params,
+        conversation_id=conversation_id,
+        user_message_id=user_message_id,
+    )
+    schedule_task(
+        task_id,
+        run_chat_task(
+            task_id,
+            conversation_id,
+            user_message_id,
+            params,
+            uploaded,
+            previous_response_id,
+            conversation_title,
+            recent_messages,
+            context_limit,
+        ),
+    )
+    return {"task": db.get_task(task_id), "user_message_id": user_message_id}
+
+
+async def run_chat_task(
+    task_id: int,
+    conversation_id: int,
+    user_message_id: int,
+    params: ChatRequest,
+    uploaded: list[tuple[Path, str]],
+    previous_response_id: str | None,
+    conversation_title: str,
+    recent_messages: list[dict[str, Any]],
+    context_limit: int,
+) -> None:
+    async def worker() -> None:
+        db.update_task(task_id, progress=12, stage="AI 正在理解意图")
+        planner_prompt = build_chat_planner_prompt(recent_messages, params.prompt, bool(uploaded))
+        planner_response = await call_chat_planner(
+            model=params.model,
+            prompt=planner_prompt,
+            config=params.config,
+            uploaded=uploaded,
+            previous_response_id=previous_response_id,
+        )
+        planner_text = extract_text_from_responses(planner_response)
+        plan = parse_planner_json(planner_text)
+        planner_response_id = planner_response.get("id")
+        db.update_task(
+            task_id,
+            progress=34,
+            stage="AI 已完成意图判断，准备生图" if plan["should_generate"] else "AI 已判断无需生图",
         )
 
-    response_id = response.get("id")
-    with db.connect() as conn:
-        cursor = conn.execute(
-            """
-            insert into messages (conversation_id, role, content, response_id, meta_json, created_at)
-            values (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                conversation_id,
-                "assistant",
-                text or "已生成图片。",
-                response_id,
-                db.json_dumps(raw_for_meta),
-                db.now_iso(),
-            ),
-        )
-        assistant_message_id = int(cursor.lastrowid)
-        conn.execute(
-            """
-            update conversations
-            set previous_response_id = ?, updated_at = ?
-            where id = ?
-            """,
-            (response_id or previous_response_id, db.now_iso(), conversation_id),
-        )
+        raw_for_meta: dict[str, Any] = {
+            "endpoint": "/v1/responses",
+            "planner": sanitize_response(planner_response),
+            "plan": plan,
+            "context_limit": context_limit,
+        }
 
-    images_out = [
-        public_task_image(
-            item,
-            conversation_id=conversation_id,
-            message_id=assistant_message_id,
-            title=conversation_title,
-            bucket=bucket,
+        with db.connect() as conn:
+            cursor = conn.execute(
+                """
+                insert into messages (conversation_id, role, content, response_id, meta_json, created_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    "assistant",
+                    plan["reply"] or "我理解了。",
+                    planner_response_id,
+                    db.json_dumps(raw_for_meta),
+                    db.now_iso(),
+                ),
+            )
+            assistant_message_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                update conversations
+                set previous_response_id = ?, updated_at = ?
+                where id = ?
+                """,
+                (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
+            )
+
+        db.update_task(task_id, assistant_message_id=assistant_message_id)
+
+        if not plan["should_generate"]:
+            raw_for_task = {
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "text": plan["reply"],
+                "images": [],
+                "fallback": False,
+                "raw": raw_for_meta,
+            }
+            db.finish_task(task_id, raw_for_task)
+            return
+
+        image_prompt = plan["image_prompt"] or params.prompt
+        action = plan["action"] if plan["action"] in {"generate", "edit", "auto"} else params.action
+        if uploaded and action == "auto":
+            action = "edit"
+        if not uploaded and action == "edit":
+            action = "generate"
+        db.update_task(task_id, progress=48, stage=f"AI 决定执行 {action}，正在生成图片")
+        image_response = await call_responses_image_generation(
+            model=params.model,
+            prompt=image_prompt,
+            image_model=params.image_model,
+            size=params.size,
+            quality=params.quality,
+            output_format=params.output_format,
+            background=params.background,
+            output_compression=params.output_compression,
+            moderation=params.moderation,
+            action=action,
+            partial_images=params.partial_images,
+            config=params.config,
+            uploaded=uploaded,
+            input_fidelity=params.input_fidelity,
+            previous_response_id=planner_response_id or previous_response_id,
         )
-        for item in image_items
-    ]
-    return {
-        "user_message_id": user_message_id,
-        "assistant_message_id": assistant_message_id,
-        "text": text,
-        "images": images_out,
-        "fallback": False,
-        "raw": raw_for_meta,
-    }
+        db.update_task(task_id, progress=84, stage="正在提取和保存图片")
+        bucket = task_image_folder(task_id, conversation_title)
+        image_items = extract_images_from_responses(image_response, params.output_format, folder=bucket)
+        raw_for_meta["tool"] = "image_generation"
+        raw_for_meta["image_prompt"] = image_prompt
+        raw_for_meta["image_response"] = sanitize_response(image_response)
+        if not image_items:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                    "endpoint": "responses",
+                    "upstream": sanitize_response(image_response),
+                    "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                },
+            )
+
+        images_out = [
+            public_task_image(
+                item,
+                conversation_id=conversation_id,
+                message_id=assistant_message_id,
+                task_id=task_id,
+                title=conversation_title,
+                bucket=bucket,
+            )
+            for item in image_items
+        ]
+        with db.connect() as conn:
+            conn.execute(
+                "update messages set meta_json = ?, response_id = ?, updated_at = ? where id = ?",
+                (
+                    db.json_dumps(raw_for_meta),
+                    image_response.get("id") or planner_response_id,
+                    db.now_iso(),
+                    assistant_message_id,
+                ),
+            )
+            conn.execute(
+                "update conversations set previous_response_id = ?, updated_at = ? where id = ?",
+                (image_response.get("id") or planner_response_id or previous_response_id, db.now_iso(), conversation_id),
+            )
+
+        raw_for_task = {
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "text": plan["reply"],
+            "images": images_out,
+            "fallback": False,
+            "raw": raw_for_meta,
+        }
+        db.update_task(task_id, assistant_message_id=assistant_message_id, progress=96, stage="正在写入对话历史")
+        db.finish_task(task_id, raw_for_task)
+    await run_with_slot(task_id, worker)
+
 
 
 app.mount("/media/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")

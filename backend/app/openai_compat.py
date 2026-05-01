@@ -129,7 +129,10 @@ def parse_response(
     try:
         body = response.json()
     except ValueError:
-        body = {"raw": response.text}
+        text = response.text
+        body = {"raw": text, "content_type": response.headers.get("content-type", "")}
+        if looks_like_html(text):
+            body["html_error"] = summarize_html_error(text)
     if response.status_code >= 400:
         upstream = body.get("error", body) if isinstance(body, dict) else body
         raise HTTPException(
@@ -149,6 +152,9 @@ def parse_response(
 
 def readable_error_message(upstream: Any, status_code: int) -> str:
     if isinstance(upstream, dict):
+        html_error = upstream.get("html_error")
+        if isinstance(html_error, str) and html_error.strip():
+            return html_error.strip()
         for key in ("message", "detail", "raw", "error"):
             value = upstream.get(key)
             if isinstance(value, str) and value.strip():
@@ -160,6 +166,8 @@ def readable_error_message(upstream: Any, status_code: int) -> str:
 
 def suggestion_for_status(status_code: int, endpoint: str, upstream: Any) -> str:
     text = readable_error_message(upstream, status_code).lower()
+    if status_code in {524, 522, 520} or "timeout" in text:
+        return "上游接口超时或网关异常。项目已自动重试一次，仍失败时请稍后重试，或降低图片质量/尺寸后再试。"
     if status_code == 404:
         return f"当前接口没有找到 /{endpoint}。如果你使用中转服务，请确认它支持该 OpenAI 兼容路径，或换成它文档里的 base_url。"
     if status_code == 429:
@@ -169,6 +177,28 @@ def suggestion_for_status(status_code: int, endpoint: str, upstream: Any) -> str
     if "model" in text:
         return "接口可能不支持当前模型，请在模型设置里换一个可用模型后重试。"
     return "请复制完整失败原因，结合接口地址、模型和上游返回内容排查。"
+
+
+def looks_like_html(text: str) -> bool:
+    snippet = text[:512].lower()
+    return "<!doctype html" in snippet or "<html" in snippet or "<head" in snippet
+
+
+def summarize_html_error(text: str) -> str:
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+    h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", text, flags=re.IGNORECASE | re.DOTALL)
+    title = clean_html_text(title_match.group(1)) if title_match else ""
+    heading = clean_html_text(h1_match.group(1)) if h1_match else ""
+    message = title or heading or "上游接口返回了 HTML 错误页"
+    if heading and heading not in message:
+        message = f"{message}：{heading}"
+    return message
+
+
+def clean_html_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:

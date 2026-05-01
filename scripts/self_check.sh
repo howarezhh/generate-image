@@ -29,9 +29,13 @@ echo "[4/5] Checking frontend"
 curl -fsS "${URL}/" >/tmp/gpt-image-studio-index.html
 grep -q "GPT Image Studio" /tmp/gpt-image-studio-index.html
 
-echo "[5/5] Checking settings API"
+echo "[5/5] Checking settings APIs"
 curl -fsS "${URL}/api/settings" >/tmp/gpt-image-studio-settings.json
 cat /tmp/gpt-image-studio-settings.json
 echo
+curl -fsS "${URL}/api/providers" >/tmp/gpt-image-studio-providers.json
+grep -q '"items"' /tmp/gpt-image-studio-providers.json
+curl -fsS "${URL}/api/app-settings" >/tmp/gpt-image-studio-app-settings.json
+grep -q '"value"' /tmp/gpt-image-studio-app-settings.json
 
 echo "Self check passed."

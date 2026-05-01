@@ -29,3 +29,28 @@ echo ".env configured at ${ROOT_DIR}/.env"
 echo "Base URL: ${BASE_URL}"
 echo "Port: ${PORT_VALUE}"
 
+if [ -x backend/.venv/bin/python ]; then
+  backend/.venv/bin/python - <<'PY'
+from backend.app.config import DEFAULT_API_BASE_URL, DEFAULT_API_KEY, ensure_dirs
+from backend.app import database as db
+
+ensure_dirs()
+db.init_db()
+stamp = db.now_iso()
+with db.connect() as conn:
+    row = conn.execute("select id from providers order by id asc limit 1").fetchone()
+    if row:
+        conn.execute(
+            "update providers set name = ?, base_url = ?, api_key = ?, updated_at = ? where id = ?",
+            ("默认提供商", DEFAULT_API_BASE_URL, DEFAULT_API_KEY, stamp, row["id"]),
+        )
+    else:
+        conn.execute(
+            "insert into providers (name, base_url, api_key, created_at, updated_at) values (?, ?, ?, ?, ?)",
+            ("默认提供商", DEFAULT_API_BASE_URL, DEFAULT_API_KEY, stamp, stamp),
+        )
+print("SQLite provider settings initialized.")
+PY
+else
+  echo "Python virtualenv not found; provider settings will initialize on first app start."
+fi

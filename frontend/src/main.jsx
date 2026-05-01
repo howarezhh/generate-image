@@ -18,10 +18,12 @@ import {
   Loader2,
   MessageCircle,
   PanelLeft,
+  Plus,
   RefreshCw,
   Send,
   Settings2,
   Sparkles,
+  Trash2,
   Wand2,
   X,
 } from "lucide-react";
@@ -106,15 +108,6 @@ const defaults = {
   context_limit: 10,
 };
 
-function readJsonStorage(key, fallback) {
-  try {
-    const saved = localStorage.getItem(key);
-    return saved ? { ...fallback, ...JSON.parse(saved) } : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 function persistableForm(form) {
   const { prompt, ...settings } = form;
   return settings;
@@ -144,20 +137,40 @@ function optionLabel(options, value) {
   return options.find((option) => option.value === value)?.label || value;
 }
 
+function modeLabel(mode) {
+  return { chat: "对话", generate: "生成", edit: "编辑" }[mode] || mode;
+}
+
+function statusLabel(status) {
+  return {
+    queued: "排队中",
+    running: "运行中",
+    done: "已完成",
+    failed: "失败",
+    canceled: "已停止",
+  }[status] || status;
+}
+
 function App() {
-  const [config, setConfig] = useState(() => readJsonStorage("gpt-image-config", defaultConfig));
+  const [config, setConfig] = useState(defaultConfig);
+  const [providers, setProviders] = useState([]);
+  const [providerDraft, setProviderDraft] = useState({ name: "", base_url: "", api_key: "" });
+  const [editingProviderId, setEditingProviderId] = useState(null);
+  const [modeProviders, setModeProviders] = useState({ chat: "", generate: "", edit: "" });
   const [form, setForm] = useState(() => ({
-    ...normalizeFormSettings(readJsonStorage("gpt-image-form-settings", defaults)),
+    ...defaults,
     prompt: "",
   }));
-  const [controlsOpen, setControlsOpen] = useState(() => readJsonStorage("gpt-image-controls", { open: false }).open);
-  const [openGroups, setOpenGroups] = useState(() => readJsonStorage("gpt-image-open-groups", {}));
+  const [controlsOpen, setControlsOpen] = useState(false);
+  const [openGroups, setOpenGroups] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [gallery, setGallery] = useState([]);
   const [galleryHistory, setGalleryHistory] = useState([]);
   const [conversations, setConversations] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
+  const [tasks, setTasks] = useState([]);
+  const [taskMeta, setTaskMeta] = useState({ active_count: 0, max_concurrent: 3 });
   const [activeView, setActiveView] = useState("studio");
   const [conversation, setConversation] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -166,38 +179,37 @@ function App() {
   const [chatImages, setChatImages] = useState([]);
   const [copied, setCopied] = useState("");
   const scrollRef = useRef(null);
+  const taskStatusRef = useRef({});
+  const dbSettingsReadyRef = useRef(false);
+  const dbSettingsTimerRef = useRef(null);
 
   useEffect(() => {
-    localStorage.setItem("gpt-image-config", JSON.stringify(config));
-  }, [config]);
-
-  useEffect(() => {
-    localStorage.setItem("gpt-image-form-settings", JSON.stringify(persistableForm(form)));
-  }, [form]);
-
-  useEffect(() => {
-    localStorage.setItem("gpt-image-open-groups", JSON.stringify(openGroups));
-  }, [openGroups]);
-
-  useEffect(() => {
-    localStorage.setItem("gpt-image-controls", JSON.stringify({ open: controlsOpen }));
-  }, [controlsOpen]);
-
-  useEffect(() => {
-    fetch(`${API}/api/settings`)
-      .then((res) => res.json())
-      .then((data) => {
-        setConfig((current) => ({
-          base_url: current.base_url || data.base_url || defaultConfig.base_url,
-          api_key: current.api_key || data.api_key || "",
-        }));
-      })
-      .catch(() => {});
+    initializeSettings();
+    refreshProviders();
   }, []);
+
+  useEffect(() => {
+    if (!dbSettingsReadyRef.current) return;
+    if (dbSettingsTimerRef.current) clearTimeout(dbSettingsTimerRef.current);
+    dbSettingsTimerRef.current = setTimeout(() => {
+      saveAppSettings();
+    }, 500);
+    return () => {
+      if (dbSettingsTimerRef.current) clearTimeout(dbSettingsTimerRef.current);
+    };
+  }, [config, form, modeProviders]);
 
   useEffect(() => {
     refreshHistory();
     refreshGallery();
+    refreshTasks();
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      refreshTasks();
+    }, 1800);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -206,7 +218,23 @@ function App() {
     }
   }, [messages, loading]);
 
-  const submitDisabled = loading || !form.prompt.trim();
+  const runningTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
+  const modeTasks = runningTasks.filter((task) => task.mode === form.mode);
+  const latestModeTask = modeTasks[0];
+  const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
+  const submitDisabled = latestModeTask ? false : !form.prompt.trim() || atTaskLimit;
+  const activeProvider = providerForMode(form.mode);
+
+  function providerForMode(mode) {
+    const providerId = modeProviders[mode];
+    return providers.find((provider) => String(provider.id) === String(providerId)) || providers[0] || null;
+  }
+
+  function configForMode(mode) {
+    const provider = providerForMode(mode);
+    if (!provider) return config;
+    return { base_url: provider.base_url, api_key: provider.api_key };
+  }
 
   async function ensureConversation() {
     if (conversation) return conversation;
@@ -224,6 +252,18 @@ function App() {
   async function handleSubmit(event) {
     event.preventDefault();
     setError(null);
+    if (latestModeTask) {
+      await cancelTask(latestModeTask.id);
+      return;
+    }
+    await startTask();
+  }
+
+  async function startTask() {
+    if (atTaskLimit) {
+      setError(describeError({ detail: { message: "已有 3 个任务运行或排队，请等待完成后再创建新任务。" } }));
+      return;
+    }
     setLoading(true);
     try {
       if (form.mode === "generate") {
@@ -242,6 +282,7 @@ function App() {
   }
 
   async function runGenerate() {
+    const runConfig = configForMode("generate");
     const body = {
       prompt: form.prompt,
       model: form.model,
@@ -255,7 +296,7 @@ function App() {
       moderation: form.moderation,
       action: "generate",
       partial_images: Number(form.partial_images),
-      config,
+      config: runConfig,
     };
     const res = await fetch(`${API}/api/images/generate`, {
       method: "POST",
@@ -263,8 +304,8 @@ function App() {
       body: JSON.stringify(body),
     });
     const data = await parse(res);
-    setGallery((items) => [{ prompt: form.prompt, mode: "generate", images: data.images }, ...items]);
-    refreshGallery();
+    mergeTask(data.task);
+    await refreshTasks();
   }
 
   async function runEdit() {
@@ -272,6 +313,7 @@ function App() {
       throw new Error("编辑模式至少上传一张图片");
     }
     const data = new FormData();
+    const runConfig = configForMode("edit");
     const params = {
       prompt: form.prompt,
       model: form.model,
@@ -285,15 +327,15 @@ function App() {
       moderation: form.moderation,
       input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
-      config,
+      config: runConfig,
     };
     data.append("params_json", JSON.stringify(params));
     [...editImages].forEach((file) => data.append("images", file));
     if (editMask) data.append("mask", editMask);
     const res = await fetch(`${API}/api/images/edit`, { method: "POST", body: data });
     const result = await parse(res);
-    setGallery((items) => [{ prompt: form.prompt, mode: "edit", images: result.images }, ...items]);
-    refreshGallery();
+    mergeTask(result.task);
+    await refreshTasks();
   }
 
   async function runChat() {
@@ -307,6 +349,7 @@ function App() {
     setMessages((items) => [...items, localUser]);
 
     const data = new FormData();
+    const runConfig = configForMode("chat");
     const params = {
       prompt: form.prompt,
       model: form.chatModel,
@@ -321,7 +364,7 @@ function App() {
       input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
       context_limit: Number(form.context_limit),
-      config,
+      config: runConfig,
     };
     data.append("params_json", JSON.stringify(params));
     [...chatImages].forEach((file) => data.append("images", file));
@@ -330,18 +373,112 @@ function App() {
       body: data,
     });
     const result = await parse(res);
-    setMessages((items) => [
-      ...items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)),
-      {
-        id: result.assistant_message_id,
-        role: "assistant",
-        content: result.text || "已生成图片。",
-        images: result.images,
-      },
-    ]);
+    setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
+    mergeTask(result.task);
     setChatImages([]);
     refreshHistory();
-    refreshGallery();
+    refreshTasks();
+  }
+
+  async function loadAppSettings() {
+    try {
+      const res = await fetch(`${API}/api/app-settings`);
+      const data = await parse(res);
+      const value = data.value || {};
+      if (value.config) {
+        setConfig({ ...defaultConfig, ...value.config });
+      }
+      if (value.form) {
+        setForm({ ...normalizeFormSettings({ ...defaults, ...value.form }), prompt: "" });
+      }
+      if (value.modeProviders) {
+        setModeProviders({ chat: "", generate: "", edit: "", ...value.modeProviders });
+      }
+    } catch (err) {
+      setError(describeError(err));
+    } finally {
+      dbSettingsReadyRef.current = true;
+    }
+  }
+
+  async function initializeSettings() {
+    try {
+      const res = await fetch(`${API}/api/settings`);
+      const data = await parse(res);
+      setConfig({
+        base_url: data.base_url || defaultConfig.base_url,
+        api_key: data.api_key || "",
+      });
+    } catch {
+      setConfig(defaultConfig);
+    }
+    await loadAppSettings();
+  }
+
+  async function saveAppSettings() {
+    const value = {
+      config,
+      form: persistableForm(form),
+      modeProviders,
+    };
+    try {
+      await fetch(`${API}/api/app-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value }),
+      });
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  function mergeTask(task) {
+    if (!task) return;
+    setTasks((items) => [task, ...items.filter((item) => item.id !== task.id)]);
+  }
+
+  async function refreshTasks() {
+    try {
+      const res = await fetch(`${API}/api/tasks?limit=80`);
+      const data = await parse(res);
+      const items = data.items || [];
+      const completedNow = items.some((task) => {
+        const previous = taskStatusRef.current[task.id];
+        return previous && previous !== task.status && ["done", "failed", "canceled"].includes(task.status);
+      });
+      taskStatusRef.current = Object.fromEntries(items.map((task) => [task.id, task.status]));
+      setTasks(items);
+      setGallery(
+        items
+          .filter((task) => ["generate", "edit"].includes(task.mode) && task.status === "done" && task.images?.length)
+          .map((task) => ({
+            prompt: task.prompt,
+            mode: task.mode,
+            images: task.images.map((image) => ({
+              ...image,
+              url: image.public_url,
+              filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
+            })),
+          }))
+      );
+      setTaskMeta({ active_count: data.active_count || 0, max_concurrent: data.max_concurrent || 3 });
+      const activeConversationTask = conversation && items.some(
+        (task) => task.mode === "chat" && task.conversation_id === conversation.id && ["queued", "running", "done"].includes(task.status)
+      );
+      if (completedNow || activeConversationTask) {
+        refreshGallery();
+        if (conversation) loadConversation(conversation.id, { openStudio: activeView === "studio" });
+      }
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function cancelTask(taskId) {
+    const res = await fetch(`${API}/api/tasks/${taskId}/cancel`, { method: "POST" });
+    const data = await parse(res);
+    mergeTask(data.task);
+    await refreshTasks();
   }
 
   async function saveSettings() {
@@ -351,8 +488,76 @@ function App() {
       body: JSON.stringify(config),
     });
     await parse(res);
+    await saveAppSettings();
     setCopied("配置已保存");
     setTimeout(() => setCopied(""), 1400);
+  }
+
+  async function refreshProviders() {
+    try {
+      const res = await fetch(`${API}/api/providers`);
+      const data = await parse(res);
+      const items = data.items || [];
+      setProviders(items);
+      if (items.length) {
+        const ids = new Set(items.map((provider) => String(provider.id)));
+        setModeProviders((current) => ({
+          chat: ids.has(String(current.chat)) ? current.chat : String(items[0].id),
+          generate: ids.has(String(current.generate)) ? current.generate : String(items[0].id),
+          edit: ids.has(String(current.edit)) ? current.edit : String(items[0].id),
+        }));
+      }
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function saveProvider() {
+    const payload = {
+      name: providerDraft.name.trim(),
+      base_url: providerDraft.base_url.trim(),
+      api_key: providerDraft.api_key.trim(),
+    };
+    if (!payload.name || !payload.base_url) {
+      setError(describeError({ detail: { message: "提供商名称和接口地址不能为空" } }));
+      return;
+    }
+    const url = editingProviderId ? `${API}/api/providers/${editingProviderId}` : `${API}/api/providers`;
+    const res = await fetch(url, {
+      method: editingProviderId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const saved = await parse(res);
+    await refreshProviders();
+    setProviderDraft({ name: "", base_url: "", api_key: "" });
+    setEditingProviderId(null);
+    setCopied(`已保存 ${saved.name}`);
+    setTimeout(() => setCopied(""), 1400);
+  }
+
+  function editProvider(provider) {
+    setProviderDraft({ name: provider.name, base_url: provider.base_url, api_key: provider.api_key });
+    setEditingProviderId(provider.id);
+  }
+
+  async function deleteProvider(providerId) {
+    const res = await fetch(`${API}/api/providers/${providerId}`, { method: "DELETE" });
+    await parse(res);
+    setModeProviders((current) => {
+      const fallback = providers.find((provider) => provider.id !== providerId);
+      const fallbackId = fallback ? String(fallback.id) : "";
+      return {
+        chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
+        generate: String(current.generate) === String(providerId) ? fallbackId : current.generate,
+        edit: String(current.edit) === String(providerId) ? fallbackId : current.edit,
+      };
+    });
+    await refreshProviders();
+  }
+
+  function syncProviderToAll(providerId) {
+    setModeProviders({ chat: providerId, generate: providerId, edit: providerId });
   }
 
   async function newChat() {
@@ -514,7 +719,7 @@ function App() {
 
           <SettingsGroup
             title="接口配置"
-            summary={config.base_url || "未配置"}
+            summary={activeProvider ? `当前：${activeProvider.name}` : (config.base_url || "未配置")}
             open={!!openGroups.endpoint}
             onToggle={() => toggleGroup("endpoint")}
           >
@@ -533,6 +738,75 @@ function App() {
               {copied ? <Check size={17} /> : <KeyRound size={17} />}
               {copied || "保存配置"}
             </button>
+          </SettingsGroup>
+
+          <SettingsGroup
+            title="提供商管理"
+            summary={activeProvider ? `${modeLabel(form.mode)}：${activeProvider.name}` : "未配置提供商"}
+            open={!!openGroups.providers}
+            onToggle={() => toggleGroup("providers")}
+          >
+            <Select
+              label="对话模式"
+              value={modeProviders.chat}
+              onChange={(v) => setModeProviders({ ...modeProviders, chat: v })}
+              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+            />
+            <Select
+              label="生成模式"
+              value={modeProviders.generate}
+              onChange={(v) => setModeProviders({ ...modeProviders, generate: v })}
+              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+            />
+            <Select
+              label="编辑模式"
+              value={modeProviders.edit}
+              onChange={(v) => setModeProviders({ ...modeProviders, edit: v })}
+              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+            />
+            <button className="secondaryButton" type="button" onClick={() => syncProviderToAll(modeProviders[form.mode] || String(providers[0]?.id || ""))}>
+              <Check size={17} />
+              当前提供商同步到全部模式
+            </button>
+
+            <div className="providerEditor">
+              <Field label="提供商名称">
+                <input value={providerDraft.name} onChange={(e) => setProviderDraft({ ...providerDraft, name: e.target.value })} placeholder="例如 asxs / OpenAI / 备用线路" />
+              </Field>
+              <Field label="接口地址">
+                <input value={providerDraft.base_url} onChange={(e) => setProviderDraft({ ...providerDraft, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
+              </Field>
+              <Field label="密钥">
+                <input type="password" value={providerDraft.api_key} onChange={(e) => setProviderDraft({ ...providerDraft, api_key: e.target.value })} placeholder="sk-..." />
+              </Field>
+              <div className="providerActions">
+                <button className="secondaryButton" type="button" onClick={saveProvider}>
+                  <KeyRound size={16} />
+                  {editingProviderId ? "保存修改" : "新建提供商"}
+                </button>
+                {editingProviderId && (
+                  <button className="ghostButton" type="button" onClick={() => { setEditingProviderId(null); setProviderDraft({ name: "", base_url: "", api_key: "" }); }}>
+                    <X size={16} />
+                    取消
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="providerList">
+              {providers.map((provider) => (
+                <article className="providerItem" key={provider.id}>
+                  <div>
+                    <strong>{provider.name}</strong>
+                    <small>{provider.base_url}</small>
+                  </div>
+                  <div>
+                    <button type="button" onClick={() => editProvider(provider)} title="编辑"><Edit3 size={15} /></button>
+                    <button type="button" onClick={() => deleteProvider(provider.id)} title="删除"><Trash2 size={15} /></button>
+                  </div>
+                </article>
+              ))}
+            </div>
           </SettingsGroup>
 
           <SettingsGroup
@@ -629,12 +903,20 @@ function App() {
               <p><ModeIcon size={18} /> {modeMeta.title}</p>
               <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
             </div>
-            {activeView === "studio" && form.mode === "chat" && (
-              <button className="ghostButton" onClick={newChat}><RefreshCw size={17} /> 新对话</button>
+            {activeView === "studio" && (
+              <div className="headActions">
+                {form.mode === "chat" && <button className="ghostButton" onClick={newChat}><RefreshCw size={17} /> 新对话</button>}
+                <button className="ghostButton" onClick={startTask} disabled={!form.prompt.trim() || atTaskLimit}>
+                  <Plus size={17} /> 新任务
+                </button>
+              </div>
             )}
           </div>
 
           {error && <ErrorPanel error={error} onClose={() => setError(null)} />}
+          {activeView === "studio" && (
+            <TaskBoard tasks={tasks} currentMode={form.mode} meta={taskMeta} onCancel={cancelTask} onDownload={downloadImage} />
+          )}
 
           {activeView === "history" ? (
             <HistoryPane
@@ -665,7 +947,7 @@ function App() {
               {loading && (
                 <div className="message assistant">
                   <div className="avatar"><Loader2 className="spin" size={18} /></div>
-                  <div className="bubble">正在向生图接口请求，复杂图片可能需要几十秒...</div>
+                  <div className="bubble">任务已提交到后台，可以切换页面或开启其它任务。</div>
                 </div>
               )}
             </div>
@@ -679,6 +961,7 @@ function App() {
                 label="编辑图片"
                 files={editImages}
                 onChange={setEditImages}
+                onRemove={(index) => setEditImages((items) => items.filter((_, i) => i !== index))}
                 multiple
               />
             )}
@@ -687,6 +970,7 @@ function App() {
                 label="Mask"
                 files={editMask ? [editMask] : []}
                 onChange={(files) => setEditMask(files[0] || null)}
+                onRemove={() => setEditMask(null)}
               />
             )}
             {form.mode === "chat" && (
@@ -694,6 +978,7 @@ function App() {
                 label="参考图片"
                 files={chatImages}
                 onChange={setChatImages}
+                onRemove={(index) => setChatImages((items) => items.filter((_, i) => i !== index))}
                 multiple
               />
             )}
@@ -703,8 +988,8 @@ function App() {
                 onChange={(e) => setForm({ ...form, prompt: e.target.value })}
                 placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : "描述你想生成的画面..."}
               />
-              <button className="sendButton" disabled={submitDisabled}>
-                {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
+              <button className={`sendButton ${latestModeTask ? "stop" : ""}`} disabled={submitDisabled}>
+                {latestModeTask ? <X size={20} /> : loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
               </button>
             </div>
           </form>}
@@ -713,7 +998,7 @@ function App() {
           <div className="infoBlock">
             <Settings2 size={18} />
             <h3>参数提示</h3>
-            <p>对话模式走 Responses API，普通生成和编辑走 Images API。中转服务只要兼容 OpenAI 路径即可使用。</p>
+            <p>生成、编辑和对话都走 Responses API + image_generation。任务会在后台继续运行，最多同时 3 个。</p>
           </div>
           <div className="quickPrompts">
             {[
@@ -750,10 +1035,11 @@ function SettingsGroup({ title, summary, open, onToggle, children }) {
 
 function ErrorPanel({ error, onClose }) {
   const [copied, setCopied] = useState(false);
-  const detailText = error.detail || error.raw || error.summary;
+  const detailText = error.displayDetail || error.detail || error.raw || error.summary;
+  const copyText = error.copyDetail || error.detail || error.raw || error.summary;
 
   async function copyError() {
-    await navigator.clipboard.writeText(detailText);
+    await navigator.clipboard.writeText(copyText);
     setCopied(true);
     setTimeout(() => setCopied(false), 1400);
   }
@@ -777,6 +1063,67 @@ function ErrorPanel({ error, onClose }) {
       )}
       <pre>{detailText}</pre>
     </section>
+  );
+}
+
+function TaskBoard({ tasks, currentMode, meta, onCancel, onDownload }) {
+  const recent = tasks.slice(0, 8);
+  const active = recent.filter((task) => ["queued", "running"].includes(task.status));
+  if (!recent.length) return null;
+  return (
+    <section className="taskBoard">
+      <div className="taskBoardHead">
+        <strong>后台任务</strong>
+        <span>{active.length}/{meta.max_concurrent || 3} 运行或排队</span>
+      </div>
+      <div className="taskRail">
+        {recent.map((task) => (
+          <TaskCard
+            key={task.id}
+            task={task}
+            active={task.mode === currentMode}
+            onCancel={onCancel}
+            onDownload={onDownload}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function TaskCard({ task, active, onCancel, onDownload }) {
+  const progress = Number(task.progress || 0);
+  const isLive = ["queued", "running"].includes(task.status);
+  const images = (task.images || []).map((image) => ({
+    ...image,
+    url: image.public_url,
+    filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
+  }));
+  return (
+    <article className={`taskCard ${active ? "active" : ""} ${task.status}`}>
+      <div className="taskTop">
+        <span>{modeLabel(task.mode)} #{task.id}</span>
+        <strong>{statusLabel(task.status)}</strong>
+      </div>
+      <p>{task.prompt}</p>
+      <div className="progressTrack">
+        <div style={{ width: `${Math.max(4, Math.min(progress, 100))}%` }} />
+      </div>
+      <div className="taskFoot">
+        <small>{task.stage || "等待中"} · {progress}%</small>
+        {isLive && <button type="button" onClick={() => onCancel(task.id)}><X size={14} /> 停止</button>}
+      </div>
+      {task.error_detail && <pre className="taskError">{formatTaskError(task.error_detail)}</pre>}
+      {images.length > 0 && (
+        <div className="taskThumbs">
+          {images.map((image) => (
+            <button key={image.id} type="button" onClick={() => onDownload(image)}>
+              <img src={image.public_url} alt="" />
+            </button>
+          ))}
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -985,18 +1332,36 @@ function Select({ label, value, onChange, options }) {
   );
 }
 
-function UploadRow({ label, files, onChange, multiple = false }) {
+function UploadRow({ label, files, onChange, onRemove, multiple = false }) {
+  const [previews, setPreviews] = useState([]);
+
+  useEffect(() => {
+    const next = files.map((file) => ({ file, url: URL.createObjectURL(file) }));
+    setPreviews(next);
+    return () => next.forEach((item) => URL.revokeObjectURL(item.url));
+  }, [files]);
+
   return (
-    <label className="uploadRow">
-      <span><ImagePlus size={16} /> {label}</span>
-      <input
-        type="file"
-        accept="image/*"
-        multiple={multiple}
-        onChange={(event) => onChange([...event.target.files])}
-      />
-      <small>{files.length ? files.map((file) => file.name).join("，") : "未选择"}</small>
-    </label>
+    <div className="uploadRow">
+      <label className="uploadPicker">
+        <span><ImagePlus size={16} /> {label}</span>
+        <input
+          type="file"
+          accept="image/*"
+          multiple={multiple}
+          onChange={(event) => onChange([...event.target.files])}
+        />
+      </label>
+      <div className="uploadPreviewList">
+        {previews.length ? previews.map((item, index) => (
+          <div className="uploadPreview" key={`${item.file.name}-${index}`}>
+            <img src={item.url} alt={item.file.name} />
+            <small>{item.file.name}</small>
+            <button type="button" onClick={() => onRemove?.(index)} title="删除图片"><X size={14} /></button>
+          </div>
+        )) : <small className="uploadEmpty">未选择</small>}
+      </div>
+    </div>
   );
 }
 
@@ -1030,12 +1395,52 @@ function describeError(err) {
     endpoint ? ["接口", endpoint] : null,
     url ? ["地址", url] : null,
   ].filter(Boolean);
+  const fullDetail = JSON.stringify(detail, null, 2);
   return {
     summary,
     meta,
-    detail: JSON.stringify(detail, null, 2),
+    detail: fullDetail,
+    displayDetail: JSON.stringify(compactErrorForDisplay(detail), null, 2),
+    copyDetail: fullDetail,
     raw: JSON.stringify(err, null, 2),
   };
+}
+
+function compactErrorForDisplay(value) {
+  if (typeof value === "string") {
+    return compactString(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(compactErrorForDisplay);
+  }
+  if (value && typeof value === "object") {
+    const next = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (key === "raw" && typeof item === "string" && looksLikeHtml(item)) {
+        next[key] = "[上游返回 HTML 错误页，完整内容可点击“复制原因”获取]";
+      } else {
+        next[key] = compactErrorForDisplay(item);
+      }
+    }
+    return next;
+  }
+  return value;
+}
+
+function compactString(value) {
+  if (looksLikeHtml(value)) return "[上游返回 HTML 错误页，完整内容可点击“复制原因”获取]";
+  return value.length > 1600 ? `${value.slice(0, 1600)}\n...[已截断，完整内容可复制]` : value;
+}
+
+function looksLikeHtml(value) {
+  const text = value.slice(0, 400).toLowerCase();
+  return text.includes("<!doctype html") || text.includes("<html") || text.includes("<head");
+}
+
+function formatTaskError(error) {
+  return typeof error === "string"
+    ? compactString(error)
+    : JSON.stringify(compactErrorForDisplay(error), null, 2);
 }
 
 function groupImages(items) {

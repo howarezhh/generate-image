@@ -11,6 +11,8 @@
 - 支持常用参数：Responses 模型、图片工具模型、尺寸、质量、数量、背景、输出格式、压缩、moderation、partial images、action。
 - 生图失败时前端显示完整失败原因，并支持一键复制。
 - 历史对话和历史图库会轻量保存到 SQLite，可查看、修改并继续编辑旧图。
+- 生图任务后台运行，页面刷新或切换不影响任务；最多同时运行/排队 3 个任务，支持停止任务。
+- 支持提供商管理，可为对话、生成、编辑模式分别选择不同提供商；设置保存到 SQLite。
 - 本地 SQLite 记录任务、会话、消息和生成图片。
 - 移动端适配。
 - Ubuntu 一键安装和启动脚本。
@@ -74,6 +76,13 @@ bash scripts/self_check.sh
 bash scripts/stop.sh
 ```
 
+更新服务器已有项目：
+
+```bash
+cd ~/generate-image
+bash scripts/update_project.sh
+```
+
 ## 配置说明
 
 - `IMAGE_API_BASE_URL`：OpenAI 或兼容服务地址，例如 `https://api.openai.com` 或你的中转地址。
@@ -82,4 +91,4 @@ bash scripts/stop.sh
 - `DATABASE_PATH`：SQLite 数据库位置。
 - `STORAGE_DIR`：上传和输出图片目录。
 
-前端右侧配置面板也可以临时覆盖 `.env` 中的接口地址和密钥，配置会保存在浏览器本地。
+前端配置面板中的提供商、模型和图片参数会保存到 SQLite 数据库，不依赖浏览器本地存储。

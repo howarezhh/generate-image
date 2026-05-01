@@ -226,6 +226,70 @@ p {
   animation: groupIn 140ms ease-out;
 }
 
+.providerEditor {
+  border-top: 1px solid rgba(245, 243, 234, 0.12);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.providerActions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.providerList {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.providerItem {
+  border: 1px solid rgba(245, 243, 234, 0.12);
+  background: rgba(17, 19, 15, 0.34);
+  border-radius: 8px;
+  padding: 9px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.providerItem strong,
+.providerItem small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.providerItem strong {
+  font-size: 13px;
+}
+
+.providerItem small {
+  color: rgba(245, 243, 234, 0.56);
+  margin-top: 3px;
+}
+
+.providerItem > div:last-child {
+  display: flex;
+  gap: 5px;
+}
+
+.providerItem button {
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.07);
+  color: #f5f3ea;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+}
+
 @keyframes groupIn {
   from {
     opacity: 0;
@@ -315,6 +379,14 @@ textarea:focus {
   justify-content: space-between;
   gap: 14px;
   border-bottom: 1px solid rgba(245, 243, 234, 0.12);
+}
+
+.headActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .stageHead p {
@@ -414,6 +486,11 @@ textarea {
   border-color: transparent;
 }
 
+.sendButton.stop {
+  background: #d64c39;
+  color: white;
+}
+
 .sendButton:disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -426,27 +503,88 @@ textarea {
   padding: 9px 10px;
   margin-bottom: 8px;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: 150px minmax(0, 1fr);
   gap: 10px;
   align-items: center;
 }
 
-.uploadRow span {
-  display: flex;
-  align-items: center;
+.uploadPicker {
+  display: grid;
   gap: 6px;
   color: #eecb70;
 }
 
-.uploadRow input {
-  min-width: 0;
+.uploadPicker span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.uploadRow small {
+.uploadPicker input {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.uploadPreviewList {
+  min-width: 0;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.uploadPreview {
+  position: relative;
+  flex: 0 0 86px;
+  height: 72px;
+  border: 1px solid rgba(245, 243, 234, 0.16);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.uploadPreview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.uploadPreview small {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: 4px;
+  padding: 2px 4px;
+  border-radius: 5px;
+  background: rgba(17, 19, 15, 0.74);
+  color: rgba(245, 243, 234, 0.86);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+.uploadPreview button {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(214, 76, 57, 0.92);
+  color: white;
+  display: grid;
+  place-items: center;
+}
+
+.uploadEmpty {
   color: rgba(245, 243, 234, 0.62);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  align-self: center;
 }
 
 .imageGrid {
@@ -594,6 +732,147 @@ textarea {
   color: #ffd9d1;
   font-size: 12px;
   line-height: 1.55;
+}
+
+.taskBoard {
+  border-bottom: 1px solid rgba(245, 243, 234, 0.12);
+  padding: 12px 22px;
+  background: rgba(17, 19, 15, 0.34);
+}
+
+.taskBoardHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: rgba(245, 243, 234, 0.78);
+}
+
+.taskBoardHead span {
+  color: #eecb70;
+  font-size: 13px;
+}
+
+.taskRail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+  max-height: 310px;
+  overflow: auto;
+}
+
+.taskCard {
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  background: rgba(245, 243, 234, 0.055);
+  border-radius: 8px;
+  padding: 11px;
+  display: grid;
+  gap: 8px;
+}
+
+.taskCard.active {
+  border-color: rgba(238, 203, 112, 0.5);
+}
+
+.taskCard.done {
+  border-color: rgba(45, 146, 127, 0.45);
+}
+
+.taskCard.failed,
+.taskCard.canceled {
+  border-color: rgba(214, 76, 57, 0.42);
+}
+
+.taskTop,
+.taskFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.taskTop span {
+  color: #eecb70;
+  font-size: 12px;
+}
+
+.taskTop strong {
+  font-size: 12px;
+  color: rgba(245, 243, 234, 0.74);
+}
+
+.taskCard p {
+  color: #f5f3ea;
+  line-height: 1.45;
+  font-size: 13px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.progressTrack {
+  height: 7px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(245, 243, 234, 0.12);
+}
+
+.progressTrack div {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2d927f, #eecb70);
+  transition: width 300ms ease;
+}
+
+.taskFoot small {
+  color: rgba(245, 243, 234, 0.62);
+  min-width: 0;
+}
+
+.taskFoot button {
+  border: 0;
+  background: #d64c39;
+  color: white;
+  border-radius: 7px;
+  min-height: 28px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.taskError {
+  max-height: 92px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #ffd9d1;
+  font-size: 11px;
+  margin: 0;
+}
+
+.taskThumbs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+}
+
+.taskThumbs button {
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  background: transparent;
+  border-radius: 7px;
+  padding: 0;
+  overflow: hidden;
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+}
+
+.taskThumbs img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .historyPane {
