@@ -1,5 +1,6 @@
 .env
 .learnings/
+.install-state/
 backend/.venv/
 __pycache__/
 *.pyc
