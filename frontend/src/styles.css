@@ -422,7 +422,6 @@ textarea {
   border: 1px solid rgba(245, 243, 234, 0.14);
   background: rgba(0, 0, 0, 0.22);
   color: #f5f3ea;
-  text-decoration: none;
   aspect-ratio: 1;
 }
 
@@ -435,17 +434,34 @@ textarea {
   border-radius: 8px;
 }
 
-.imageCard span {
+.imageActions {
   position: absolute;
   right: 8px;
   bottom: 8px;
+  left: 8px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.imageActions a,
+.imageActions button {
+  border: 0;
   padding: 5px 8px;
   background: rgba(17, 19, 15, 0.72);
   border-radius: 6px;
+  color: #f5f3ea;
+  text-decoration: none;
   display: flex;
   align-items: center;
   gap: 4px;
   font-size: 12px;
+  backdrop-filter: blur(10px);
+}
+
+.imageActions button {
+  background: #eecb70;
+  color: #11130f;
 }
 
 .resultGroup {

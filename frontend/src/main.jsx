@@ -8,6 +8,7 @@ import {
   Copy,
   Download,
   Eraser,
+  ExternalLink,
   ImagePlus,
   KeyRound,
   Loader2,
@@ -250,6 +251,19 @@ function App() {
     setChatImages([]);
   }
 
+  async function downloadImage(image) {
+    const response = await fetch(image.url);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = image.filename || "generated-image.png";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   function toggleGroup(name) {
     setOpenGroups((groups) => ({ ...groups, [name]: !groups[name] }));
   }
@@ -403,7 +417,7 @@ function App() {
                 </div>
               )}
               {messages.map((msg) => (
-                <Message key={msg.id} msg={msg} />
+                <Message key={msg.id} msg={msg} onDownload={downloadImage} />
               ))}
               {loading && (
                 <div className="message assistant">
@@ -413,7 +427,7 @@ function App() {
               )}
             </div>
           ) : (
-            <Gallery items={gallery} loading={loading} />
+            <Gallery items={gallery} loading={loading} onDownload={downloadImage} />
           )}
 
           <form className="composer" onSubmit={handleSubmit}>
@@ -494,7 +508,7 @@ function SettingsGroup({ title, summary, open, onToggle, children }) {
   );
 }
 
-function Message({ msg }) {
+function Message({ msg, onDownload }) {
   return (
     <div className={`message ${msg.role}`}>
       <div className="avatar">{msg.role === "user" ? "你" : <Bot size={18} />}</div>
@@ -507,7 +521,7 @@ function Message({ msg }) {
         )}
         {msg.images?.length > 0 && (
           <div className="imageGrid">
-            {msg.images.map((image) => <ImageCard key={image.url} image={image} />)}
+            {msg.images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
           </div>
         )}
       </div>
@@ -515,7 +529,7 @@ function Message({ msg }) {
   );
 }
 
-function Gallery({ items, loading }) {
+function Gallery({ items, loading, onDownload }) {
   return (
     <div className="galleryPane">
       {items.length === 0 && !loading && (
@@ -537,7 +551,7 @@ function Gallery({ items, loading }) {
           <span>{item.mode}</span>
           <h3>{item.prompt}</h3>
           <div className="imageGrid">
-            {item.images.map((image) => <ImageCard key={image.url} image={image} />)}
+            {item.images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
           </div>
         </article>
       ))}
@@ -545,12 +559,21 @@ function Gallery({ items, loading }) {
   );
 }
 
-function ImageCard({ image }) {
+function ImageCard({ image, onDownload }) {
   return (
-    <a className="imageCard" href={image.url} target="_blank" rel="noreferrer">
+    <div className="imageCard">
       <img src={image.url} alt="generated" />
-      <span><Download size={14} /> 打开</span>
-    </a>
+      <div className="imageActions">
+        <a href={image.url} target="_blank" rel="noreferrer">
+          <ExternalLink size={14} />
+          预览
+        </a>
+        <button type="button" onClick={() => onDownload(image)}>
+          <Download size={14} />
+          下载
+        </button>
+      </div>
+    </div>
   );
 }
 
