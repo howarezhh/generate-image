@@ -231,6 +231,13 @@ function App() {
   const submitDisabled = latestModeTask ? false : !form.prompt.trim() || atTaskLimit;
   const activeProvider = providerForMode(form.mode);
 
+  function switchView(view) {
+    setActiveView(view);
+    if (window.innerWidth <= 760) {
+      setControlsOpen(false);
+    }
+  }
+
   function providerForMode(mode) {
     const providerId = modeProviders[mode];
     return providers.find((provider) => String(provider.id) === String(providerId)) || providers[0] || null;
@@ -659,7 +666,7 @@ function App() {
 
   function usePromptEntry(item) {
     setForm((value) => ({ ...value, prompt: item.content || "" }));
-    setActiveView("studio");
+    switchView("studio");
   }
 
   async function loadConversation(id, { openStudio = true } = {}) {
@@ -977,7 +984,7 @@ function App() {
               ["gallery", Images, "图库"],
               ["prompts", BookOpen, "提示词"],
             ].map(([value, Icon, label]) => (
-              <button key={value} className={activeView === value ? "active" : ""} onClick={() => setActiveView(value)}>
+              <button key={value} className={activeView === value ? "active" : ""} onClick={() => switchView(value)}>
                 <Icon size={16} />
                 {label}
               </button>

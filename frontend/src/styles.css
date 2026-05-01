@@ -46,6 +46,10 @@ button {
   justify-content: space-between;
   border-bottom: 1px solid rgba(245, 243, 234, 0.12);
   backdrop-filter: blur(16px);
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: rgba(17, 19, 15, 0.78);
 }
 
 .brand {
@@ -516,8 +520,11 @@ textarea {
 }
 
 .uploadPicker input {
-  min-width: 0;
-  font-size: 12px;
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .uploadPreviewList {
@@ -1216,10 +1223,18 @@ textarea {
   }
 
   .controls {
-    border-right: 0;
-    border-bottom: 1px solid rgba(245, 243, 234, 0.12);
-    max-height: 38vh;
-    padding: 12px;
+    position: fixed;
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    z-index: 25;
+    border: 1px solid rgba(245, 243, 234, 0.16);
+    border-radius: 8px;
+    max-height: min(68dvh, 620px);
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+    background: rgba(17, 19, 15, 0.94);
+    box-shadow: 0 -18px 48px rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(18px);
   }
 
   .workspace.withoutControls .controls {
@@ -1227,19 +1242,43 @@ textarea {
   }
 
   .stage {
-    min-height: 72vh;
+    min-height: calc(100dvh - 74px);
   }
 
   .stageHead {
     padding: 14px;
+    display: grid;
+    gap: 12px;
   }
 
   .viewTabs {
-    padding: 10px 14px 0;
+    padding: 10px 10px 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    overflow: visible;
+  }
+
+  .viewTabs button {
+    min-width: 0;
+    justify-content: center;
+    padding: 0 6px;
+    font-size: 14px;
+  }
+
+  .headActions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-content: stretch;
+  }
+
+  .headActions .ghostButton {
+    width: 100%;
   }
 
   .stageHead h2 {
     font-size: 20px;
+    line-height: 1.35;
   }
 
   .chatPane,
@@ -1254,6 +1293,20 @@ textarea {
 
   .uploadRow {
     grid-template-columns: 1fr;
+  }
+
+  .uploadPicker {
+    display: inline-flex;
+    width: max-content;
+    max-width: 100%;
+  }
+
+  .uploadPicker span {
+    border: 1px solid rgba(238, 203, 112, 0.34);
+    border-radius: 8px;
+    min-height: 38px;
+    padding: 0 10px;
+    background: rgba(238, 203, 112, 0.08);
   }
 
   .promptRow {

@@ -235,18 +235,38 @@ def build_context_prompt(history: list[dict[str, Any]], prompt: str) -> str:
     return "\n".join(lines)
 
 
-def build_chat_planner_prompt(history: list[dict[str, Any]], prompt: str, has_images: bool) -> str:
+def build_chat_planner_prompt(
+    history: list[dict[str, Any]],
+    prompt: str,
+    has_images: bool,
+    image_candidates: list[dict[str, Any]] | None = None,
+) -> str:
     context = build_context_prompt(history, prompt)
-    image_note = "本轮用户上传了参考图片。" if has_images else "本轮用户没有上传参考图片。"
+    image_candidates = image_candidates or []
+    if image_candidates:
+        source_note = "本轮用户上传了新图片；这些上传图已进入候选列表。" if has_images else "本轮用户没有上传新图片。"
+        lines = [f"{source_note} 当前可用图片候选如下，可由你根据上下文选择作为 edit 输入图："]
+        for index, image in enumerate(image_candidates, start=1):
+            lines.append(
+                f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
+                f"image_id={image.get('id')}, message_id={image.get('message_id')}, "
+                f"task_id={image.get('task_id')}, 提示词/说明={image.get('hint') or '无'}"
+            )
+        lines.append("候选顺序与随请求附带给你的参考图片顺序一致：候选1对应第1张参考图，候选2对应第2张参考图，以此类推。")
+        lines.append("如果用户说“继续改、改这张、上一张、刚才那张、参考我上传的图”等，请结合上下文和候选说明选择最匹配的 ref。")
+        image_note = "\n".join(lines)
+    else:
+        image_note = "本轮用户没有上传参考图片，当前对话也没有可用的最近生成图。"
     return f"""
 你是一个中文生图对话助手。你的职责不是每次都生图，而是先理解用户意图，再决定是否需要调用生图。
 
 判断规则：
 1. 如果用户只是在聊天、询问能力、补充偏好、没有明确画面/修改目标，不要生图，应继续提问或确认需求。
 2. 如果用户明确要求生成、重画、修改、继续改图，或上下文已经足够且用户表达了开始/按这个来/生成吧，应生图。
-3. 如果用户上传了参考图，优先考虑 edit；如果没有参考图，优先考虑 generate。
+3. 如果用户表达“继续改、修改、调整、保留、换成、参考某张图”等改图意图，应从候选中智能选择 reference_image_refs 后使用 edit。候选可能来自本轮上传图，也可能来自历史生成图。
 4. 如果用户在已有图片基础上提出修改意见，应把修改意见融合为新的高质量生图提示词，强调保留不应改变的部分。
 5. 生成提示词要完整、具体、适合直接传给 image_generation 工具。
+6. 如果用户要改图但你无法从候选中判断应修改哪张图，不要生图，should_generate=false，并请用户明确选择哪张。
 
 {image_note}
 
@@ -256,6 +276,8 @@ def build_chat_planner_prompt(history: list[dict[str, Any]], prompt: str, has_im
   "should_generate": true 或 false,
   "action": "generate" 或 "edit" 或 "auto",
   "image_prompt": "should_generate 为 true 时填写最终生图提示词，否则为空字符串",
+  "reference_image_refs": ["需要作为 edit 输入图的 ref，例如 upload:1 或 image:8；没有则为空数组"],
+  "reference_image_ids": [需要作为 edit 输入图的 image_id；没有则为空数组],
   "reason": "简短说明判断依据"
 }}
 
@@ -282,15 +304,91 @@ def parse_planner_json(text: str) -> dict[str, Any]:
             "should_generate": False,
             "action": "auto",
             "image_prompt": "",
+            "reference_image_refs": [],
+            "reference_image_ids": [],
             "reason": "planner returned non-json text",
         }
+    reference_refs = parsed.get("reference_image_refs") or []
+    if not isinstance(reference_refs, list):
+        reference_refs = []
+    reference_ids = parsed.get("reference_image_ids") or []
+    if not isinstance(reference_ids, list):
+        reference_ids = []
     return {
         "reply": str(parsed.get("reply") or "").strip() or "我理解了。",
         "should_generate": bool(parsed.get("should_generate")),
         "action": str(parsed.get("action") or "auto").strip(),
         "image_prompt": str(parsed.get("image_prompt") or "").strip(),
+        "reference_image_refs": [str(value).strip() for value in reference_refs if str(value).strip()],
+        "reference_image_ids": [int(value) for value in reference_ids if str(value).isdigit()],
         "reason": str(parsed.get("reason") or "").strip(),
     }
+
+
+def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for index, (path, mime_type) in enumerate(uploaded, start=1):
+        candidates.append(
+            {
+                "ref": f"upload:{index}",
+                "source": "upload",
+                "id": None,
+                "message_id": None,
+                "task_id": None,
+                "path": path,
+                "mime_type": mime_type,
+                "hint": f"本轮用户上传的第 {index} 张图片",
+            }
+        )
+    return candidates
+
+
+def load_conversation_image_candidates(conversation_id: int, limit: int = 8) -> list[dict[str, Any]]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            select i.id, i.file_path, i.mime_type, i.message_id, i.task_id, i.title, i.created_at,
+                   m.content as message_content,
+                   t.prompt as task_prompt,
+                   t.mode as task_mode
+            from images i
+            left join messages m on m.id = i.message_id
+            left join tasks t on t.id = i.task_id
+            where i.conversation_id = ?
+            order by i.id desc
+            limit ?
+            """,
+            (conversation_id, max(1, min(limit, 12))),
+        ).fetchall()
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        path = Path(row["file_path"])
+        if not path.exists():
+            continue
+        item = db.row_to_dict(row)
+        hint = item.get("task_prompt") or item.get("message_content") or item.get("title") or ""
+        item["ref"] = f"image:{item['id']}"
+        item["source"] = "history"
+        item["path"] = path
+        item["hint"] = str(hint)[:220]
+        candidates.append(item)
+    return candidates
+
+
+def selected_candidate_uploads(
+    candidates: list[dict[str, Any]],
+    reference_ids: list[int],
+    reference_refs: list[str],
+) -> list[tuple[Path, str]]:
+    selected: list[tuple[Path, str]] = []
+    wanted = set(reference_ids)
+    wanted_refs = set(reference_refs)
+    for item in candidates:
+        item_id = item.get("id")
+        item_ref = str(item.get("ref") or "")
+        if item_ref in wanted_refs or (item_id is not None and int(item_id) in wanted):
+            selected.append((item["path"], item.get("mime_type") or "image/png"))
+    return selected
 
 
 def build_image_generation_tool(
@@ -1191,16 +1289,38 @@ async def run_chat_task(
 ) -> None:
     async def worker() -> None:
         db.update_task(task_id, progress=12, stage="AI 正在理解意图")
-        planner_prompt = build_chat_planner_prompt(recent_messages, params.prompt, bool(uploaded))
+        image_candidates = [
+            *build_uploaded_image_candidates(uploaded),
+            *load_conversation_image_candidates(conversation_id),
+        ]
+        planner_reference_images = [
+            (item["path"], item.get("mime_type") or "image/png")
+            for item in image_candidates
+        ]
+        planner_prompt = build_chat_planner_prompt(
+            recent_messages,
+            params.prompt,
+            bool(uploaded),
+            image_candidates=image_candidates,
+        )
         planner_response = await call_chat_planner(
             model=params.model,
             prompt=planner_prompt,
             config=params.config,
-            uploaded=uploaded,
+            uploaded=planner_reference_images,
             previous_response_id=previous_response_id,
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_planner_json(planner_text)
+        reference_uploads = selected_candidate_uploads(
+            image_candidates,
+            plan.get("reference_image_ids", []),
+            plan.get("reference_image_refs", []),
+        )
+        if plan["should_generate"] and plan["action"] == "edit" and not reference_uploads:
+            plan["should_generate"] = False
+            plan["reply"] = "我需要先确认你要修改哪一张图片。请说明要改本轮上传的第几张，或历史记录/图库里的哪一张。"
+            plan["reason"] = "planner requested edit but did not select a reference image"
         planner_response_id = planner_response.get("id")
         db.update_task(
             task_id,
@@ -1213,6 +1333,14 @@ async def run_chat_task(
             "planner": sanitize_response(planner_response),
             "plan": plan,
             "context_limit": context_limit,
+            "image_candidates": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"path"}
+                }
+                for item in image_candidates
+            ],
         }
 
         with db.connect() as conn:
@@ -1256,10 +1384,12 @@ async def run_chat_task(
 
         image_prompt = plan["image_prompt"] or params.prompt
         action = plan["action"] if plan["action"] in {"generate", "edit", "auto"} else params.action
-        if uploaded and action == "auto":
+        if reference_uploads:
             action = "edit"
-        if not uploaded and action == "edit":
-            action = "generate"
+        edit_inputs = reference_uploads
+        raw_for_meta["selected_reference_image_refs"] = plan.get("reference_image_refs", [])
+        raw_for_meta["selected_reference_image_ids"] = plan.get("reference_image_ids", [])
+        raw_for_meta["resolved_action"] = action
         db.update_task(task_id, progress=48, stage=f"AI 决定执行 {action}，正在生成图片")
         image_response = await call_responses_image_generation(
             model=params.model,
@@ -1274,7 +1404,7 @@ async def run_chat_task(
             action=action,
             partial_images=params.partial_images,
             config=params.config,
-            uploaded=uploaded,
+            uploaded=edit_inputs,
             input_fidelity=params.input_fidelity,
             previous_response_id=planner_response_id or previous_response_id,
         )
