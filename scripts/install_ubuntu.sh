@@ -26,7 +26,7 @@ has_apt_package() {
 }
 
 echo "[1/5] Checking system packages"
-APT_PACKAGES=(python3 python3-venv python3-pip curl ca-certificates)
+APT_PACKAGES=(python3 python3-venv python3-pip curl ca-certificates git)
 MISSING_PACKAGES=()
 for package in "${APT_PACKAGES[@]}"; do
   if ! has_apt_package "$package"; then

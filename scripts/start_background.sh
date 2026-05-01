@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if [ -n "${IMAGE_API_KEY:-}" ]; then
+  echo "Configuring .env from environment variables"
+  IMAGE_API_BASE_URL="${IMAGE_API_BASE_URL:-}" IMAGE_API_KEY="${IMAGE_API_KEY}" PORT="${PORT:-8010}" bash scripts/configure_env.sh
+fi
+
+echo "Checking dependencies and frontend build"
+bash scripts/install_ubuntu.sh
+
 source scripts/common.sh
 load_env_file
 PORT="$(resolve_port)"
