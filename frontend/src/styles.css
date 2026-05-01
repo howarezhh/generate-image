@@ -158,6 +158,72 @@ p {
   background: #eecb70;
 }
 
+.settingsGroup {
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.045);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+
+.settingsGroupHead {
+  width: 100%;
+  min-height: 54px;
+  border: 0;
+  background: transparent;
+  color: #f5f3ea;
+  padding: 10px 11px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  gap: 8px;
+  align-items: center;
+  text-align: left;
+}
+
+.settingsGroupHead span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.settingsGroupHead strong {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.settingsGroupHead small {
+  color: rgba(245, 243, 234, 0.55);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settingsGroupHead svg {
+  justify-self: center;
+  color: #eecb70;
+  transition: transform 160ms ease;
+}
+
+.settingsGroup.open .settingsGroupHead svg {
+  transform: rotate(180deg);
+}
+
+.settingsGroupBody {
+  padding: 0 11px 12px;
+  animation: groupIn 140ms ease-out;
+}
+
+@keyframes groupIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .field {
   display: block;
   margin-bottom: 12px;
@@ -481,11 +547,12 @@ textarea {
   .controls {
     border-right: 0;
     border-bottom: 1px solid rgba(245, 243, 234, 0.12);
-    max-height: 46vh;
+    max-height: 38vh;
+    padding: 12px;
   }
 
   .stage {
-    min-height: 68vh;
+    min-height: 72vh;
   }
 
   .stageHead {
@@ -516,5 +583,8 @@ textarea {
   .imageGrid {
     grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   }
-}
 
+  .settingsGroupHead {
+    min-height: 50px;
+  }
+}

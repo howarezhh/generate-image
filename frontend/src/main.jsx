@@ -4,6 +4,7 @@ import {
   Bot,
   Brush,
   Check,
+  ChevronDown,
   Copy,
   Download,
   Eraser,
@@ -66,6 +67,7 @@ function App() {
     prompt: "",
   }));
   const [settingsOpen, setSettingsOpen] = useState(true);
+  const [openGroups, setOpenGroups] = useState(() => readJsonStorage("gpt-image-open-groups", {}));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [gallery, setGallery] = useState([]);
@@ -84,6 +86,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("gpt-image-form-settings", JSON.stringify(persistableForm(form)));
   }, [form]);
+
+  useEffect(() => {
+    localStorage.setItem("gpt-image-open-groups", JSON.stringify(openGroups));
+  }, [openGroups]);
 
   useEffect(() => {
     fetch(`${API}/api/settings`)
@@ -244,6 +250,10 @@ function App() {
     setChatImages([]);
   }
 
+  function toggleGroup(name) {
+    setOpenGroups((groups) => ({ ...groups, [name]: !groups[name] }));
+  }
+
   const modeMeta = useMemo(() => {
     if (form.mode === "generate") return { icon: Wand2, title: "普通生图" };
     if (form.mode === "edit") return { icon: Eraser, title: "图片编辑" };
@@ -285,56 +295,89 @@ function App() {
             ))}
           </div>
 
-          <Field label="接口地址">
-            <input value={config.base_url} onChange={(e) => setConfig({ ...config, base_url: e.target.value })} />
-          </Field>
-          <Field label="密钥">
-            <input
-              type="password"
-              value={config.api_key}
-              onChange={(e) => setConfig({ ...config, api_key: e.target.value })}
-              placeholder="sk-..."
-            />
-          </Field>
-          <button className="secondaryButton" onClick={saveSettings}>
-            {copied ? <Check size={17} /> : <KeyRound size={17} />}
-            {copied || "保存配置"}
-          </button>
-
-          <div className="divider" />
-          {form.mode === "chat" ? (
-            <>
-              <Field label="对话模型">
-                <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} />
-              </Field>
-              <Field label="生图模型">
-                <input value={form.imageModel} onChange={(e) => setForm({ ...form, imageModel: e.target.value })} />
-              </Field>
-              <Select label="动作" value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={["auto", "generate", "edit"]} />
-              <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={["auto", "high", "low"]} />
-              <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-            </>
-          ) : (
-            <Field label="模型">
-              <input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} />
+          <SettingsGroup
+            title="接口配置"
+            summary={config.base_url || "未配置"}
+            open={!!openGroups.endpoint}
+            onToggle={() => toggleGroup("endpoint")}
+          >
+            <Field label="接口地址">
+              <input value={config.base_url} onChange={(e) => setConfig({ ...config, base_url: e.target.value })} />
             </Field>
-          )}
+            <Field label="密钥">
+              <input
+                type="password"
+                value={config.api_key}
+                onChange={(e) => setConfig({ ...config, api_key: e.target.value })}
+                placeholder="sk-..."
+              />
+            </Field>
+            <button className="secondaryButton" onClick={saveSettings}>
+              {copied ? <Check size={17} /> : <KeyRound size={17} />}
+              {copied || "保存配置"}
+            </button>
+          </SettingsGroup>
 
-          <Select label="尺寸" value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={["1024x1024", "1024x1536", "1536x1024", "auto"]} />
-          <Select label="质量" value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={["auto", "low", "medium", "high"]} />
-          <Select label="背景" value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={["auto", "transparent", "opaque"]} />
-          <Select label="格式" value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={["png", "jpeg", "webp"]} />
-          {form.mode !== "chat" && (
-            <>
+          <SettingsGroup
+            title="模型设置"
+            summary={form.mode === "chat" ? `${form.chatModel} / ${form.imageModel}` : form.model}
+            open={!!openGroups.models}
+            onToggle={() => toggleGroup("models")}
+          >
+            {form.mode === "chat" ? (
+              <>
+                <Field label="对话模型">
+                  <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} />
+                </Field>
+                <Field label="生图模型">
+                  <input value={form.imageModel} onChange={(e) => setForm({ ...form, imageModel: e.target.value })} />
+                </Field>
+              </>
+            ) : (
+              <Field label="模型">
+                <input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} />
+              </Field>
+            )}
+          </SettingsGroup>
+
+          <SettingsGroup
+            title="图片参数"
+            summary={`${form.size} / ${form.quality} / ${form.output_format}`}
+            open={!!openGroups.image}
+            onToggle={() => toggleGroup("image")}
+          >
+            <Select label="尺寸" value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={["1024x1024", "1024x1536", "1536x1024", "auto"]} />
+            <Select label="质量" value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={["auto", "low", "medium", "high"]} />
+            <Select label="背景" value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={["auto", "transparent", "opaque"]} />
+            <Select label="格式" value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={["png", "jpeg", "webp"]} />
+            {form.mode !== "chat" && (
               <Field label="数量">
                 <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
               </Field>
-              <Field label="压缩 0-100">
-                <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
-              </Field>
-              <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={["auto", "low"]} />
-            </>
-          )}
+            )}
+          </SettingsGroup>
+
+          <SettingsGroup
+            title="高级选项"
+            summary={form.mode === "chat" ? `${form.action} / fidelity ${form.input_fidelity}` : `moderation ${form.moderation}`}
+            open={!!openGroups.advanced}
+            onToggle={() => toggleGroup("advanced")}
+          >
+            {form.mode === "chat" ? (
+              <>
+                <Select label="动作" value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={["auto", "generate", "edit"]} />
+                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={["auto", "high", "low"]} />
+                <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+              </>
+            ) : (
+              <>
+                <Field label="压缩 0-100">
+                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
+                </Field>
+                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={["auto", "low"]} />
+              </>
+            )}
+          </SettingsGroup>
         </aside>
 
         <section className="stage">
@@ -433,6 +476,21 @@ function App() {
         )}
       </section>
     </main>
+  );
+}
+
+function SettingsGroup({ title, summary, open, onToggle, children }) {
+  return (
+    <section className={`settingsGroup ${open ? "open" : ""}`}>
+      <button type="button" className="settingsGroupHead" onClick={onToggle}>
+        <span>
+          <strong>{title}</strong>
+          <small>{summary}</small>
+        </span>
+        <ChevronDown size={18} />
+      </button>
+      {open && <div className="settingsGroupBody">{children}</div>}
+    </section>
   );
 }
 
