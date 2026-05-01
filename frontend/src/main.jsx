@@ -13,7 +13,7 @@ import {
   KeyRound,
   Loader2,
   MessageCircle,
-  PanelRight,
+  PanelLeft,
   RefreshCw,
   Send,
   Settings2,
@@ -29,15 +29,70 @@ const defaultConfig = {
   api_key: "",
 };
 
+const chatModelOptions = [
+  { value: "gpt-5.4", label: "GPT-5.4" },
+  { value: "gpt-5.5", label: "GPT-5.5" },
+];
+
+const imageModelOptions = [
+  { value: "gpt-5.4", label: "GPT-5.4" },
+  { value: "gpt-5.5", label: "GPT-5.5" },
+  { value: "gpt-image-1", label: "GPT Image 1" },
+  { value: "gpt-image-2", label: "GPT Image 2" },
+];
+
+const sizeOptions = [
+  { value: "1536x1024", label: "电脑横屏 2K 高清" },
+  { value: "1024x1536", label: "手机竖屏 2K 高清" },
+  { value: "1024x1024", label: "方图 1K 标准" },
+  { value: "auto", label: "自动比例" },
+];
+
+const qualityOptions = [
+  { value: "high", label: "2K 高清" },
+  { value: "medium", label: "1K 标准" },
+  { value: "low", label: "快速预览" },
+  { value: "auto", label: "自动清晰度" },
+];
+
+const backgroundOptions = [
+  { value: "auto", label: "自动背景" },
+  { value: "transparent", label: "透明背景" },
+  { value: "opaque", label: "不透明背景" },
+];
+
+const formatOptions = [
+  { value: "png", label: "PNG" },
+  { value: "jpeg", label: "JPEG" },
+  { value: "webp", label: "WebP" },
+];
+
+const actionOptions = [
+  { value: "auto", label: "自动判断" },
+  { value: "generate", label: "生成新图" },
+  { value: "edit", label: "编辑参考图" },
+];
+
+const fidelityOptions = [
+  { value: "auto", label: "自动保真" },
+  { value: "high", label: "高保真" },
+  { value: "low", label: "低保真" },
+];
+
+const moderationOptions = [
+  { value: "auto", label: "自动审核" },
+  { value: "low", label: "低审核" },
+];
+
 const defaults = {
   mode: "chat",
   prompt: "",
   model: "gpt-image-1",
-  chatModel: "gpt-4.1-mini",
+  chatModel: "gpt-5.4",
   imageModel: "gpt-image-1",
   action: "auto",
-  size: "1024x1024",
-  quality: "auto",
+  size: "1536x1024",
+  quality: "high",
   n: 1,
   background: "auto",
   output_format: "png",
@@ -61,13 +116,37 @@ function persistableForm(form) {
   return settings;
 }
 
+function normalizeFormSettings(settings) {
+  const next = { ...settings };
+  if (!chatModelOptions.some((option) => option.value === next.chatModel)) {
+    next.chatModel = defaults.chatModel;
+  }
+  if (!imageModelOptions.some((option) => option.value === next.imageModel)) {
+    next.imageModel = defaults.imageModel;
+  }
+  if (!imageModelOptions.some((option) => option.value === next.model)) {
+    next.model = defaults.model;
+  }
+  if (!sizeOptions.some((option) => option.value === next.size)) {
+    next.size = defaults.size;
+  }
+  if (!qualityOptions.some((option) => option.value === next.quality)) {
+    next.quality = defaults.quality;
+  }
+  return next;
+}
+
+function optionLabel(options, value) {
+  return options.find((option) => option.value === value)?.label || value;
+}
+
 function App() {
   const [config, setConfig] = useState(() => readJsonStorage("gpt-image-config", defaultConfig));
   const [form, setForm] = useState(() => ({
-    ...readJsonStorage("gpt-image-form-settings", defaults),
+    ...normalizeFormSettings(readJsonStorage("gpt-image-form-settings", defaults)),
     prompt: "",
   }));
-  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [controlsOpen, setControlsOpen] = useState(() => readJsonStorage("gpt-image-controls", { open: false }).open);
   const [openGroups, setOpenGroups] = useState(() => readJsonStorage("gpt-image-open-groups", {}));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -91,6 +170,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("gpt-image-open-groups", JSON.stringify(openGroups));
   }, [openGroups]);
+
+  useEffect(() => {
+    localStorage.setItem("gpt-image-controls", JSON.stringify({ open: controlsOpen }));
+  }, [controlsOpen]);
 
   useEffect(() => {
     fetch(`${API}/api/settings`)
@@ -285,12 +368,13 @@ function App() {
             <span>个人生图工作台</span>
           </div>
         </div>
-        <button className="iconButton" onClick={() => setSettingsOpen((v) => !v)} title="配置">
-          <PanelRight size={20} />
+        <button className={`iconButton ${controlsOpen ? "active" : ""}`} onClick={() => setControlsOpen((v) => !v)} title="配置">
+          <PanelLeft size={20} />
         </button>
       </header>
 
-      <section className="workspace">
+      <section className={`workspace ${controlsOpen ? "withControls" : "withoutControls"}`}>
+        {controlsOpen && (
         <aside className="controls">
           <div className="modeSwitch">
             {[
@@ -340,30 +424,24 @@ function App() {
           >
             {form.mode === "chat" ? (
               <>
-                <Field label="对话模型">
-                  <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} />
-                </Field>
-                <Field label="生图模型">
-                  <input value={form.imageModel} onChange={(e) => setForm({ ...form, imageModel: e.target.value })} />
-                </Field>
+                <Select label="对话模型" value={form.chatModel} onChange={(v) => setForm({ ...form, chatModel: v })} options={chatModelOptions} />
+                <Select label="生图模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
             ) : (
-              <Field label="模型">
-                <input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} />
-              </Field>
+              <Select label="生图模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={imageModelOptions} />
             )}
           </SettingsGroup>
 
           <SettingsGroup
             title="图片参数"
-            summary={`${form.size} / ${form.quality} / ${form.output_format}`}
+            summary={`${optionLabel(sizeOptions, form.size)} / ${optionLabel(qualityOptions, form.quality)} / ${optionLabel(formatOptions, form.output_format)}`}
             open={!!openGroups.image}
             onToggle={() => toggleGroup("image")}
           >
-            <Select label="尺寸" value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={["1024x1024", "1024x1536", "1536x1024", "auto"]} />
-            <Select label="质量" value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={["auto", "low", "medium", "high"]} />
-            <Select label="背景" value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={["auto", "transparent", "opaque"]} />
-            <Select label="格式" value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={["png", "jpeg", "webp"]} />
+            <Select label="画面比例" value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={sizeOptions} />
+            <Select label="分辨率" value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={qualityOptions} />
+            <Select label="背景" value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={backgroundOptions} />
+            <Select label="格式" value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={formatOptions} />
             {form.mode !== "chat" && (
               <Field label="数量">
                 <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
@@ -373,14 +451,14 @@ function App() {
 
           <SettingsGroup
             title="高级选项"
-            summary={form.mode === "chat" ? `${form.action} / fidelity ${form.input_fidelity}` : `moderation ${form.moderation}`}
+            summary={form.mode === "chat" ? `${optionLabel(actionOptions, form.action)} / ${optionLabel(fidelityOptions, form.input_fidelity)}` : optionLabel(moderationOptions, form.moderation)}
             open={!!openGroups.advanced}
             onToggle={() => toggleGroup("advanced")}
           >
             {form.mode === "chat" ? (
               <>
-                <Select label="动作" value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={["auto", "generate", "edit"]} />
-                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={["auto", "high", "low"]} />
+                <Select label="动作" value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={actionOptions} />
+                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
                 <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
               </>
             ) : (
@@ -388,11 +466,12 @@ function App() {
                 <Field label="压缩 0-100">
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
                 </Field>
-                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={["auto", "low"]} />
+                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             )}
           </SettingsGroup>
         </aside>
+        )}
 
         <section className="stage">
           <div className="stageHead">
@@ -466,28 +545,25 @@ function App() {
             </div>
           </form>
         </section>
-
-        {settingsOpen && (
-          <aside className="sideInfo">
-            <div className="infoBlock">
-              <Settings2 size={18} />
-              <h3>参数提示</h3>
-              <p>对话模式走 Responses API，普通生成和编辑走 Images API。中转服务只要兼容 OpenAI 路径即可使用。</p>
-            </div>
-            <div className="quickPrompts">
-              {[
-                "一只玻璃质感的未来耳机，电商白底产品图，高级摄影",
-                "把参考图改成赛博朋克夜景，保持主体轮廓和构图",
-                "连续分镜第一帧：少女打开一扇发光的门，油画厚涂，电影感",
-              ].map((text) => (
-                <button key={text} onClick={() => setForm((f) => ({ ...f, prompt: text }))}>
-                  <Copy size={15} />
-                  {text}
-                </button>
-              ))}
-            </div>
-          </aside>
-        )}
+        <aside className="sideInfo">
+          <div className="infoBlock">
+            <Settings2 size={18} />
+            <h3>参数提示</h3>
+            <p>对话模式走 Responses API，普通生成和编辑走 Images API。中转服务只要兼容 OpenAI 路径即可使用。</p>
+          </div>
+          <div className="quickPrompts">
+            {[
+              "一只玻璃质感的未来耳机，电商白底产品图，高级摄影",
+              "把参考图改成赛博朋克夜景，保持主体轮廓和构图",
+              "连续分镜第一帧：少女打开一扇发光的门，油画厚涂，电影感",
+            ].map((text) => (
+              <button key={text} onClick={() => setForm((f) => ({ ...f, prompt: text }))}>
+                <Copy size={15} />
+                {text}
+              </button>
+            ))}
+          </div>
+        </aside>
       </section>
     </main>
   );
@@ -590,7 +666,10 @@ function Select({ label, value, onChange, options }) {
   return (
     <Field label={label}>
       <select value={value} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => <option key={option} value={option}>{option}</option>)}
+        {options.map((option) => {
+          const normalized = typeof option === "string" ? { value: option, label: option } : option;
+          return <option key={normalized.value} value={normalized.value}>{normalized.label}</option>;
+        })}
       </select>
     </Field>
   );

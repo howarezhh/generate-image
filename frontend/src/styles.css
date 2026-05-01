@@ -103,6 +103,12 @@ p {
   width: 42px;
 }
 
+.iconButton.active {
+  background: #eecb70;
+  color: #11130f;
+  border-color: transparent;
+}
+
 .secondaryButton,
 .ghostButton {
   padding: 0 14px;
@@ -119,7 +125,14 @@ p {
   flex: 1;
   min-height: 0;
   display: grid;
+}
+
+.workspace.withControls {
   grid-template-columns: 310px minmax(0, 1fr) 260px;
+}
+
+.workspace.withoutControls {
+  grid-template-columns: minmax(0, 1fr) 260px;
 }
 
 .controls,
@@ -540,8 +553,12 @@ textarea {
 }
 
 @media (max-width: 1080px) {
-  .workspace {
+  .workspace.withControls {
     grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .workspace.withoutControls {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .sideInfo {
@@ -565,6 +582,10 @@ textarea {
     border-bottom: 1px solid rgba(245, 243, 234, 0.12);
     max-height: 38vh;
     padding: 12px;
+  }
+
+  .workspace.withoutControls .controls {
+    display: none;
   }
 
   .stage {
