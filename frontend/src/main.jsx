@@ -102,6 +102,13 @@ const plannerEndpointOptions = [
   { value: "chat_completions", label: "Chat Completions" },
 ];
 
+const modeOptions = [
+  { value: "chat", icon: MessageCircle, label: "对话", help: "对话生图：像聊天一样描述、追问和完善想法，AI 会在合适时机生成或编辑图片。" },
+  { value: "storyboard", icon: Clapperboard, label: "分镜", help: "分镜连续生图：为视频镜头逐张生成首帧，并用上一镜头画面保持人物、场景和逻辑连续。" },
+  { value: "generate", icon: Wand2, label: "生成", help: "普通生图：直接根据一份图片提示词生成独立图片，适合一次性创作。" },
+  { value: "edit", icon: Brush, label: "编辑", help: "图片编辑：上传参考图后按你的描述改图、续画或调整画面。" },
+];
+
 const defaults = {
   mode: "chat",
   prompt: "",
@@ -1253,16 +1260,13 @@ function App() {
         {controlsOpen && (
         <aside className="controls">
           <div className="modeSwitch">
-            {[
-              ["chat", MessageCircle, "对话"],
-              ["storyboard", Clapperboard, "分镜"],
-              ["generate", Wand2, "生成"],
-              ["edit", Brush, "编辑"],
-            ].map(([value, Icon, label]) => (
+            {modeOptions.map(({ value, icon: Icon, label, help }) => (
               <button
                 key={value}
                 className={form.mode === value ? "active" : ""}
                 onClick={() => setForm((f) => ({ ...f, mode: value }))}
+                title={help}
+                aria-label={`${label}：${help}`}
               >
                 <Icon size={17} />
                 {label}
@@ -2358,6 +2362,7 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [drag, setDrag] = useState(null);
+  const stageRef = useRef(null);
   const image = state?.items?.[state.index];
   const url = image?.public_url || image?.url;
 
@@ -2378,13 +2383,19 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [state, onClose, onMove]);
 
-  if (!state || !image || !url) return null;
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!state || !stage) return undefined;
+    function handleWheel(event) {
+      event.preventDefault();
+      const direction = event.deltaY > 0 ? -0.12 : 0.12;
+      setZoom((value) => Math.max(0.25, Math.min(6, Number((value + direction).toFixed(2)))));
+    }
+    stage.addEventListener("wheel", handleWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", handleWheel);
+  }, [state, url]);
 
-  function handleWheel(event) {
-    event.preventDefault();
-    const direction = event.deltaY > 0 ? -0.12 : 0.12;
-    setZoom((value) => Math.max(0.25, Math.min(6, Number((value + direction).toFixed(2)))));
-  }
+  if (!state || !image || !url) return null;
 
   function startDrag(event) {
     event.preventDefault();
@@ -2417,7 +2428,7 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
             <button type="button" onClick={onClose} title="关闭"><X size={16} /></button>
           </div>
         </div>
-        <div className="previewStage" onWheel={handleWheel}>
+        <div className="previewStage" ref={stageRef}>
           {state.items.length > 1 && (
             <button className="previewNav prev" type="button" onClick={() => onMove(-1)} title="上一张">
               <ChevronLeft size={28} />

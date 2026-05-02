@@ -9,6 +9,7 @@ frontend/node_modules/
 frontend/dist/
 storage/*.db
 storage/*.db-*
+storage/ui-*.png
 storage/uploads/*
 storage/outputs/*
 !storage/uploads/.gitkeep
