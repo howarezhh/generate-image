@@ -2,12 +2,13 @@ import asyncio
 import copy
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,7 @@ from .openai_compat import (
     extract_images_from_responses,
     extract_text_from_responses,
     guess_mime,
+    post_chat_completions,
     post_json,
     post_json_stream,
     safe_storage_folder,
@@ -52,6 +54,8 @@ app.add_middleware(
 
 RUNNING_TASKS: dict[int, asyncio.Task[Any]] = {}
 TASK_SEMAPHORE: asyncio.Semaphore | None = None
+TASK_EVENT_SUBSCRIBERS: dict[int, set[asyncio.Queue[dict[str, Any]]]] = {}
+TASK_EVENT_SNAPSHOTS: dict[int, dict[str, dict[str, Any]]] = {}
 
 
 class ClientConfig(BaseModel):
@@ -110,6 +114,7 @@ class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = "gpt-5.4"
     planner_model: str | None = None
+    planner_endpoint: str = "responses"
     image_model: str = "gpt-image-2"
     action: str = "auto"
     size: str = "2560x1440"
@@ -130,6 +135,7 @@ class StoryboardRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = "gpt-5.4"
     planner_model: str | None = None
+    planner_endpoint: str = "responses"
     image_model: str = "gpt-image-2"
     size: str = "2560x1440"
     quality: str = "high"
@@ -357,6 +363,51 @@ def compact_error_detail(detail: Any) -> str:
     return json.dumps(detail, ensure_ascii=False, indent=2) if not isinstance(detail, str) else detail
 
 
+def sse_format(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def publish_task_event(task_id: int, event: str, data: dict[str, Any], *, snapshot: bool = True) -> None:
+    payload = {"event": event, "data": data}
+    if snapshot:
+        TASK_EVENT_SNAPSHOTS.setdefault(task_id, {})[event] = payload
+    dead: list[asyncio.Queue[dict[str, Any]]] = []
+    for queue in TASK_EVENT_SUBSCRIBERS.get(task_id, set()):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            dead.append(queue)
+    for queue in dead:
+        TASK_EVENT_SUBSCRIBERS.get(task_id, set()).discard(queue)
+
+
+def publish_task_snapshot(task_id: int) -> None:
+    task = db.get_task(task_id)
+    if task:
+        publish_task_event(task_id, "task_update", {"task": summarize_task_like(task)}, snapshot=True)
+
+
+def summarize_task_like(task: dict[str, Any]) -> dict[str, Any]:
+    item = dict(task)
+    if isinstance(item.get("params_json"), str):
+        try:
+            item["params"] = json.loads(item["params_json"])
+        except json.JSONDecodeError:
+            item["params"] = {}
+    if isinstance(item.get("response_json"), str):
+        try:
+            item["response"] = json.loads(item["response_json"])
+        except json.JSONDecodeError:
+            item["response"] = None
+    if isinstance(item.get("error"), str) and item["error"]:
+        try:
+            item["error_detail"] = json.loads(item["error"])
+        except json.JSONDecodeError:
+            item["error_detail"] = item["error"]
+    item["prompt_text"] = prompt_text_for_task(item)
+    return item
+
+
 def update_message_meta(message_id: int, updates: dict[str, Any], response_id: str | None = None) -> None:
     with db.connect() as conn:
         row = conn.execute("select meta_json from messages where id = ?", (message_id,)).fetchone()
@@ -371,6 +422,17 @@ def update_message_meta(message_id: int, updates: dict[str, Any], response_id: s
         meta.update(updates)
         values: list[Any] = [db.json_dumps(meta), db.now_iso()]
         assignments = "meta_json = ?, updated_at = ?"
+        if response_id is not None:
+            assignments += ", response_id = ?"
+            values.append(response_id)
+        values.append(message_id)
+        conn.execute(f"update messages set {assignments} where id = ?", values)
+
+
+def update_message_content(message_id: int, content: str, response_id: str | None = None) -> None:
+    with db.connect() as conn:
+        values: list[Any] = [content, db.now_iso()]
+        assignments = "content = ?, updated_at = ?"
         if response_id is not None:
             assignments += ", response_id = ?"
             values.append(response_id)
@@ -476,6 +538,7 @@ def build_chat_planner_prompt(
     prompt: str,
     has_images: bool,
     image_candidates: list[dict[str, Any]] | None = None,
+    attach_reference_images: bool = True,
 ) -> str:
     context = build_context_prompt(history, prompt)
     image_candidates = image_candidates or []
@@ -493,7 +556,10 @@ def build_chat_planner_prompt(
                 f"image_id={image.get('id')}, message_id={image.get('message_id')}, "
                 f"task_id={image.get('task_id')}, {prompt_part}"
             )
-        lines.append("候选顺序与随请求附带给你的参考图片顺序一致。")
+        if attach_reference_images:
+            lines.append("候选顺序与随请求附带给你的参考图片顺序一致。")
+        else:
+            lines.append("当前 planner 使用 chat/completions 兼容模式，只提供参考图文字说明和已知生图提示词，不附带参考图片本体；不要声称你已经看到了图片内容。")
         image_note = "\n".join(lines)
     else:
         image_note = "本轮用户没有上传或选择参考图片。"
@@ -572,9 +638,15 @@ def build_storyboard_planner_prompt(
     prompt: str,
     has_images: bool,
     shot_limit: int,
+    attach_reference_images: bool = True,
 ) -> str:
     context = build_context_prompt(history, prompt)
-    image_note = "用户本轮已经提供了角色/场景参考图，可作为第一镜头的 edit 输入。" if has_images else "用户本轮没有提供参考图，第一镜头可从文本生成开始。"
+    if has_images and attach_reference_images:
+        image_note = "用户本轮已经提供了角色/场景参考图，可作为第一镜头的 edit 输入，参考图图片已随请求提供。"
+    elif has_images:
+        image_note = "用户本轮已经指定角色/场景参考图，但当前 planner 使用 chat/completions 兼容模式，只提供参考图文字说明和已知生图提示词，不附带参考图片本体；第一镜头执行生图时仍会使用这些参考图。"
+    else:
+        image_note = "用户本轮没有提供参考图，第一镜头可从文本生成开始。"
     return f"""
 你是本项目“分镜连续生图 planner”。你只负责和用户完善视频意图、规划镜头、为每个镜头撰写单张首帧图片提示词；真正的逐张生图由后续 image_generation 工具按顺序执行。
 
@@ -1072,6 +1144,76 @@ def responses_payload_for_planner(
     return payload
 
 
+def text_delta_from_stream_event(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type") or "")
+    if event_type == "chat.completion.delta":
+        delta = event.get("delta")
+        return str(delta) if isinstance(delta, str) else ""
+    if event_type in {"response.output_text.delta", "response.text.delta"}:
+        delta = event.get("delta") or event.get("text")
+        return str(delta) if isinstance(delta, str) else ""
+    if event_type == "response.output_item.done":
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "message":
+            return extract_text_from_responses({"output": [item]})
+    return ""
+
+
+def extract_partial_json_string_field(buffer: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', buffer)
+    if not match:
+        return ""
+    index = match.end()
+    chars: list[str] = []
+    while index < len(buffer):
+        char = buffer[index]
+        if char == '"':
+            break
+        if char != "\\":
+            chars.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(buffer):
+            break
+        esc = buffer[index + 1]
+        if esc == "u":
+            raw = buffer[index + 2 : index + 6]
+            if len(raw) < 4 or not re.fullmatch(r"[0-9a-fA-F]{4}", raw):
+                break
+            chars.append(chr(int(raw, 16)))
+            index += 6
+            continue
+        chars.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f"}.get(esc, esc))
+        index += 2
+    return "".join(chars).strip()
+
+
+def make_planner_reply_stream_handler(task_id: int, message_id: int, fallback: str) -> Callable[[dict[str, Any]], None]:
+    state: dict[str, Any] = {"raw": "", "last_reply": "", "last_write": 0.0}
+
+    def on_event(event: dict[str, Any]) -> None:
+        delta = text_delta_from_stream_event(event)
+        if delta:
+            state["raw"] += delta
+        reply = extract_partial_json_string_field(str(state["raw"]), "reply")
+        if not reply or reply == state["last_reply"]:
+            return
+        now = time.monotonic()
+        if len(reply) - len(str(state["last_reply"])) < 8 and now - float(state["last_write"] or 0) < 0.35:
+            return
+        state["last_reply"] = reply
+        state["last_write"] = now
+        update_message_content(message_id, reply or fallback)
+        publish_task_event(
+            task_id,
+            "assistant_reply",
+            {"message_id": message_id, "content": reply or fallback},
+            snapshot=True,
+        )
+
+    return on_event
+
+
 async def call_chat_planner(
     *,
     model: str,
@@ -1080,20 +1222,49 @@ async def call_chat_planner(
     uploaded: list[tuple[Path, str]] | None = None,
     image_contexts: list[dict[str, Any]] | None = None,
     previous_response_id: str | None = None,
+    on_stream_event: Callable[[dict[str, Any]], None] | None = None,
+    planner_endpoint: str = "responses",
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    chat_lines: list[str] = [prompt]
     contexts = image_contexts or []
     for idx, (path, mime_type) in enumerate(uploaded or [], start=1):
         context = contexts[idx - 1] if idx - 1 < len(contexts) else {}
         ref = context.get("ref") or f"reference:{idx}"
         if context.get("source") == "upload":
             reference_text = f"Reference image {idx}: ref={ref}; 这是用户本轮上传的参考图，没有对应生图提示词。下一张 input_image 就是这个 ref 对应的图片。"
+            chat_reference_text = f"Reference image {idx}: ref={ref}; 这是用户本轮上传的参考图，没有对应生图提示词。chat/completions 兼容模式只传文字说明，不附带图片本体。"
         else:
             hint = context.get("hint") or "无对应历史提示词"
             reference_text = f"Reference image {idx}: ref={ref}; 该参考图对应的一张图片生图提示词/说明={hint}。下一张 input_image 就是这个 ref 对应的图片。"
+            chat_reference_text = f"Reference image {idx}: ref={ref}; 该参考图对应的一张图片生图提示词/说明={hint}。chat/completions 兼容模式只传文字说明，不附带图片本体。"
         content.append({"type": "input_text", "text": reference_text})
         content.append({"type": "input_image", "image_url": data_url_for_file(path, mime_type)})
+        chat_lines.append(chat_reference_text)
+
+    if planner_endpoint == "chat_completions":
+        payload = {"model": model, "messages": [{"role": "user", "content": "\n\n".join(chat_lines)}]}
+        return await post_chat_completions(
+            payload,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=CHAT_PLANNER_TIMEOUT_SECONDS,
+            max_attempts=CHAT_PLANNER_MAX_ATTEMPTS,
+            stream=on_stream_event is not None,
+            on_event=on_stream_event,
+        )
+
     payload = responses_payload_for_planner(model=model, content=content, previous_response_id=previous_response_id)
+    if on_stream_event is not None:
+        return await post_json_stream(
+            "responses",
+            payload,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=CHAT_PLANNER_TIMEOUT_SECONDS,
+            max_attempts=CHAT_PLANNER_MAX_ATTEMPTS,
+            on_event=on_stream_event,
+        )
     return await post_json(
         "responses",
         payload,
@@ -1142,20 +1313,33 @@ async def run_with_slot(task_id: int, worker: Any) -> None:
         TASK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     try:
         db.update_task(task_id, status="queued", progress=3, stage="等待生图通道")
+        publish_task_snapshot(task_id)
         async with TASK_SEMAPHORE:
             task = db.get_task(task_id)
             if task and task.get("cancel_requested"):
                 db.cancel_task(task_id)
+                publish_task_snapshot(task_id)
+                publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
                 return
             db.update_task(task_id, status="running", progress=8, stage="任务已启动")
+            publish_task_snapshot(task_id)
             await worker()
     except asyncio.CancelledError:
         db.cancel_task(task_id)
+        publish_task_snapshot(task_id)
+        publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
         raise
     except HTTPException as exc:
         db.fail_task(task_id, compact_error_detail(exc.detail))
+        publish_task_snapshot(task_id)
+        publish_task_event(task_id, "failed", {"task_id": task_id, "error": exc.detail}, snapshot=False)
     except Exception as exc:
         db.fail_task(task_id, str(exc))
+        publish_task_snapshot(task_id)
+        publish_task_event(task_id, "failed", {"task_id": task_id, "error": str(exc)}, snapshot=False)
+    else:
+        publish_task_snapshot(task_id)
+        publish_task_event(task_id, "done", {"task_id": task_id}, snapshot=False)
 
 
 def task_image_folder(task_id: int, title: str) -> str:
@@ -1596,6 +1780,47 @@ def get_task(task_id: int) -> dict[str, Any]:
     return {"task": task_with_images(task_id)}
 
 
+@app.get("/api/tasks/{task_id}/events")
+async def task_events(task_id: int, request: Request) -> StreamingResponse:
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+    TASK_EVENT_SUBSCRIBERS.setdefault(task_id, set()).add(queue)
+
+    async def stream() -> Any:
+        try:
+            yield sse_format("connected", {"task_id": task_id})
+            for payload in TASK_EVENT_SNAPSHOTS.get(task_id, {}).values():
+                yield sse_format(str(payload["event"]), payload["data"])
+            publish_task_snapshot(task_id)
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+                yield sse_format(str(payload["event"]), payload["data"])
+                if payload["event"] in {"done", "failed", "canceled"}:
+                    break
+        finally:
+            TASK_EVENT_SUBSCRIBERS.get(task_id, set()).discard(queue)
+            if not TASK_EVENT_SUBSCRIBERS.get(task_id):
+                TASK_EVENT_SUBSCRIBERS.pop(task_id, None)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: int) -> dict[str, Any]:
     task = db.get_task(task_id)
@@ -1623,6 +1848,8 @@ def cancel_task(task_id: int) -> dict[str, Any]:
     if running:
         running.cancel()
     db.cancel_task(task_id)
+    publish_task_snapshot(task_id)
+    publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
     return {"task": task_with_images(task_id)}
 
 
@@ -1905,6 +2132,7 @@ async def storyboard_message(
             "tool": "image_generation",
             "model": params.model,
             "planner_model": params.planner_model,
+            "planner_endpoint": params.planner_endpoint,
             "image_model": params.image_model,
             "prompt": params.prompt,
             "size": params.size,
@@ -1979,6 +2207,40 @@ async def run_storyboard_task(
             params.prompt,
             bool(image_candidates),
             params.shot_limit,
+            attach_reference_images=params.planner_endpoint != "chat_completions",
+        )
+        with db.connect() as conn:
+            cursor = conn.execute(
+                """
+                insert into messages (conversation_id, role, content, meta_json, created_at)
+                values (?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    "assistant",
+                    "AI 正在规划连续分镜...",
+                    db.json_dumps({"mode": "storyboard", "planner_status": "streaming", "context_limit": context_limit}),
+                    db.now_iso(),
+                ),
+            )
+            assistant_message_id = int(cursor.lastrowid)
+        db.update_task(task_id, assistant_message_id=assistant_message_id)
+        publish_task_event(
+            task_id,
+            "assistant_start",
+            {
+                "message": {
+                    "id": assistant_message_id,
+                    "conversation_id": conversation_id,
+                    "role": "assistant",
+                    "content": "AI 正在规划连续分镜...",
+                    "meta": {"mode": "storyboard", "planner_status": "streaming", "context_limit": context_limit},
+                    "image_status": "",
+                    "images": [],
+                    "uploaded_images": [],
+                }
+            },
+            snapshot=True,
         )
         planner_response = await call_chat_planner(
             model=params.planner_model or params.model,
@@ -1987,6 +2249,8 @@ async def run_storyboard_task(
             uploaded=planner_reference_images,
             image_contexts=image_candidates,
             previous_response_id=None,
+            on_stream_event=make_planner_reply_stream_handler(task_id, assistant_message_id, "AI 正在规划连续分镜..."),
+            planner_endpoint=params.planner_endpoint,
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_storyboard_plan(planner_text, params.shot_limit)
@@ -2020,27 +2284,18 @@ async def run_storyboard_task(
         }
 
         with db.connect() as conn:
-            cursor = conn.execute(
-                """
-                insert into messages (conversation_id, role, content, response_id, meta_json, created_at)
-                values (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    conversation_id,
-                    "assistant",
-                    plan["reply"] or "我理解了。",
-                    planner_response_id,
-                    db.json_dumps(raw_for_meta),
-                    db.now_iso(),
-                ),
-            )
-            assistant_message_id = int(cursor.lastrowid)
             conn.execute(
                 "update conversations set previous_response_id = ?, updated_at = ? where id = ?",
                 (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
             )
-
-        db.update_task(task_id, assistant_message_id=assistant_message_id)
+        update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
+        update_message_meta(assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
+        publish_task_event(
+            task_id,
+            "assistant_reply",
+            {"message_id": assistant_message_id, "content": plan["reply"] or "我理解了。"},
+            snapshot=True,
+        )
 
         if not plan["should_generate"]:
             db.finish_task(
@@ -2457,6 +2712,7 @@ async def chat_message(
             "tool": "image_generation",
             "model": params.model,
             "planner_model": params.planner_model,
+            "planner_endpoint": params.planner_endpoint,
             "image_model": params.image_model,
             "prompt": params.prompt,
             "size": params.size,
@@ -2528,6 +2784,40 @@ async def run_chat_task(
             params.prompt,
             bool(image_candidates),
             image_candidates=image_candidates,
+            attach_reference_images=params.planner_endpoint != "chat_completions",
+        )
+        with db.connect() as conn:
+            cursor = conn.execute(
+                """
+                insert into messages (conversation_id, role, content, meta_json, created_at)
+                values (?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    "assistant",
+                    "AI 正在理解你的需求...",
+                    db.json_dumps({"planner_status": "streaming", "context_limit": context_limit}),
+                    db.now_iso(),
+                ),
+            )
+            assistant_message_id = int(cursor.lastrowid)
+        db.update_task(task_id, assistant_message_id=assistant_message_id)
+        publish_task_event(
+            task_id,
+            "assistant_start",
+            {
+                "message": {
+                    "id": assistant_message_id,
+                    "conversation_id": conversation_id,
+                    "role": "assistant",
+                    "content": "AI 正在理解你的需求...",
+                    "meta": {"planner_status": "streaming", "context_limit": context_limit},
+                    "image_status": "",
+                    "images": [],
+                    "uploaded_images": [],
+                }
+            },
+            snapshot=True,
         )
         planner_response = await call_chat_planner(
             model=params.planner_model or params.model,
@@ -2536,6 +2826,8 @@ async def run_chat_task(
             uploaded=planner_reference_images,
             image_contexts=image_candidates,
             previous_response_id=None,
+            on_stream_event=make_planner_reply_stream_handler(task_id, assistant_message_id, "AI 正在理解你的需求..."),
+            planner_endpoint=params.planner_endpoint,
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_planner_json(planner_text)
@@ -2570,21 +2862,6 @@ async def run_chat_task(
         }
 
         with db.connect() as conn:
-            cursor = conn.execute(
-                """
-                insert into messages (conversation_id, role, content, response_id, meta_json, created_at)
-                values (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    conversation_id,
-                    "assistant",
-                    plan["reply"] or "我理解了。",
-                    planner_response_id,
-                    db.json_dumps(raw_for_meta),
-                    db.now_iso(),
-                ),
-            )
-            assistant_message_id = int(cursor.lastrowid)
             conn.execute(
                 """
                 update conversations
@@ -2593,8 +2870,14 @@ async def run_chat_task(
                 """,
                 (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
             )
-
-        db.update_task(task_id, assistant_message_id=assistant_message_id)
+        update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
+        update_message_meta(assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
+        publish_task_event(
+            task_id,
+            "assistant_reply",
+            {"message_id": assistant_message_id, "content": plan["reply"] or "我理解了。"},
+            snapshot=True,
+        )
 
         if not plan["should_generate"]:
             raw_for_task = {

@@ -94,6 +94,121 @@ async def post_json_stream(
     )
 
 
+async def post_chat_completions(
+    payload: dict[str, Any],
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: float = 120.0,
+    max_attempts: int = 2,
+    stream: bool = False,
+    on_event: Any | None = None,
+) -> dict[str, Any]:
+    endpoint = "chat/completions"
+    url = responses_url(base_url, endpoint)
+    client = create_async_client(base_url=base_url, api_key=api_key, timeout=timeout)
+    last_exc: HTTPException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await create_chat_completion_once(client, payload, stream=stream, on_event=on_event)
+        except HTTPException as exc:
+            last_exc = exc
+            if attempt >= max_attempts or not is_retryable_http_exception(exc):
+                raise
+            await asyncio.sleep(retry_delay_seconds(attempt, exc))
+        except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as exc:
+            http_exc = sdk_exception_to_http_exception(exc, endpoint=endpoint, url=url, payload=payload)
+            last_exc = http_exc
+            if attempt >= max_attempts or not is_retryable_http_exception(http_exc):
+                raise http_exc from exc
+            await asyncio.sleep(retry_delay_seconds(attempt, http_exc))
+    assert last_exc is not None
+    raise last_exc
+
+
+async def create_chat_completion_once(
+    client: AsyncOpenAI,
+    payload: dict[str, Any],
+    *,
+    stream: bool,
+    on_event: Any | None = None,
+) -> dict[str, Any]:
+    if not stream:
+        response = sdk_to_plain(await client.chat.completions.create(**payload))
+        return chat_completion_to_responses_like(response)
+
+    chunks: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    stream_obj = await client.chat.completions.create(**payload, stream=True)
+    try:
+        async for raw_chunk in stream_obj:
+            chunk = sdk_to_plain(raw_chunk)
+            chunks.append(chunk)
+            delta = chat_completion_delta_text(chunk)
+            if delta:
+                text_parts.append(delta)
+                if on_event is not None:
+                    on_event({"type": "chat.completion.delta", "delta": delta, "chunk": chunk})
+    finally:
+        close = getattr(stream_obj, "close", None)
+        if callable(close):
+            closed = close()
+            if inspect.isawaitable(closed):
+                await closed
+    text = "".join(text_parts).strip()
+    result = responses_like_from_text(text, chunks[-1].get("id") if chunks else None)
+    result["_chat_completion_stream_chunks"] = summarize_chat_stream_chunks(chunks)
+    return result
+
+
+def chat_completion_delta_text(chunk: dict[str, Any]) -> str:
+    choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") if isinstance(choices[0], dict) else {}
+    content = delta.get("content") if isinstance(delta, dict) else ""
+    return content if isinstance(content, str) else ""
+
+
+def chat_completion_to_responses_like(response: dict[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices") if isinstance(response.get("choices"), list) else []
+    text = ""
+    if choices and isinstance(choices[0], dict):
+        message = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
+        content = message.get("content") if isinstance(message, dict) else ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict)).strip()
+    result = responses_like_from_text(text.strip(), response.get("id"))
+    result["_chat_completion"] = sanitize_response(response)
+    return result
+
+
+def responses_like_from_text(text: str, response_id: str | None) -> dict[str, Any]:
+    return {
+        "id": response_id,
+        "output_text": text,
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+    }
+
+
+def summarize_chat_stream_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for chunk in chunks:
+        item: dict[str, Any] = {"id": chunk.get("id"), "object": chunk.get("object")}
+        delta = chat_completion_delta_text(chunk)
+        if delta:
+            item["delta"] = delta[:120]
+        summary.append({key: value for key, value in item.items() if value})
+    return summary
+
+
 async def post_responses_with_sdk(
     endpoint: str,
     payload: dict[str, Any],

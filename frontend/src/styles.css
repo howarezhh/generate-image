@@ -311,6 +311,12 @@ p {
   margin-bottom: 6px;
 }
 
+.fieldLabel[title] {
+  cursor: help;
+  text-decoration: underline dotted rgba(245, 243, 234, 0.35);
+  text-underline-offset: 3px;
+}
+
 .field input,
 .field select,
 textarea {
@@ -787,6 +793,123 @@ textarea {
 .imageActions button {
   background: #eecb70;
   color: #11130f;
+}
+
+.previewOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 5, 3, 0.78);
+  backdrop-filter: blur(16px);
+}
+
+.previewPanel {
+  width: min(1180px, calc(100vw - 48px));
+  height: min(820px, calc(100vh - 48px));
+  border: 1px solid rgba(238, 203, 112, 0.28);
+  border-radius: 18px;
+  background: linear-gradient(145deg, rgba(20, 23, 17, 0.98), rgba(7, 9, 7, 0.98));
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.62);
+  overflow: hidden;
+}
+
+.previewHeader {
+  height: 68px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(245, 243, 234, 0.11);
+}
+
+.previewHeader strong,
+.previewHeader small {
+  display: block;
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.previewHeader small {
+  margin-top: 4px;
+  color: rgba(245, 243, 234, 0.55);
+  font-size: 12px;
+}
+
+.previewHeaderActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.previewHeaderActions button,
+.previewNav {
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  background: rgba(245, 243, 234, 0.08);
+  color: #f5f3ea;
+  border-radius: 9px;
+  min-height: 34px;
+  padding: 7px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.previewHeaderActions button:hover,
+.previewNav:hover {
+  border-color: rgba(238, 203, 112, 0.58);
+  background: rgba(238, 203, 112, 0.18);
+}
+
+.previewStage {
+  position: relative;
+  height: calc(100% - 68px);
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(circle at 20% 15%, rgba(238, 203, 112, 0.08), transparent 34%),
+    linear-gradient(45deg, rgba(255, 255, 255, 0.035) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.035) 75%),
+    linear-gradient(45deg, rgba(255, 255, 255, 0.035) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.035) 75%);
+  background-position: 0 0, 0 0, 16px 16px;
+  background-size: auto, 32px 32px, 32px 32px;
+}
+
+.previewStage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+  transform-origin: center;
+  transition: transform 80ms linear;
+}
+
+.previewNav {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 48px;
+  height: 62px;
+  padding: 0;
+  justify-content: center;
+  background: rgba(17, 19, 15, 0.72);
+  backdrop-filter: blur(10px);
+}
+
+.previewNav.prev {
+  left: 16px;
+}
+
+.previewNav.next {
+  right: 16px;
 }
 
 .imagePromptBox {

@@ -6,6 +6,8 @@ import {
   Brush,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clapperboard,
   Clock3,
   Copy,
@@ -33,7 +35,7 @@ import {
 import "./styles.css";
 
 const API = "";
-const APP_SETTINGS_VERSION = 3;
+const APP_SETTINGS_VERSION = 4;
 
 const defaultConfig = {
   base_url: "https://api.asxs.top/v1",
@@ -95,11 +97,17 @@ const moderationOptions = [
   { value: "low", label: "低审核" },
 ];
 
+const plannerEndpointOptions = [
+  { value: "responses", label: "Responses（默认）" },
+  { value: "chat_completions", label: "Chat Completions" },
+];
+
 const defaults = {
   mode: "chat",
   prompt: "",
   model: "gpt-5.4",
   chatModel: "gpt-5.4",
+  plannerEndpoint: "responses",
   imageModel: "gpt-image-2",
   action: "auto",
   size: "2560x1440",
@@ -124,6 +132,9 @@ function normalizeFormSettings(settings) {
   const next = { ...settings };
   if (!String(next.chatModel || "").trim()) {
     next.chatModel = defaults.chatModel;
+  }
+  if (!plannerEndpointOptions.some((option) => option.value === next.plannerEndpoint)) {
+    next.plannerEndpoint = defaults.plannerEndpoint;
   }
   if (!imageModelOptions.some((option) => option.value === next.imageModel)) {
     next.imageModel = defaults.imageModel;
@@ -198,6 +209,7 @@ function App() {
   const [editMask, setEditMask] = useState(null);
   const [chatImages, setChatImages] = useState([]);
   const [chatReferenceImages, setChatReferenceImages] = useState([]);
+  const [previewState, setPreviewState] = useState(null);
   const [copied, setCopied] = useState("");
   const [runningPanelOpen, setRunningPanelOpen] = useState(false);
   const scrollRef = useRef(null);
@@ -209,6 +221,7 @@ function App() {
   const conversationRef = useRef(conversation);
   const selectedTaskRef = useRef(selectedTask);
   const conversationLoadSeqRef = useRef(0);
+  const taskEventSourcesRef = useRef(new Map());
 
   useEffect(() => {
     activeViewRef.current = activeView;
@@ -220,6 +233,10 @@ function App() {
   useEffect(() => {
     initializeSettings();
     refreshProviders();
+    return () => {
+      taskEventSourcesRef.current.forEach((source) => source.close());
+      taskEventSourcesRef.current.clear();
+    };
   }, []);
 
   useEffect(() => {
@@ -297,6 +314,25 @@ function App() {
     const provider = providerForMode(mode);
     if (!provider) return config;
     return { base_url: provider.base_url, api_key: provider.api_key };
+  }
+
+  function openImagePreview(images, index = 0) {
+    const items = uniqueImages(images).filter((image) => image.url || image.public_url);
+    if (!items.length) return;
+    const safeIndex = Math.max(0, Math.min(index, items.length - 1));
+    setPreviewState({ items, index: safeIndex });
+  }
+
+  function closeImagePreview() {
+    setPreviewState(null);
+  }
+
+  function moveImagePreview(offset) {
+    setPreviewState((current) => {
+      if (!current?.items?.length) return current;
+      const nextIndex = (current.index + offset + current.items.length) % current.items.length;
+      return { ...current, index: nextIndex };
+    });
   }
 
   function plannerConfigForMode(mode) {
@@ -521,6 +557,7 @@ function App() {
       prompt: form.prompt,
       model: form.model,
       planner_model: form.chatModel.trim() || null,
+      planner_endpoint: form.plannerEndpoint,
       image_model: form.imageModel,
       action: form.action,
       size: form.size,
@@ -545,6 +582,7 @@ function App() {
     const result = await parse(res);
     setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
     mergeTask(result.task);
+    startTaskEventStream(result.task?.id, active.id);
     setChatImages([]);
     await refreshHistory();
     await refreshTasks();
@@ -569,6 +607,7 @@ function App() {
       prompt: form.prompt,
       model: form.model,
       planner_model: form.chatModel.trim() || null,
+      planner_endpoint: form.plannerEndpoint,
       image_model: form.imageModel,
       size: form.size,
       quality: form.quality,
@@ -593,6 +632,7 @@ function App() {
     const result = await parse(res);
     setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
     mergeTask(result.task);
+    startTaskEventStream(result.task?.id, active.id);
     setChatImages([]);
     await refreshHistory();
     await refreshTasks();
@@ -668,6 +708,77 @@ function App() {
     setTasks((items) => [task, ...items.filter((item) => item.id !== task.id)]);
   }
 
+  function closeTaskEventStream(taskId) {
+    const source = taskEventSourcesRef.current.get(Number(taskId));
+    if (source) {
+      source.close();
+      taskEventSourcesRef.current.delete(Number(taskId));
+    }
+  }
+
+  function parseEventData(event) {
+    try {
+      return JSON.parse(event.data || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function upsertStreamingMessage(message, conversationId) {
+    if (!message || Number(conversationRef.current?.id) !== Number(conversationId || message.conversation_id)) return;
+    setMessages((items) => {
+      const normalized = {
+        ...message,
+        meta: message.meta || {},
+        images: message.images || [],
+        uploaded_images: message.uploaded_images || [],
+      };
+      const exists = items.some((item) => Number(item.id) === Number(normalized.id));
+      if (exists) {
+        return items.map((item) => (Number(item.id) === Number(normalized.id) ? { ...item, ...normalized } : item));
+      }
+      return [...items, normalized];
+    });
+  }
+
+  function updateStreamingMessageContent(messageId, content, conversationId) {
+    if (Number(conversationRef.current?.id) !== Number(conversationId)) return;
+    setMessages((items) => items.map((item) => (
+      Number(item.id) === Number(messageId) ? { ...item, content } : item
+    )));
+  }
+
+  function startTaskEventStream(taskId, conversationId) {
+    if (!taskId || typeof EventSource === "undefined") return;
+    closeTaskEventStream(taskId);
+    const source = new EventSource(`${API}/api/tasks/${taskId}/events`);
+    taskEventSourcesRef.current.set(Number(taskId), source);
+
+    source.addEventListener("assistant_start", (event) => {
+      const data = parseEventData(event);
+      upsertStreamingMessage(data.message, conversationId);
+    });
+    source.addEventListener("assistant_reply", (event) => {
+      const data = parseEventData(event);
+      updateStreamingMessageContent(data.message_id, data.content || "", conversationId);
+    });
+    source.addEventListener("task_update", (event) => {
+      const data = parseEventData(event);
+      if (data.task) mergeTask(data.task);
+    });
+    for (const eventName of ["done", "failed", "canceled"]) {
+      source.addEventListener(eventName, async () => {
+        closeTaskEventStream(taskId);
+        await refreshTasks();
+        await refreshHistory();
+        await refreshPrompts();
+      });
+    }
+    source.onerror = () => {
+      closeTaskEventStream(taskId);
+    };
+  }
+
   async function refreshTasks(options = {}) {
     try {
       const res = await fetch(`${API}/api/tasks?limit=80`);
@@ -703,6 +814,7 @@ function App() {
   async function cancelTask(taskId) {
     const res = await fetch(`${API}/api/tasks/${taskId}/cancel`, { method: "POST" });
     const data = await parse(res);
+    closeTaskEventStream(taskId);
     mergeTask(data.task);
     await refreshTasks();
   }
@@ -721,6 +833,7 @@ function App() {
     try {
       const res = await fetch(`${API}/api/tasks/${taskId}`, { method: "DELETE" });
       await parse(res);
+      closeTaskEventStream(taskId);
       setSelectedTask(null);
       setTasks((items) => items.filter((task) => Number(task.id) !== Number(taskId)));
       await refreshTasks();
@@ -1121,6 +1234,7 @@ function App() {
   const ModeIcon = modeMeta.icon;
 
   return (
+    <>
     <main className="app">
       <header className="topbar">
         <div className="brand">
@@ -1164,36 +1278,42 @@ function App() {
           >
             <Select
               label="对话生图"
+              help="对话模式真正执行 image_generation 生图的接口线路。"
               value={modeProviders.chat}
               onChange={(v) => setModeProviders({ ...modeProviders, chat: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
               label="对话规划"
+              help="负责理解对话、判断是否生图、撰写单张图片提示词的模型线路。"
               value={plannerProviders.chat}
               onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
               label="分镜生图"
+              help="分镜模式逐张生成镜头首帧图片时使用的生图接口线路。"
               value={modeProviders.storyboard}
               onChange={(v) => setModeProviders({ ...modeProviders, storyboard: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
               label="分镜规划"
+              help="负责规划人物场景概述、镜头列表和每张首帧提示词的模型线路。"
               value={plannerProviders.storyboard}
               onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
               label="生成模式"
+              help="普通文本生图任务使用的生图接口线路。"
               value={modeProviders.generate}
               onChange={(v) => setModeProviders({ ...modeProviders, generate: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
               label="编辑模式"
+              help="上传图片后进行编辑、改图或局部处理时使用的接口线路。"
               value={modeProviders.edit}
               onChange={(v) => setModeProviders({ ...modeProviders, edit: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
@@ -1245,7 +1365,7 @@ function App() {
 
           <SettingsGroup
             title="模型设置"
-            summary={["chat", "storyboard"].includes(form.mode) ? `规划 ${form.chatModel} / 生图 ${form.model} + ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
+            summary={["chat", "storyboard"].includes(form.mode) ? `规划 ${form.chatModel} · ${optionLabel(plannerEndpointOptions, form.plannerEndpoint)} / 生图 ${form.model} + ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
             open={!!openGroups.models}
             onToggle={() => toggleGroup("models")}
           >
@@ -1254,6 +1374,13 @@ function App() {
                 <Field label="规划模型">
                   <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} placeholder="例如 qwen-plus / deepseek-chat / gpt-5.4" />
                 </Field>
+                <Select
+                  label="规划接口格式"
+                  help="默认用 Responses；只有规划模型不支持 Responses 时，才显式切到 Chat Completions。生图执行始终走 Responses。"
+                  value={form.plannerEndpoint}
+                  onChange={(v) => setForm({ ...form, plannerEndpoint: v })}
+                  options={plannerEndpointOptions}
+                />
                 <Select label="生图 Responses 模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
                 <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
@@ -1395,6 +1522,7 @@ function App() {
               onSaveMessage={saveMessage}
               onDownload={downloadImage}
               onUseImage={useImageAsReference}
+              onPreview={openImagePreview}
               onCancelTask={cancelTask}
               onRetryTask={retryTask}
               onDeleteTask={deleteTask}
@@ -1407,6 +1535,7 @@ function App() {
               onRefresh={() => runRefresh("gallery", () => refreshGallery({ throwError: true }))}
               onDownload={downloadImage}
               onUseImage={useImageAsReference}
+              onPreview={openImagePreview}
             />
           ) : activeView === "prompts" ? (
             <PromptLibrary
@@ -1439,7 +1568,7 @@ function App() {
                 </div>
               )}
               {messages.map((msg) => (
-                <Message key={msg.id} msg={msg} onDownload={downloadImage} />
+                <Message key={msg.id} msg={msg} onDownload={downloadImage} onPreview={openImagePreview} previewImages={chatGeneratedImages} />
               ))}
               {liveChatTasks.map((task) => (
                 <ChatTaskProgress key={task.id} task={task} />
@@ -1506,6 +1635,13 @@ function App() {
         </section>
       </section>
     </main>
+    <ImagePreviewModal
+      state={previewState}
+      onClose={closeImagePreview}
+      onMove={moveImagePreview}
+      onDownload={downloadImage}
+    />
+    </>
   );
 }
 
@@ -1578,6 +1714,7 @@ function HistoryPane({
   onSaveMessage,
   onDownload,
   onUseImage,
+  onPreview,
   onCancelTask,
   onRetryTask,
   onDeleteTask,
@@ -1598,6 +1735,10 @@ function HistoryPane({
     }
     return [...byId.values()].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
   }, [selected, tasks]);
+  const conversationPreviewImages = useMemo(
+    () => uniqueImages((selected?.messages || []).flatMap((msg) => msg.images || [])),
+    [selected],
+  );
 
   useEffect(() => {
     if (!selected?.conversation) return;
@@ -1642,6 +1783,7 @@ function HistoryPane({
             onCancel={onCancelTask}
             onDownload={onDownload}
             onUseImage={onUseImage}
+            onPreview={onPreview}
             onContinue={onContinue}
             onDelete={onDeleteTask}
             onRetry={onRetryTask}
@@ -1699,15 +1841,24 @@ function HistoryPane({
                   )}
                   {msg.images?.length > 0 && (
                     <div className="imageGrid">
-                      {msg.images.map((image) => (
-                        <ImageCard key={image.url} image={image} onDownload={onDownload} onUseImage={onUseImage} />
+                      {msg.images.map((image, index) => (
+                        <ImageCard
+                          key={image.url}
+                          image={image}
+                          onDownload={onDownload}
+                          onUseImage={onUseImage}
+                          onPreview={() => {
+                            const previewIndex = conversationPreviewImages.findIndex((item) => Number(item.id) === Number(image.id));
+                            onPreview(conversationPreviewImages.length ? conversationPreviewImages : msg.images, previewIndex >= 0 ? previewIndex : index);
+                          }}
+                        />
                       ))}
                     </div>
                   )}
                   {msg.uploaded_images?.length > 0 && (
                     <div className="imageGrid uploadedImageGrid">
-                      {msg.uploaded_images.map((image) => (
-                        <ImageCard key={image.url} image={image} onDownload={onDownload} />
+                      {msg.uploaded_images.map((image, index) => (
+                        <ImageCard key={image.url} image={image} onDownload={onDownload} onPreview={() => onPreview(msg.uploaded_images, index)} />
                       ))}
                     </div>
                   )}
@@ -1859,7 +2010,7 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
   );
 }
 
-function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDelete, onRetry }) {
+function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onContinue, onDelete, onRetry }) {
   const [copyState, setCopyState] = useState("idle");
   const isLive = ["queued", "running"].includes(task.status);
   const images = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
@@ -1929,7 +2080,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDele
             <small>{inputImages.length} 张</small>
           </div>
           <div className="imageGrid uploadedImageGrid">
-            {inputImages.map((image) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} />)}
+            {inputImages.map((image, index) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} onPreview={() => onPreview(inputImages, index)} />)}
           </div>
         </section>
       )}
@@ -1940,7 +2091,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDele
             <small>{images.length} 张</small>
           </div>
           <div className="imageGrid">
-            {images.map((image) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} onUseImage={onUseImage} />)}
+            {images.map((image, index) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} onUseImage={onUseImage} onPreview={() => onPreview(images, index)} />)}
           </div>
         </section>
       ) : (
@@ -2090,7 +2241,7 @@ function PromptLibrary({
   );
 }
 
-function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage }) {
+function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage, onPreview }) {
   const groups = groupImages(items);
   return (
     <div className="galleryHistory">
@@ -2111,7 +2262,7 @@ function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage
             <small>{group.time}</small>
           </div>
           <div className="imageGrid">
-            {group.items.map((image) => <ImageCard key={image.id} image={image} onDownload={onDownload} onUseImage={onUseImage} />)}
+            {group.items.map((image, index) => <ImageCard key={image.id} image={image} onDownload={onDownload} onUseImage={onUseImage} onPreview={() => onPreview(group.items, index)} />)}
           </div>
         </article>
       ))}
@@ -2171,7 +2322,7 @@ function ChatReferencePicker({ images, selected, onToggle }) {
   );
 }
 
-function Message({ msg, onDownload }) {
+function Message({ msg, onDownload, onPreview, previewImages = [] }) {
   return (
     <div className={`message ${msg.role}`}>
       <div className="avatar">{msg.role === "user" ? "你" : <Bot size={18} />}</div>
@@ -2187,14 +2338,107 @@ function Message({ msg, onDownload }) {
         )}
         {msg.uploaded_images?.length > 0 && (
           <div className="imageGrid uploadedImageGrid">
-            {msg.uploaded_images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
+            {msg.uploaded_images.map((image, index) => <ImageCard key={image.url} image={image} onDownload={onDownload} onPreview={() => onPreview(msg.uploaded_images, index)} />)}
           </div>
         )}
         {msg.images?.length > 0 && (
           <div className="imageGrid">
-            {msg.images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
+            {msg.images.map((image, index) => {
+              const previewIndex = previewImages.findIndex((item) => Number(item.id) === Number(image.id));
+              return <ImageCard key={image.url} image={image} onDownload={onDownload} onPreview={() => onPreview(previewImages.length ? previewImages : msg.images, previewIndex >= 0 ? previewIndex : index)} />;
+            })}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [drag, setDrag] = useState(null);
+  const image = state?.items?.[state.index];
+  const url = image?.public_url || image?.url;
+
+  useEffect(() => {
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+    setDrag(null);
+  }, [state?.index, url]);
+
+  useEffect(() => {
+    if (!state) return undefined;
+    function onKey(event) {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft") onMove(-1);
+      if (event.key === "ArrowRight") onMove(1);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [state, onClose, onMove]);
+
+  if (!state || !image || !url) return null;
+
+  function handleWheel(event) {
+    event.preventDefault();
+    const direction = event.deltaY > 0 ? -0.12 : 0.12;
+    setZoom((value) => Math.max(0.25, Math.min(6, Number((value + direction).toFixed(2)))));
+  }
+
+  function startDrag(event) {
+    event.preventDefault();
+    setDrag({ x: event.clientX, y: event.clientY, baseX: offset.x, baseY: offset.y });
+  }
+
+  function moveDrag(event) {
+    if (!drag) return;
+    setOffset({
+      x: drag.baseX + event.clientX - drag.x,
+      y: drag.baseY + event.clientY - drag.y,
+    });
+  }
+
+  const title = image.title || image.filename || `图片 ${state.index + 1}`;
+
+  return (
+    <div className="previewOverlay" role="dialog" aria-modal="true" onMouseMove={moveDrag} onMouseUp={() => setDrag(null)} onMouseLeave={() => setDrag(null)}>
+      <div className="previewPanel">
+        <div className="previewHeader">
+          <div>
+            <strong title={title}>{title}</strong>
+            <small>{state.index + 1}/{state.items.length} · 滚轮缩放，拖拽移动，方向键切换</small>
+          </div>
+          <div className="previewHeaderActions">
+            <button type="button" onClick={() => setZoom((value) => Math.max(0.25, Number((value - 0.2).toFixed(2))))}>缩小</button>
+            <button type="button" onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }); }}>原始适配</button>
+            <button type="button" onClick={() => setZoom((value) => Math.min(6, Number((value + 0.2).toFixed(2))))}>放大</button>
+            <button type="button" onClick={() => onDownload(image)}><Download size={14} /> 下载</button>
+            <button type="button" onClick={onClose} title="关闭"><X size={16} /></button>
+          </div>
+        </div>
+        <div className="previewStage" onWheel={handleWheel}>
+          {state.items.length > 1 && (
+            <button className="previewNav prev" type="button" onClick={() => onMove(-1)} title="上一张">
+              <ChevronLeft size={28} />
+            </button>
+          )}
+          <img
+            src={url}
+            alt={title}
+            draggable={false}
+            onMouseDown={startDrag}
+            style={{
+              transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+              cursor: drag ? "grabbing" : "grab",
+            }}
+          />
+          {state.items.length > 1 && (
+            <button className="previewNav next" type="button" onClick={() => onMove(1)} title="下一张">
+              <ChevronRight size={28} />
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2233,7 +2477,7 @@ function Gallery({ items, loading, onDownload }) {
   );
 }
 
-function ImageCard({ image, onDownload, onUseImage }) {
+function ImageCard({ image, onDownload, onUseImage, onPreview }) {
   const [showPrompt, setShowPrompt] = useState(false);
   const url = image.public_url || image.url;
   const promptText = image.prompt_text || image.task_prompt || image.message_content || "";
@@ -2241,10 +2485,10 @@ function ImageCard({ image, onDownload, onUseImage }) {
     <div className="imageCard">
       <img src={url} alt="generated" />
       <div className="imageActions">
-        <a href={url} target="_blank" rel="noreferrer">
+        <button type="button" onClick={onPreview || (() => window.open(url, "_blank", "noreferrer"))}>
           <ExternalLink size={14} />
           预览
-        </a>
+        </button>
         <button type="button" onClick={() => onDownload(image)}>
           <Download size={14} />
           下载
@@ -2318,18 +2562,18 @@ function InlineErrorBox({ title = "失败原因", error }) {
   );
 }
 
-function Field({ label, children }) {
+function Field({ label, children, help = "" }) {
   return (
     <label className="field">
-      <span>{label}</span>
+      <span className="fieldLabel" title={help || undefined}>{label}</span>
       {children}
     </label>
   );
 }
 
-function Select({ label, value, onChange, options }) {
+function Select({ label, value, onChange, options, help = "" }) {
   return (
-    <Field label={label}>
+    <Field label={label} help={help}>
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {options.map((option) => {
           const normalized = typeof option === "string" ? { value: option, label: option } : option;
