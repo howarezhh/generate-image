@@ -4,7 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [ -n "${IMAGE_API_KEY:-}" ]; then
+if [ "${AUTO_CONFIGURE_ENV:-0}" = "1" ]; then
+  if [ -z "${IMAGE_API_KEY:-}" ]; then
+    echo "AUTO_CONFIGURE_ENV=1 requires IMAGE_API_KEY."
+    exit 1
+  fi
   echo "Configuring .env from environment variables"
   IMAGE_API_BASE_URL="${IMAGE_API_BASE_URL:-}" IMAGE_API_KEY="${IMAGE_API_KEY}" PORT="${PORT:-8010}" bash scripts/configure_env.sh
 fi

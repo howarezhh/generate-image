@@ -25,17 +25,11 @@ fi
 echo "[2/5] Installing or updating dependencies"
 bash scripts/install_ubuntu.sh
 
-echo "[3/5] Applying local configuration and database defaults"
+echo "[3/5] Applying database schema migrations"
 if [ -f .env ]; then
-  source scripts/common.sh
-  load_env_file
-  if [ -n "${IMAGE_API_KEY:-}" ]; then
-    IMAGE_API_BASE_URL="${IMAGE_API_BASE_URL:-}" IMAGE_API_KEY="${IMAGE_API_KEY}" PORT="${PORT:-8010}" bash scripts/configure_env.sh
-  else
-    echo "IMAGE_API_KEY is empty in .env; skipping configure_env.sh"
-  fi
+  bash scripts/migrate_db.sh
 else
-  echo ".env not found; create it with scripts/configure_env.sh before starting."
+  echo ".env not found; skipping database migration. Create it with scripts/configure_env.sh before starting."
 fi
 
 echo "[4/5] Restarting background service"
