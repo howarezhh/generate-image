@@ -174,6 +174,7 @@ function App() {
   const [promptFilter, setPromptFilter] = useState({ q: "", mode: "", favorite: false });
   const [editingPromptId, setEditingPromptId] = useState(null);
   const [promptCopyId, setPromptCopyId] = useState(null);
+  const [refreshFeedback, setRefreshFeedback] = useState({});
   const [conversations, setConversations] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
@@ -298,6 +299,33 @@ function App() {
     event.preventDefault();
     setError(null);
     await startTask();
+  }
+
+  function handlePromptKeyDown(event) {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.nativeEvent?.isComposing) return;
+    event.preventDefault();
+    if (submitDisabled) return;
+    event.currentTarget.form?.requestSubmit();
+  }
+
+  async function runRefresh(key, action) {
+    setRefreshFeedback((current) => ({ ...current, [key]: "loading" }));
+    try {
+      await action();
+      setRefreshFeedback((current) => ({ ...current, [key]: "success" }));
+    } catch (err) {
+      setError(describeError(err));
+      setRefreshFeedback((current) => ({ ...current, [key]: "failed" }));
+    } finally {
+      setTimeout(() => {
+        setRefreshFeedback((current) => {
+          if (current[key] === "loading") return current;
+          const next = { ...current };
+          delete next[key];
+          return next;
+        });
+      }, 1300);
+    }
   }
 
   function selectedReferenceCount(nextUploads = chatImages, nextReferences = chatReferenceImages) {
@@ -555,7 +583,7 @@ function App() {
     setTasks((items) => [task, ...items.filter((item) => item.id !== task.id)]);
   }
 
-  async function refreshTasks() {
+  async function refreshTasks(options = {}) {
     try {
       const res = await fetch(`${API}/api/tasks?limit=80`);
       const data = await parse(res);
@@ -583,6 +611,7 @@ function App() {
       }
     } catch (err) {
       setError(describeError(err));
+      if (options.throwError) throw err;
     }
   }
 
@@ -715,27 +744,29 @@ function App() {
     setActiveView("studio");
   }
 
-  async function refreshHistory() {
+  async function refreshHistory(options = {}) {
     try {
       const res = await fetch(`${API}/api/conversations`);
       const data = await parse(res);
       setConversations(data.items || []);
     } catch (err) {
       setError(describeError(err));
+      if (options.throwError) throw err;
     }
   }
 
-  async function refreshGallery() {
+  async function refreshGallery(options = {}) {
     try {
       const res = await fetch(`${API}/api/gallery`);
       const data = await parse(res);
       setGalleryHistory(data.items || []);
     } catch (err) {
       setError(describeError(err));
+      if (options.throwError) throw err;
     }
   }
 
-  async function refreshPrompts() {
+  async function refreshPrompts(options = {}) {
     try {
       const params = new URLSearchParams({ limit: "300" });
       if (promptFilter.q.trim()) params.set("q", promptFilter.q.trim());
@@ -746,6 +777,7 @@ function App() {
       setPrompts(data.items || []);
     } catch (err) {
       setError(describeError(err));
+      if (options.throwError) throw err;
     }
   }
 
@@ -1162,7 +1194,7 @@ function App() {
             </div>
             {activeView === "studio" && (
               <div className="headActions">
-                {form.mode === "chat" && <button className="ghostButton" onClick={newChat}><RefreshCw size={17} /> 新对话</button>}
+                {form.mode === "chat" && <button className="ghostButton" onClick={newChat}><Plus size={17} /> 新对话</button>}
                 {form.mode !== "chat" && <button className="ghostButton" onClick={newStudioTask}>
                   <Plus size={17} /> 新任务
                 </button>}
@@ -1178,10 +1210,11 @@ function App() {
               tasks={tasks}
               selected={selectedHistory}
               selectedTask={selectedTask}
-              onRefresh={async () => {
-                await refreshHistory();
-                await refreshTasks();
-              }}
+              refreshState={refreshFeedback.history}
+              onRefresh={() => runRefresh("history", async () => {
+                await refreshHistory({ throwError: true });
+                await refreshTasks({ throwError: true });
+              })}
               onOpen={(id) => loadConversation(id, { openStudio: false })}
               onOpenTask={loadTask}
               onContinue={(id) => loadConversation(id, { openStudio: true })}
@@ -1194,7 +1227,13 @@ function App() {
               onDeleteConversation={deleteConversation}
             />
           ) : activeView === "gallery" ? (
-            <GalleryHistory items={galleryHistory} onRefresh={refreshGallery} onDownload={downloadImage} onUseImage={useImageAsReference} />
+            <GalleryHistory
+              items={galleryHistory}
+              refreshState={refreshFeedback.gallery}
+              onRefresh={() => runRefresh("gallery", () => refreshGallery({ throwError: true }))}
+              onDownload={downloadImage}
+              onUseImage={useImageAsReference}
+            />
           ) : activeView === "prompts" ? (
             <PromptLibrary
               items={prompts}
@@ -1213,7 +1252,8 @@ function App() {
               onCopy={copyPromptEntry}
               onUse={usePromptEntry}
               onFavorite={togglePromptFavorite}
-              onRefresh={refreshPrompts}
+              refreshState={refreshFeedback.prompts}
+              onRefresh={() => runRefresh("prompts", () => refreshPrompts({ throwError: true }))}
             />
           ) : form.mode === "chat" ? (
             <div className="chatPane" ref={scrollRef}>
@@ -1281,9 +1321,10 @@ function App() {
               <textarea
                 value={form.prompt}
                 onChange={(e) => setForm({ ...form, prompt: e.target.value })}
+                onKeyDown={handlePromptKeyDown}
                 placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : "描述你想生成的画面..."}
               />
-              <button className="sendButton" disabled={submitDisabled}>
+              <button className="sendButton" type="submit" disabled={submitDisabled}>
                 {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
               </button>
             </div>
@@ -1354,6 +1395,7 @@ function HistoryPane({
   tasks,
   selected,
   selectedTask,
+  refreshState,
   onRefresh,
   onOpen,
   onOpenTask,
@@ -1386,7 +1428,7 @@ function HistoryPane({
       <div className="historyList">
         <div className="paneToolbar">
           <strong>历史记录</strong>
-          <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
+          <RefreshButton state={refreshState} onClick={onRefresh} />
         </div>
         {records.length === 0 ? (
           <div className="emptyMini">暂无历史记录</div>
@@ -1648,6 +1690,7 @@ function PromptLibrary({
   filter,
   editingId,
   copiedId,
+  refreshState,
   onDraft,
   onDraftMode,
   onFilter,
@@ -1665,7 +1708,7 @@ function PromptLibrary({
       <section className="promptEditor">
         <div className="paneToolbar">
           <strong>{editingId ? "修改提示词" : "新增提示词"}</strong>
-          <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
+          <RefreshButton state={refreshState} onClick={onRefresh} />
         </div>
         <textarea
           value={draft}
@@ -1745,13 +1788,13 @@ function PromptLibrary({
   );
 }
 
-function GalleryHistory({ items, onRefresh, onDownload, onUseImage }) {
+function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage }) {
   const groups = groupImages(items);
   return (
     <div className="galleryHistory">
       <div className="paneToolbar">
         <strong>历史图库</strong>
-        <button type="button" onClick={onRefresh}><RefreshCw size={15} />刷新</button>
+        <RefreshButton state={refreshState} onClick={onRefresh} />
       </div>
       {groups.length === 0 ? (
         <div className="emptyState">
@@ -1921,6 +1964,24 @@ function ImageCard({ image, onDownload, onUseImage }) {
         </div>
       )}
     </div>
+  );
+}
+
+function RefreshButton({ state = "idle", onClick }) {
+  const busy = state === "loading";
+  const Icon = state === "success" ? Check : state === "failed" ? X : RefreshCw;
+  const label = state === "loading" ? "刷新中" : state === "success" ? "已刷新" : state === "failed" ? "刷新失败" : "刷新";
+  return (
+    <button
+      type="button"
+      className={`refreshButton ${state}`}
+      onClick={onClick}
+      disabled={busy}
+      aria-live="polite"
+    >
+      <Icon className={busy ? "spin" : ""} size={15} />
+      {label}
+    </button>
   );
 }
 

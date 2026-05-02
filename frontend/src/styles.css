@@ -371,6 +371,31 @@ textarea:focus {
   border-color: transparent;
 }
 
+.refreshButton {
+  transition: transform 120ms ease, background 140ms ease, color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+
+.refreshButton:active:not(:disabled) {
+  transform: translateY(1px) scale(0.98);
+}
+
+.refreshButton.loading {
+  opacity: 0.78;
+  cursor: wait;
+}
+
+.refreshButton.success {
+  background: #2d927f;
+  color: #fff;
+  border-color: transparent;
+}
+
+.refreshButton.failed {
+  background: rgba(214, 76, 57, 0.2);
+  color: #ffd9d1;
+  border-color: rgba(214, 76, 57, 0.45);
+}
+
 .stageHead {
   padding: 20px 22px;
   display: flex;
