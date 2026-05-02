@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import inspect
 import json
 import mimetypes
 import re
@@ -9,6 +10,7 @@ from urllib.parse import urljoin
 
 import httpx
 from fastapi import HTTPException, UploadFile
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 from .config import DEFAULT_API_BASE_URL, DEFAULT_API_KEY, OUTPUT_DIR, UPLOAD_DIR
 
@@ -32,6 +34,24 @@ def headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def responses_url(base_url: str | None, endpoint: str) -> str:
+    return urljoin(normalize_base_url(base_url) + "/", endpoint.lstrip("/"))
+
+
+def create_async_client(
+    *,
+    base_url: str | None,
+    api_key: str | None,
+    timeout: float,
+) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=resolve_api_key(api_key),
+        base_url=normalize_base_url(base_url),
+        timeout=timeout,
+        max_retries=0,
+    )
+
+
 async def post_json(
     endpoint: str,
     payload: dict[str, Any],
@@ -41,27 +61,15 @@ async def post_json(
     timeout: float = 240.0,
     max_attempts: int = 2,
 ) -> dict[str, Any]:
-    url = urljoin(normalize_base_url(base_url) + "/", endpoint.lstrip("/"))
-    key = resolve_api_key(api_key)
-    last_network_error: httpx.RequestError | None = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, headers=headers(key), json=payload)
-        except httpx.RequestError as exc:
-            last_network_error = exc
-            if attempt < max_attempts:
-                await asyncio.sleep(backoff_seconds(attempt, None))
-                continue
-            raise HTTPException(status_code=502, detail=network_error_detail(endpoint, url, exc)) from exc
-        if should_retry_response(response) and attempt < max_attempts:
-            await asyncio.sleep(backoff_seconds(attempt, response))
-            continue
-        break
-    else:
-        assert last_network_error is not None
-        raise HTTPException(status_code=502, detail=network_error_detail(endpoint, url, last_network_error))
-    return parse_response(response, endpoint=endpoint, url=url, payload=payload)
+    return await post_responses_with_sdk(
+        endpoint,
+        payload,
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        max_attempts=max_attempts,
+        stream=False,
+    )
 
 
 async def post_json_stream(
@@ -71,62 +79,244 @@ async def post_json_stream(
     base_url: str | None = None,
     api_key: str | None = None,
     timeout: float = 240.0,
+    max_attempts: int = 2,
     on_event: Any | None = None,
 ) -> dict[str, Any]:
-    url = urljoin(normalize_base_url(base_url) + "/", endpoint.lstrip("/"))
-    key = resolve_api_key(api_key)
-    stream_payload = {**payload, "stream": True}
+    return await post_responses_with_sdk(
+        endpoint,
+        payload,
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        max_attempts=max_attempts,
+        stream=True,
+        on_event=on_event,
+    )
+
+
+async def post_responses_with_sdk(
+    endpoint: str,
+    payload: dict[str, Any],
+    *,
+    base_url: str | None,
+    api_key: str | None,
+    timeout: float,
+    max_attempts: int,
+    stream: bool,
+    on_event: Any | None = None,
+) -> dict[str, Any]:
+    if endpoint.strip("/") != "responses":
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "SDK 调用层当前仅支持 /v1/responses。",
+                "endpoint": endpoint,
+                "suggestion": "请将生图链路统一到 Responses API。",
+            },
+        )
+    url = responses_url(base_url, endpoint)
+    client = create_async_client(base_url=base_url, api_key=api_key, timeout=timeout)
+    if stream:
+        try:
+            return await post_responses_with_retries(
+                client,
+                endpoint,
+                url,
+                payload,
+                max_attempts=max_attempts,
+                stream=True,
+                on_event=on_event,
+            )
+        except HTTPException as exc:
+            if not is_stream_fallback_http_exception(exc):
+                raise
+            return await post_responses_with_retries(
+                client,
+                endpoint,
+                url,
+                payload,
+                max_attempts=max_attempts,
+                stream=False,
+                on_event=None,
+            )
+    return await post_responses_with_retries(
+        client,
+        endpoint,
+        url,
+        payload,
+        max_attempts=max_attempts,
+        stream=False,
+        on_event=None,
+    )
+
+
+async def post_responses_with_retries(
+    client: AsyncOpenAI,
+    endpoint: str,
+    url: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int,
+    stream: bool,
+    on_event: Any | None,
+) -> dict[str, Any]:
+    last_exc: HTTPException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await create_responses_once(client, payload, stream=stream, on_event=on_event)
+            validate_responses_result(result, endpoint=endpoint, url=url, payload=payload)
+            return result
+        except HTTPException as exc:
+            last_exc = exc
+            if attempt >= max_attempts or not is_retryable_http_exception(exc):
+                raise
+            await asyncio.sleep(retry_delay_seconds(attempt, exc))
+        except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as exc:
+            http_exc = sdk_exception_to_http_exception(exc, endpoint=endpoint, url=url, payload=payload)
+            last_exc = http_exc
+            if attempt >= max_attempts or not is_retryable_http_exception(http_exc):
+                raise http_exc from exc
+            await asyncio.sleep(retry_delay_seconds(attempt, http_exc))
+    assert last_exc is not None
+    raise last_exc
+
+
+async def create_responses_once(
+    client: AsyncOpenAI,
+    payload: dict[str, Any],
+    *,
+    stream: bool,
+    on_event: Any | None = None,
+) -> dict[str, Any]:
+    if not stream:
+        return sdk_to_plain(await client.responses.create(**payload))
+
     events: list[dict[str, Any]] = []
     output_items: list[dict[str, Any]] = []
     terminal_response: dict[str, Any] | None = None
+    stream_obj = await client.responses.create(**payload, stream=True)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, headers=headers(key), json=stream_payload) as response:
-                if response.status_code >= 400:
-                    body = await response.aread()
-                    parsed = httpx.Response(
-                        response.status_code,
-                        content=body,
-                        headers=response.headers,
-                        request=response.request,
-                    )
-                    return parse_response(parsed, endpoint=endpoint, url=url, payload=payload)
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw or raw == "[DONE]":
-                        continue
-                    try:
-                        event = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    events.append(event)
-                    if on_event is not None:
-                        on_event(event)
-                    event_type = str(event.get("type") or "")
-                    if event_type == "response.output_item.done":
-                        item = event.get("item")
-                        if isinstance(item, dict):
-                            output_items.append(item)
-                    elif event_type in {"response.completed", "response.failed"}:
-                        response_obj = event.get("response")
-                        if isinstance(response_obj, dict):
-                            terminal_response = response_obj
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=network_error_detail(endpoint, url, exc)) from exc
+        async for raw_event in stream_obj:
+            event = sdk_to_plain(raw_event)
+            events.append(event)
+            if on_event is not None:
+                on_event(event)
+            event_type = str(event.get("type") or "")
+            if event_type == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, dict):
+                    output_items.append(item)
+            elif event_type in {"response.completed", "response.failed"}:
+                response_obj = event.get("response")
+                if isinstance(response_obj, dict):
+                    terminal_response = response_obj
+    finally:
+        close = getattr(stream_obj, "close", None)
+        if callable(close):
+            closed = close()
+            if inspect.isawaitable(closed):
+                await closed
     result = terminal_response or {"id": None, "output": []}
     if output_items:
         existing = result.get("output")
         if not isinstance(existing, list) or not any(
-            isinstance(item, dict) and item.get("type") == "image_generation_call" and item.get("result")
-            for item in existing
+                isinstance(item, dict) and item.get("type") == "image_generation_call" and item.get("result")
+                for item in existing
         ):
             result["output"] = output_items
     result["_stream_events"] = summarize_stream_events(events)
-    validate_responses_result(result, endpoint=endpoint, url=url, payload=payload)
     return result
+
+
+def sdk_to_plain(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, list):
+        return [sdk_to_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sdk_to_plain(item) for key, item in value.items()}
+    return value
+
+
+def sdk_exception_to_http_exception(
+    exc: Exception,
+    *,
+    endpoint: str,
+    url: str,
+    payload: dict[str, Any],
+) -> HTTPException:
+    status_code = int(getattr(exc, "status_code", 502) or 502)
+    upstream = sdk_error_body(exc)
+    message = readable_error_message(upstream, status_code)
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        message = str(exc) or "请求生图接口失败，未收到有效响应。"
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "message": message,
+            "status_code": status_code,
+            "endpoint": endpoint,
+            "url": url,
+            "upstream": upstream,
+            "request": summarize_payload(payload),
+            "suggestion": suggestion_for_status(status_code, endpoint, upstream),
+        },
+    )
+
+
+def sdk_error_body(exc: Exception) -> Any:
+    body = getattr(exc, "body", None)
+    if body:
+        return body
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            return response.json()
+        except Exception:
+            text = getattr(response, "text", "") or ""
+            body = {"raw": text, "content_type": response.headers.get("content-type", "")}
+            if looks_like_html(text):
+                body["html_error"] = summarize_html_error(text)
+            return body
+    return {"error_type": exc.__class__.__name__, "error": str(exc)}
+
+
+def is_retryable_http_exception(exc: HTTPException) -> bool:
+    status_code = int(exc.status_code or 0)
+    if status_code in {429, 502, 503, 504} or 500 <= status_code <= 599:
+        return True
+    text = json.dumps(exc.detail, ensure_ascii=False).lower() if not isinstance(exc.detail, str) else exc.detail.lower()
+    return any(
+        marker in text
+        for marker in (
+            "upstream_error",
+            "timeout",
+            "timed out",
+            "temporarily_unavailable",
+            "rate_limit",
+            "rate limit",
+            "too many requests",
+            "connection reset",
+        )
+    )
+
+
+def is_stream_fallback_http_exception(exc: HTTPException) -> bool:
+    text = json.dumps(exc.detail, ensure_ascii=False).lower() if not isinstance(exc.detail, str) else exc.detail.lower()
+    if any(marker in text for marker in ("moderation_blocked", "content_policy", "safety_violations")):
+        return False
+    return exc.status_code in {400, 404, 405} or is_retryable_http_exception(exc)
+
+
+def retry_delay_seconds(attempt: int, exc: HTTPException) -> float:
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    retry_after = detail.get("retry_after") if isinstance(detail, dict) else None
+    if retry_after:
+        try:
+            return min(float(retry_after), 60.0)
+        except (TypeError, ValueError):
+            pass
+    return min(2.0**attempt, 60.0)
 
 
 async def post_multipart(

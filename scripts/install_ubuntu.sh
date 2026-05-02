@@ -67,6 +67,7 @@ fi
 echo "[3/5] Checking Python dependencies"
 REQ_HASH="$(file_hash backend/requirements.txt)"
 PY_STATE_FILE="$STATE_DIR/python-requirements.sha256"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 if [ ! -d backend/.venv ]; then
   echo "Creating Python virtual environment"
   python3 -m venv backend/.venv
@@ -74,8 +75,8 @@ fi
 
 if [ ! -f "$PY_STATE_FILE" ] || [ "$(cat "$PY_STATE_FILE")" != "$REQ_HASH" ]; then
   echo "Installing Python dependencies"
-  backend/.venv/bin/pip install --upgrade pip
-  backend/.venv/bin/pip install -r backend/requirements.txt
+  backend/.venv/bin/python -m pip install -i "$PIP_INDEX_URL" --upgrade pip
+  backend/.venv/bin/python -m pip install -i "$PIP_INDEX_URL" -r backend/requirements.txt
   echo "$REQ_HASH" > "$PY_STATE_FILE"
 else
   echo "Python dependencies already installed"
@@ -114,4 +115,4 @@ if [ ! -f .env ]; then
 fi
 
 echo "Default service port is $(grep -E '^PORT=' .env | cut -d= -f2). Change PORT in .env if another project already uses it."
-echo "Install complete. Start with: bash scripts/start.sh"
+echo "Install complete. Start with: bash scripts/start_background.sh"

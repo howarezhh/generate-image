@@ -7,8 +7,9 @@ cd "$ROOT_DIR"
 source scripts/common.sh
 load_env_file
 PORT="$(resolve_port)"
+PYTHON_BIN="$(python_bin || true)"
 
-if [ ! -d backend/.venv ]; then
+if [ -z "$PYTHON_BIN" ]; then
   echo "Python virtualenv not found. Run: bash scripts/install_ubuntu.sh"
   exit 1
 fi
@@ -20,4 +21,4 @@ if is_port_in_use "$PORT"; then
 fi
 
 mkdir -p storage/uploads storage/outputs logs
-exec backend/.venv/bin/python backend/run.py
+exec "$PYTHON_BIN" backend/run.py

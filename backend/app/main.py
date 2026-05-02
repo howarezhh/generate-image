@@ -320,6 +320,27 @@ def compact_error_detail(detail: Any) -> str:
     return json.dumps(detail, ensure_ascii=False, indent=2) if not isinstance(detail, str) else detail
 
 
+def update_message_meta(message_id: int, updates: dict[str, Any], response_id: str | None = None) -> None:
+    with db.connect() as conn:
+        row = conn.execute("select meta_json from messages where id = ?", (message_id,)).fetchone()
+        if not row:
+            return
+        try:
+            meta = json.loads(row["meta_json"] or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(updates)
+        values: list[Any] = [db.json_dumps(meta), db.now_iso()]
+        assignments = "meta_json = ?, updated_at = ?"
+        if response_id is not None:
+            assignments += ", response_id = ?"
+            values.append(response_id)
+        values.append(message_id)
+        conn.execute(f"update messages set {assignments} where id = ?", values)
+
+
 def cancel_running_task(task_id: int) -> None:
     running = RUNNING_TASKS.get(task_id)
     if running:
@@ -740,6 +761,7 @@ async def call_responses_image_generation(
                     base_url=config.base_url,
                     api_key=config.api_key,
                     timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+                    max_attempts=IMAGE_REQUEST_MAX_ATTEMPTS,
                     on_event=on_stream_event,
                 )
             except HTTPException as exc:
@@ -768,6 +790,7 @@ async def call_responses_image_generation(
                     base_url=config.base_url,
                     api_key=config.api_key,
                     timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+                    max_attempts=IMAGE_REQUEST_MAX_ATTEMPTS,
                     on_event=on_stream_event,
                 )
             except HTTPException as stream_exc:
@@ -1833,41 +1856,65 @@ async def run_chat_task(
         raw_for_meta["selected_reference_image_ids"] = [item.get("id") for item in image_candidates if item.get("id")]
         raw_for_meta["resolved_action"] = action
         db.update_task(task_id, progress=48, stage=f"AI 决定执行 {action}，正在生成图片")
-        image_response = await call_responses_image_generation(
-            model=params.model,
-            prompt=image_prompt,
-            image_model=params.image_model,
-            size=params.size,
-            quality=params.quality,
-            output_format=params.output_format,
-            background=params.background,
-            output_compression=params.output_compression,
-            moderation=params.moderation,
-            action=action,
-            partial_images=params.partial_images,
-            config=params.config,
-            uploaded=edit_inputs,
-            input_fidelity=params.input_fidelity,
-            previous_response_id=planner_response_id or previous_response_id,
-            on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-            on_stream_event=lambda event: handle_image_stream_event(task_id, event),
-        )
-        db.update_task(task_id, progress=84, stage="正在提取和保存图片")
-        bucket = task_image_folder(task_id, conversation_title)
-        image_items = extract_images_from_responses(image_response, params.output_format, folder=bucket)
         raw_for_meta["tool"] = "image_generation"
         raw_for_meta["image_prompt"] = image_prompt
-        raw_for_meta["image_response"] = sanitize_response(image_response)
-        if not image_items:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                    "endpoint": "responses",
-                    "upstream": sanitize_response(image_response),
-                    "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                },
+        update_message_meta(
+            assistant_message_id,
+            {
+                **raw_for_meta,
+                "image_status": "running",
+                "image_stage": f"AI 决定执行 {action}，正在生成图片",
+            },
+            planner_response_id,
+        )
+        try:
+            image_response = await call_responses_image_generation(
+                model=params.model,
+                prompt=image_prompt,
+                image_model=params.image_model,
+                size=params.size,
+                quality=params.quality,
+                output_format=params.output_format,
+                background=params.background,
+                output_compression=params.output_compression,
+                moderation=params.moderation,
+                action=action,
+                partial_images=params.partial_images,
+                config=params.config,
+                uploaded=edit_inputs,
+                input_fidelity=params.input_fidelity,
+                previous_response_id=None,
+                on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                on_stream_event=lambda event: handle_image_stream_event(task_id, event),
             )
+            db.update_task(task_id, progress=84, stage="正在提取和保存图片")
+            bucket = task_image_folder(task_id, conversation_title)
+            image_items = extract_images_from_responses(image_response, params.output_format, folder=bucket)
+            raw_for_meta["image_response"] = sanitize_response(image_response)
+            if not image_items:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                        "endpoint": "responses",
+                        "upstream": sanitize_response(image_response),
+                        "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                    },
+                )
+        except HTTPException as exc:
+            raw_for_meta["image_status"] = "failed"
+            raw_for_meta["image_error"] = exc.detail
+            update_message_meta(
+                assistant_message_id,
+                raw_for_meta,
+                planner_response_id or previous_response_id,
+            )
+            with db.connect() as conn:
+                conn.execute(
+                    "update conversations set previous_response_id = ?, updated_at = ? where id = ?",
+                    (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
+                )
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
         images_out = [
             public_task_image(
@@ -1880,6 +1927,7 @@ async def run_chat_task(
             )
             for item in image_items
         ]
+        raw_for_meta["image_status"] = "done"
         with db.connect() as conn:
             conn.execute(
                 "update messages set meta_json = ?, response_id = ?, updated_at = ? where id = ?",

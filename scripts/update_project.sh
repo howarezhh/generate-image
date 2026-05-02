@@ -5,9 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+GIT_PULL_URL="${GIT_PULL_URL:-}"
 
 echo "[1/5] Pulling latest code on ${CURRENT_BRANCH}"
-if git remote get-url origin >/dev/null 2>&1; then
+if [ -n "$GIT_PULL_URL" ]; then
+  git pull --ff-only "$GIT_PULL_URL" "$CURRENT_BRANCH"
+elif git remote get-url origin >/dev/null 2>&1; then
   git fetch origin "$CURRENT_BRANCH"
   if git merge-base --is-ancestor HEAD "origin/${CURRENT_BRANCH}"; then
     git merge --ff-only "origin/${CURRENT_BRANCH}"

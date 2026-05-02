@@ -371,6 +371,114 @@ textarea:focus {
   border-color: transparent;
 }
 
+.runningPanel {
+  position: relative;
+  min-width: 260px;
+  max-width: min(460px, 100%);
+  color: #f5d88b;
+}
+
+.runningPanelHead {
+  position: relative;
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid rgba(238, 203, 112, 0.32);
+  background: rgba(238, 203, 112, 0.12);
+  color: #f5d88b;
+  border-radius: 8px;
+  padding: 0 10px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+
+.runningPanelHead span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.runningPanelHead small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(245, 216, 139, 0.72);
+}
+
+.runningPanelHead > svg:last-child,
+.taskMiniTitle > svg:last-child {
+  transition: transform 140ms ease;
+}
+
+.runningPanel.open .runningPanelHead > svg:last-child,
+.taskMiniRow.open .taskMiniTitle > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.runningPanelBody {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 12;
+  width: min(520px, calc(100vw - 28px));
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(238, 203, 112, 0.24);
+  background: rgba(17, 19, 15, 0.96);
+  border-radius: 8px;
+  padding: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
+}
+
+.runningPanelTask {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(245, 243, 234, 0.1);
+  border-radius: 8px;
+  padding: 9px;
+  background: rgba(245, 243, 234, 0.045);
+}
+
+.runningPanelTask strong,
+.runningPanelTask small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runningPanelTask small {
+  margin-top: 4px;
+  color: rgba(245, 243, 234, 0.58);
+}
+
+.runningPanelActions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.runningPanelActions button {
+  min-height: 30px;
+  border: 1px solid rgba(245, 243, 234, 0.15);
+  background: rgba(245, 243, 234, 0.07);
+  color: #f5f3ea;
+  border-radius: 7px;
+  padding: 0 9px;
+}
+
+.runningPanelActions button:last-child {
+  border-color: rgba(214, 76, 57, 0.4);
+  color: #ffb5a8;
+}
+
 .refreshButton {
   transition: transform 120ms ease, background 140ms ease, color 140ms ease, border-color 140ms ease, opacity 140ms ease;
 }
@@ -1023,6 +1131,11 @@ textarea {
   white-space: nowrap;
 }
 
+.runningIcon {
+  flex: 0 0 auto;
+  color: currentColor;
+}
+
 .statusPill b,
 .statusPill em {
   font-style: normal;
@@ -1125,48 +1238,119 @@ textarea {
 }
 
 .taskMiniRow {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 110px auto;
-  align-items: center;
-  gap: 10px;
   border: 1px solid rgba(245, 243, 234, 0.1);
   border-radius: 8px;
-  padding: 9px;
   background: rgba(17, 19, 15, 0.28);
+  overflow: hidden;
 }
 
-.taskMiniRow > button:first-child {
-  min-width: 0;
+.taskMiniTitle {
+  position: relative;
+  width: 100%;
+  min-height: 46px;
   border: 0;
   background: transparent;
   color: #f5f3ea;
-  padding: 0;
+  padding: 9px 10px;
   text-align: left;
   display: grid;
-  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  align-items: center;
+  gap: 10px;
 }
 
-.taskMiniRow span,
-.taskMiniRow small {
+.taskMiniTitle span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.taskMiniTitle strong,
+.taskMiniTitle small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.taskMiniRow small {
+.taskMiniTitle small {
   color: rgba(245, 243, 234, 0.58);
 }
 
-.taskMiniRow > button:last-child {
-  width: 30px;
-  height: 30px;
-  border: 0;
-  border-radius: 7px;
-  background: #d64c39;
-  color: white;
+.taskMiniBody {
   display: grid;
-  place-items: center;
+  gap: 10px;
+  border-top: 1px solid rgba(245, 243, 234, 0.08);
+  padding: 10px;
+}
+
+.taskMiniActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.taskMiniActions button {
+  min-height: 32px;
+  border: 1px solid rgba(245, 243, 234, 0.15);
+  background: rgba(245, 243, 234, 0.055);
+  color: rgba(245, 243, 234, 0.78);
+  border-radius: 7px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.taskMiniActions .danger {
+  border-color: rgba(214, 76, 57, 0.45);
+  color: #ffb5a8;
+}
+
+.taskMiniError {
+  border: 1px solid rgba(214, 76, 57, 0.34);
+  background: rgba(214, 76, 57, 0.1);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.taskMiniError .sectionTitle {
+  margin-bottom: 8px;
+}
+
+.taskMiniError pre {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #ffd9d1;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.inlineErrorBox {
+  border: 1px solid rgba(214, 76, 57, 0.34);
+  background: rgba(214, 76, 57, 0.1);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 10px 0;
+}
+
+.inlineErrorBox .sectionTitle {
+  margin-bottom: 8px;
+}
+
+.inlineErrorBox pre {
+  margin: 0;
+  max-height: 210px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #ffd9d1;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .taskDetail {
@@ -1600,12 +1784,50 @@ textarea {
     justify-self: start;
   }
 
-  .taskMiniRow {
+  .runningPanel {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .runningPanelHead {
+    grid-template-columns: 1fr;
+    min-height: 48px;
+    padding: 8px 10px;
+  }
+
+  .runningPanelHead > svg:last-child {
+    position: absolute;
+    right: 10px;
+    top: 16px;
+  }
+
+  .runningPanelBody {
+    position: static;
+    width: 100%;
+    margin-top: 8px;
+    box-shadow: none;
+  }
+
+  .runningPanelTask {
     grid-template-columns: 1fr;
   }
 
-  .taskMiniRow > button:last-child {
+  .runningPanelActions,
+  .runningPanelActions button,
+  .taskMiniActions,
+  .taskMiniActions button {
     width: 100%;
+  }
+
+  .taskMiniTitle {
+    grid-template-columns: 1fr;
+    min-height: 54px;
+  }
+
+  .taskMiniTitle > svg:last-child {
+    position: absolute;
+    right: 10px;
+    top: 16px;
   }
 
   .taskDetailHead {

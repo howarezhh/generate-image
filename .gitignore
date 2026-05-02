@@ -1,4 +1,5 @@
 .env
+.idea/
 .learnings/
 .install-state/
 backend/.venv/

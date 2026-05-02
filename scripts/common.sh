@@ -13,6 +13,16 @@ resolve_port() {
   echo "${PORT:-8010}"
 }
 
+python_bin() {
+  if [ -x backend/.venv/bin/python ]; then
+    echo "backend/.venv/bin/python"
+  elif [ -x backend/.venv/Scripts/python.exe ]; then
+    echo "backend/.venv/Scripts/python.exe"
+  else
+    return 1
+  fi
+}
+
 is_port_in_use() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
@@ -23,4 +33,3 @@ is_port_in_use() {
     return 1
   fi
 }
-

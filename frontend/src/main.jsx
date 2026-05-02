@@ -34,7 +34,7 @@ import "./styles.css";
 const API = "";
 
 const defaultConfig = {
-  base_url: "https://api.xiaoxin.best/",
+  base_url: "https://api.asxs.top/v1",
   api_key: "",
 };
 
@@ -189,6 +189,7 @@ function App() {
   const [chatImages, setChatImages] = useState([]);
   const [chatReferenceImages, setChatReferenceImages] = useState([]);
   const [copied, setCopied] = useState("");
+  const [runningPanelOpen, setRunningPanelOpen] = useState(false);
   const scrollRef = useRef(null);
   const taskStatusRef = useRef({});
   const dbSettingsReadyRef = useRef(false);
@@ -893,15 +894,22 @@ function App() {
       });
       imagesByMessage.set(image.message_id, list);
     }
-    const hydrated = (data.messages || []).map((msg) => ({
-      ...msg,
-      images: imagesByMessage.get(msg.id) || [],
-      uploaded_images: (msg.uploaded_images || []).map((image) => ({
-        ...image,
-        url: image.public_url || image.url,
-        filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "uploaded-image.png",
-      })),
-    }));
+    const hydrated = (data.messages || []).map((msg) => {
+      const meta = parseJsonObject(msg.meta_json);
+      return {
+        ...msg,
+        meta,
+        image_error_detail: meta.image_error || null,
+        image_status: meta.image_status || "",
+        image_prompt: meta.image_prompt || "",
+        images: imagesByMessage.get(msg.id) || [],
+        uploaded_images: (msg.uploaded_images || []).map((image) => ({
+          ...image,
+          url: image.public_url || image.url,
+          filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "uploaded-image.png",
+        })),
+      };
+    });
     setSelectedHistory({ ...data, messages: hydrated });
     setSelectedTask(null);
     if (openStudio) {
@@ -1192,10 +1200,19 @@ function App() {
               <p><ModeIcon size={18} /> {modeMeta.title}</p>
               <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
             </div>
-            {activeView === "studio" && (
+            {(activeView === "studio" || runningTasks.length > 0) && (
               <div className="headActions">
-                {form.mode === "chat" && <button className="ghostButton" onClick={newChat}><Plus size={17} /> 新对话</button>}
-                {form.mode !== "chat" && <button className="ghostButton" onClick={newStudioTask}>
+                {runningTasks.length > 0 && (
+                  <RunningTasksPanel
+                    tasks={runningTasks}
+                    open={runningPanelOpen}
+                    onToggle={() => setRunningPanelOpen((value) => !value)}
+                    onOpenTask={loadTask}
+                    onCancelTask={cancelTask}
+                  />
+                )}
+                {activeView === "studio" && form.mode === "chat" && <button className="ghostButton" onClick={newChat}><Plus size={17} /> 新对话</button>}
+                {activeView === "studio" && form.mode !== "chat" && <button className="ghostButton" onClick={newStudioTask}>
                   <Plus size={17} /> 新任务
                 </button>}
               </div>
@@ -1412,9 +1429,17 @@ function HistoryPane({
   const [draftLimit, setDraftLimit] = useState(10);
   const [messageDrafts, setMessageDrafts] = useState({});
   const records = useMemo(() => buildHistoryRecords(conversations, tasks), [conversations, tasks]);
-  const conversationTasks = selected?.conversation
-    ? (tasks || []).filter((task) => Number(task.conversation_id) === Number(selected.conversation.id))
-    : [];
+  const conversationTasks = useMemo(() => {
+    if (!selected?.conversation) return [];
+    const byId = new Map();
+    for (const task of selected.tasks || []) byId.set(Number(task.id), task);
+    for (const task of tasks || []) {
+      if (Number(task.conversation_id) === Number(selected.conversation.id)) {
+        byId.set(Number(task.id), { ...byId.get(Number(task.id)), ...task });
+      }
+    }
+    return [...byId.values()].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+  }, [selected, tasks]);
 
   useEffect(() => {
     if (!selected?.conversation) return;
@@ -1510,6 +1535,9 @@ function HistoryPane({
                       <Edit3 size={15} /> 保存修改
                     </button>
                   </div>
+                  {msg.image_error_detail && (
+                    <InlineErrorBox title="这条回复的生图失败原因" error={msg.image_error_detail} />
+                  )}
                   {msg.images?.length > 0 && (
                     <div className="imageGrid">
                       {msg.images.map((image) => (
@@ -1574,26 +1602,100 @@ function historyRecordActive(item, selected, selectedTask) {
 }
 
 function StatusPill({ mode, status }) {
+  const live = ["queued", "running"].includes(status);
   return (
     <span className={`statusPill ${status || "idle"}`}>
+      {live && <Loader2 className="runningIcon spin" size={12} aria-hidden="true" />}
       <b>{modeLabel(mode)}</b>
       <em>{status ? statusLabel(status) : "记录"}</em>
     </span>
   );
 }
 
-function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
-  const isLive = ["queued", "running"].includes(task.status);
+function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask }) {
+  const firstTask = tasks[0];
   return (
-    <article className={`taskMiniRow ${task.status}`}>
-      <button type="button" onClick={() => onOpenTask(task.id)}>
-        <span>{modeLabel(task.mode)}任务 #{task.id}</span>
-        <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</small>
+    <section className={`runningPanel ${open ? "open" : ""}`} aria-live="polite">
+      <button className="runningPanelHead" type="button" onClick={onToggle} aria-expanded={open}>
+        <span>
+          <Loader2 className="spin" size={15} aria-hidden="true" />
+          <strong>{tasks.length} 个任务运行中</strong>
+        </span>
+        <small>{firstTask ? `${modeLabel(firstTask.mode)} #${firstTask.id} · ${firstTask.stage || statusLabel(firstTask.status)}` : "等待任务状态"}</small>
+        <ChevronDown size={16} />
       </button>
-      <div className="progressTrack">
-        <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
-      </div>
-      {isLive && <button type="button" onClick={() => onCancelTask(task.id)} title="停止任务"><X size={14} /></button>}
+      {open && (
+        <div className="runningPanelBody">
+          {tasks.map((task) => (
+            <article className="runningPanelTask" key={task.id}>
+              <div>
+                <strong>{modeLabel(task.mode)}任务 #{task.id}</strong>
+                <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</small>
+              </div>
+              <div className="progressTrack">
+                <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
+              </div>
+              <div className="runningPanelActions">
+                <button type="button" onClick={() => onOpenTask(task.id)}>查看</button>
+                <button type="button" onClick={() => onCancelTask(task.id)}>停止</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
+  const [copyState, setCopyState] = useState("idle");
+  const [open, setOpen] = useState(false);
+  const isLive = ["queued", "running"].includes(task.status);
+  const errorText = task.error_detail ? formatTaskError(task.error_detail) : "";
+
+  async function copyTaskError() {
+    setCopyState("copying");
+    try {
+      await copyTextToClipboard(errorText || "暂无失败原因");
+      setCopyState("success");
+    } catch {
+      setCopyState("failed");
+    }
+    setTimeout(() => setCopyState("idle"), 1400);
+  }
+
+  return (
+    <article className={`taskMiniRow ${task.status} ${open ? "open" : ""}`}>
+      <button className="taskMiniTitle" type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+        <span>
+          {isLive && <Loader2 className="runningIcon spin" size={13} aria-hidden="true" />}
+          <strong>{modeLabel(task.mode)}任务 #{task.id}</strong>
+        </span>
+        <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</small>
+        <ChevronDown size={15} />
+      </button>
+      {open && (
+        <div className="taskMiniBody">
+          <div className="progressTrack">
+            <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
+          </div>
+          <div className="taskMiniActions">
+            <button type="button" onClick={() => onOpenTask(task.id)}>查看详情</button>
+            {isLive && <button className="danger" type="button" onClick={() => onCancelTask(task.id)}><X size={14} /> 停止</button>}
+          </div>
+          {task.status === "failed" && errorText && (
+            <div className="taskMiniError">
+              <div className="sectionTitle">
+                <strong>失败原因</strong>
+                <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyTaskError} disabled={copyState === "copying"}>
+                  <Copy size={14} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
+                </button>
+              </div>
+              <pre>{errorText}</pre>
+            </div>
+          )}
+        </div>
+      )}
     </article>
   );
 }
@@ -1875,6 +1977,9 @@ function Message({ msg, onDownload }) {
       <div className="avatar">{msg.role === "user" ? "你" : <Bot size={18} />}</div>
       <div className="bubble">
         <p>{msg.content}</p>
+        {msg.image_error_detail && (
+          <InlineErrorBox title="生图失败原因" error={msg.image_error_detail} />
+        )}
         {msg.previews?.length > 0 && (
           <div className="imageGrid">
             {msg.previews.map((url) => <img key={url} src={url} alt="" />)}
@@ -1982,6 +2087,34 @@ function RefreshButton({ state = "idle", onClick }) {
       <Icon className={busy ? "spin" : ""} size={15} />
       {label}
     </button>
+  );
+}
+
+function InlineErrorBox({ title = "失败原因", error }) {
+  const [copyState, setCopyState] = useState("idle");
+  const errorText = formatTaskError(error);
+
+  async function copyError() {
+    setCopyState("copying");
+    try {
+      await copyTextToClipboard(errorText || "暂无失败原因");
+      setCopyState("success");
+    } catch {
+      setCopyState("failed");
+    }
+    setTimeout(() => setCopyState("idle"), 1400);
+  }
+
+  return (
+    <section className="inlineErrorBox">
+      <div className="sectionTitle">
+        <strong>{title}</strong>
+        <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
+          <Copy size={14} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
+        </button>
+      </div>
+      <pre>{errorText}</pre>
+    </section>
   );
 }
 
@@ -2117,6 +2250,16 @@ function formatTaskError(error) {
   return typeof error === "string"
     ? compactString(error)
     : JSON.stringify(compactErrorForDisplay(error), null, 2);
+}
+
+function parseJsonObject(value) {
+  if (!value || typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 async function copyTextToClipboard(text) {
