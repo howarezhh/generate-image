@@ -13,6 +13,7 @@ import {
   Eraser,
   ExternalLink,
   FolderOpen,
+  Heart,
   ImagePlus,
   Images,
   KeyRound,
@@ -22,6 +23,7 @@ import {
   Plus,
   RefreshCw,
   Send,
+  Search,
   Sparkles,
   Trash2,
   Wand2,
@@ -168,6 +170,8 @@ function App() {
   const [galleryHistory, setGalleryHistory] = useState([]);
   const [prompts, setPrompts] = useState([]);
   const [promptDraft, setPromptDraft] = useState("");
+  const [promptDraftMode, setPromptDraftMode] = useState("");
+  const [promptFilter, setPromptFilter] = useState({ q: "", mode: "", favorite: false });
   const [editingPromptId, setEditingPromptId] = useState(null);
   const [promptCopyId, setPromptCopyId] = useState(null);
   const [conversations, setConversations] = useState([]);
@@ -182,6 +186,7 @@ function App() {
   const [editImages, setEditImages] = useState([]);
   const [editMask, setEditMask] = useState(null);
   const [chatImages, setChatImages] = useState([]);
+  const [chatReferenceImages, setChatReferenceImages] = useState([]);
   const [copied, setCopied] = useState("");
   const scrollRef = useRef(null);
   const taskStatusRef = useRef({});
@@ -232,6 +237,12 @@ function App() {
   }, [selectedTask?.id, conversation?.id, activeView]);
 
   useEffect(() => {
+    if (activeView === "prompts") {
+      refreshPrompts();
+    }
+  }, [promptFilter.q, promptFilter.mode, promptFilter.favorite, activeView]);
+
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
@@ -241,6 +252,13 @@ function App() {
   const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
   const submitDisabled = loading || !form.prompt.trim() || atTaskLimit;
   const activeProvider = providerForMode(form.mode);
+  const chatGeneratedImages = useMemo(() => uniqueImages(
+    messages.flatMap((msg) => msg.images || [])
+  ), [messages]);
+  const liveChatTasks = useMemo(() => {
+    if (!conversation) return [];
+    return tasks.filter((task) => Number(task.conversation_id) === Number(conversation.id) && ["queued", "running"].includes(task.status));
+  }, [tasks, conversation]);
 
   function switchView(view) {
     if (view !== "studio") {
@@ -280,6 +298,34 @@ function App() {
     event.preventDefault();
     setError(null);
     await startTask();
+  }
+
+  function selectedReferenceCount(nextUploads = chatImages, nextReferences = chatReferenceImages) {
+    return (nextUploads?.length || 0) + (nextReferences?.length || 0);
+  }
+
+  function updateChatUploads(files) {
+    const room = Math.max(0, 3 - chatReferenceImages.length);
+    setChatImages(files.slice(0, room));
+    if (files.length > room) {
+      setError(describeError({ detail: { message: "对话模式最多同时指定 3 张参考图。" } }));
+    }
+  }
+
+  function toggleChatReferenceImage(image) {
+    setChatReferenceImages((items) => {
+      const exists = items.some((item) => Number(item.id) === Number(image.id));
+      if (exists) return items.filter((item) => Number(item.id) !== Number(image.id));
+      if (selectedReferenceCount(chatImages, items) >= 3) {
+        setError(describeError({ detail: { message: "最多选择 3 张参考图，请先移除一张。" } }));
+        return items;
+      }
+      return [...items, image];
+    });
+  }
+
+  function removeChatReferenceImage(imageId) {
+    setChatReferenceImages((items) => items.filter((item) => Number(item.id) !== Number(imageId)));
   }
 
   async function startTask() {
@@ -412,6 +458,7 @@ function App() {
       role: "user",
       content: form.prompt,
       previews: [...chatImages].map((file) => URL.createObjectURL(file)),
+      uploaded_images: chatReferenceImages,
     };
     setMessages((items) => [...items, localUser]);
 
@@ -431,6 +478,7 @@ function App() {
       input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
       context_limit: Number(form.context_limit),
+      reference_image_ids: chatReferenceImages.map((image) => image.id),
       config: runConfig,
     };
     data.append("params_json", JSON.stringify(params));
@@ -443,6 +491,7 @@ function App() {
     setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
     mergeTask(result.task);
     setChatImages([]);
+    setChatReferenceImages([]);
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
@@ -627,6 +676,7 @@ function App() {
     setConversation(null);
     setMessages([]);
     setChatImages([]);
+    setChatReferenceImages([]);
     setActiveView("studio");
   }
 
@@ -652,7 +702,11 @@ function App() {
 
   async function refreshPrompts() {
     try {
-      const res = await fetch(`${API}/api/prompts?limit=300`);
+      const params = new URLSearchParams({ limit: "300" });
+      if (promptFilter.q.trim()) params.set("q", promptFilter.q.trim());
+      if (promptFilter.mode) params.set("mode", promptFilter.mode);
+      if (promptFilter.favorite) params.set("favorite", "1");
+      const res = await fetch(`${API}/api/prompts?${params.toString()}`);
       const data = await parse(res);
       setPrompts(data.items || []);
     } catch (err) {
@@ -671,10 +725,11 @@ function App() {
       const res = await fetch(url, {
         method: editingPromptId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content, source: "manual", mode: null }),
+        body: JSON.stringify({ content, source: "manual", mode: promptDraftMode || null }),
       });
       await parse(res);
       setPromptDraft("");
+      setPromptDraftMode("");
       setEditingPromptId(null);
       await refreshPrompts();
     } catch (err) {
@@ -684,7 +739,27 @@ function App() {
 
   function editPromptEntry(item) {
     setPromptDraft(item.content || "");
+    setPromptDraftMode(item.mode || "");
     setEditingPromptId(item.id);
+  }
+
+  async function togglePromptFavorite(item) {
+    try {
+      const res = await fetch(`${API}/api/prompts/${item.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: item.content || "",
+          source: item.source || "manual",
+          mode: item.mode || null,
+          favorite: item.favorite ? 0 : 1,
+        }),
+      });
+      await parse(res);
+      await refreshPrompts();
+    } catch (err) {
+      setError(describeError(err));
+    }
   }
 
   async function deletePromptEntry(id) {
@@ -746,6 +821,8 @@ function App() {
         filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
         title: image.title,
         bucket: image.bucket,
+        source: image.source,
+        prompt_text: image.prompt_text,
       });
       imagesByMessage.set(image.message_id, list);
     }
@@ -807,17 +884,21 @@ function App() {
   }
 
   async function useImageAsReference(image) {
-    const response = await fetch(image.public_url || image.url);
-    const blob = await response.blob();
-    const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
-    const file = new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
     if (image.conversation_id) {
       await loadConversation(image.conversation_id, { openStudio: true });
     } else {
       setActiveView("studio");
       setForm((value) => ({ ...value, mode: "chat" }));
     }
-    setChatImages([file]);
+    if (image.id) {
+      setChatReferenceImages([normalizeImageForClient(image)]);
+    } else {
+      const response = await fetch(image.public_url || image.url);
+      const blob = await response.blob();
+      const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
+      const file = new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
+      setChatImages([file]);
+    }
     setForm((value) => ({ ...value, prompt: "", mode: "chat", action: "edit" }));
   }
 
@@ -879,29 +960,6 @@ function App() {
               </button>
             ))}
           </div>
-
-          <SettingsGroup
-            title="接口配置"
-            summary={activeProvider ? `当前：${activeProvider.name}` : (config.base_url || "未配置")}
-            open={!!openGroups.endpoint}
-            onToggle={() => toggleGroup("endpoint")}
-          >
-            <Field label="接口地址">
-              <input value={config.base_url} onChange={(e) => setConfig({ ...config, base_url: e.target.value })} />
-            </Field>
-            <Field label="密钥">
-              <input
-                type="password"
-                value={config.api_key}
-                onChange={(e) => setConfig({ ...config, api_key: e.target.value })}
-                placeholder="sk-..."
-              />
-            </Field>
-            <button className="secondaryButton" onClick={saveSettings}>
-              {copied ? <Check size={17} /> : <KeyRound size={17} />}
-              {copied || "保存配置"}
-            </button>
-          </SettingsGroup>
 
           <SettingsGroup
             title="提供商管理"
@@ -1104,15 +1162,20 @@ function App() {
             <PromptLibrary
               items={prompts}
               draft={promptDraft}
+              draftMode={promptDraftMode}
+              filter={promptFilter}
               editingId={editingPromptId}
               copiedId={promptCopyId}
               onDraft={setPromptDraft}
+              onDraftMode={setPromptDraftMode}
+              onFilter={setPromptFilter}
               onSave={savePromptEntry}
-              onCancel={() => { setPromptDraft(""); setEditingPromptId(null); }}
+              onCancel={() => { setPromptDraft(""); setPromptDraftMode(""); setEditingPromptId(null); }}
               onEdit={editPromptEntry}
               onDelete={deletePromptEntry}
               onCopy={copyPromptEntry}
               onUse={usePromptEntry}
+              onFavorite={togglePromptFavorite}
               onRefresh={refreshPrompts}
             />
           ) : form.mode === "chat" ? (
@@ -1126,6 +1189,9 @@ function App() {
               )}
               {messages.map((msg) => (
                 <Message key={msg.id} msg={msg} onDownload={downloadImage} />
+              ))}
+              {liveChatTasks.map((task) => (
+                <ChatTaskProgress key={task.id} task={task} />
               ))}
               {loading && (
                 <div className="message assistant">
@@ -1157,13 +1223,22 @@ function App() {
               />
             )}
             {form.mode === "chat" && (
-              <UploadRow
-                label="参考图片"
-                files={chatImages}
-                onChange={setChatImages}
-                onRemove={(index) => setChatImages((items) => items.filter((_, i) => i !== index))}
-                multiple
-              />
+              <>
+                <ChatReferencePicker
+                  images={chatGeneratedImages}
+                  selected={chatReferenceImages}
+                  onToggle={toggleChatReferenceImage}
+                  onRemove={removeChatReferenceImage}
+                />
+                <UploadRow
+                  label="上传参考"
+                  files={chatImages}
+                  onChange={updateChatUploads}
+                  onRemove={(index) => setChatImages((items) => items.filter((_, i) => i !== index))}
+                  multiple
+                  hint={`已指定 ${selectedReferenceCount()}/3 张`}
+                />
+              </>
             )}
             <div className="promptRow">
               <textarea
@@ -1441,7 +1516,8 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
 function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
   const [copyState, setCopyState] = useState("idle");
   const isLive = ["queued", "running"].includes(task.status);
-  const images = normalizeTaskImages(task);
+  const images = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
+  const inputImages = normalizeTaskImages(task).filter((image) => ["input", "mask", "input_reference"].includes(image.source));
   const errorText = task.error_detail ? formatTaskError(task.error_detail) : "";
 
   async function copyError() {
@@ -1461,7 +1537,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
         <div>
           <StatusPill mode={task.mode} status={task.status} />
           <h3>{task.prompt || `${modeLabel(task.mode)}任务 #${task.id}`}</h3>
-          <p>#{task.id} · {task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</p>
+          <p>#{task.id} · {task.stage || statusLabel(task.status)} · 上游事件进度 {Number(task.progress || 0)}%</p>
         </div>
         <div className="taskDetailActions">
           {isLive && <button className="ghostButton danger" type="button" onClick={() => onCancel(task.id)}><X size={16} /> 停止</button>}
@@ -1491,6 +1567,17 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
           <pre>{errorText}</pre>
         </section>
       )}
+      {inputImages.length > 0 && (
+        <section>
+          <div className="sectionTitle">
+            <strong>任务输入图</strong>
+            <small>{inputImages.length} 张</small>
+          </div>
+          <div className="imageGrid uploadedImageGrid">
+            {inputImages.map((image) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} />)}
+          </div>
+        </section>
+      )}
       {images.length > 0 ? (
         <section>
           <div className="sectionTitle">
@@ -1511,15 +1598,20 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
 function PromptLibrary({
   items,
   draft,
+  draftMode,
+  filter,
   editingId,
   copiedId,
   onDraft,
+  onDraftMode,
+  onFilter,
   onSave,
   onCancel,
   onEdit,
   onDelete,
   onCopy,
   onUse,
+  onFavorite,
   onRefresh,
 }) {
   return (
@@ -1534,6 +1626,17 @@ function PromptLibrary({
           onChange={(event) => onDraft(event.target.value)}
           placeholder="写入一条常用提示词，只保存文字，不保存图片。"
         />
+        <Select
+          label="提示词模式"
+          value={draftMode}
+          onChange={onDraftMode}
+          options={[
+            { value: "", label: "通用" },
+            { value: "chat", label: "对话" },
+            { value: "generate", label: "生成" },
+            { value: "edit", label: "编辑" },
+          ]}
+        />
         <div className="promptEditorActions">
           <button className="secondaryButton compact" type="button" onClick={onSave}>
             <Check size={16} /> {editingId ? "保存修改" : "保存到库"}
@@ -1544,6 +1647,22 @@ function PromptLibrary({
             </button>
           )}
         </div>
+      </section>
+
+      <section className="promptFilters">
+        <label>
+          <Search size={15} />
+          <input value={filter.q} onChange={(event) => onFilter({ ...filter, q: event.target.value })} placeholder="搜索提示词" />
+        </label>
+        <select value={filter.mode} onChange={(event) => onFilter({ ...filter, mode: event.target.value })}>
+          <option value="">全部模式</option>
+          <option value="chat">对话</option>
+          <option value="generate">生成</option>
+          <option value="edit">编辑</option>
+        </select>
+        <button className={filter.favorite ? "active" : ""} type="button" onClick={() => onFilter({ ...filter, favorite: !filter.favorite })}>
+          <Heart size={15} /> 收藏
+        </button>
       </section>
 
       {items.length === 0 ? (
@@ -1562,6 +1681,9 @@ function PromptLibrary({
               </div>
               <p>{item.content}</p>
               <div className="promptCardActions">
+                <button className={item.favorite ? "favorite active" : "favorite"} type="button" onClick={() => onFavorite(item)}>
+                  <Heart size={15} /> {item.favorite ? "已收藏" : "收藏"}
+                </button>
                 <button className={`copyFeedbackButton ${copiedId === item.id ? "success" : ""}`} type="button" onClick={() => onCopy(item)}>
                   <Copy size={15} /> {copiedId === item.id ? "复制成功" : "复制"}
                 </button>
@@ -1603,6 +1725,65 @@ function GalleryHistory({ items, onRefresh, onDownload, onUseImage }) {
         </article>
       ))}
     </div>
+  );
+}
+
+function ChatTaskProgress({ task }) {
+  return (
+    <div className="message assistant taskMessage">
+      <div className="avatar"><Loader2 className="spin" size={18} /></div>
+      <div className="bubble taskBubble">
+        <div className="taskBubbleHead">
+          <strong>{task.stage || statusLabel(task.status)}</strong>
+          <span>{Number(task.progress || 0)}%</span>
+        </div>
+        <div className="progressTrack">
+          <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
+        </div>
+        <small>#{task.id} · {task.params?.action || task.mode} · 上游事件会实时写入这里</small>
+      </div>
+    </div>
+  );
+}
+
+function ChatReferencePicker({ images, selected, onToggle, onRemove }) {
+  const selectedIds = new Set((selected || []).map((image) => Number(image.id)));
+  return (
+    <section className="referencePicker">
+      <div className="referencePickerHead">
+        <strong>指定参考图</strong>
+        <small>{selected.length}/3，AI 只会使用你指定的图作为 edit 输入</small>
+      </div>
+      {selected.length > 0 && (
+        <div className="selectedRefs">
+          {selected.map((image) => (
+            <button key={image.id} type="button" onClick={() => onRemove(image.id)}>
+              <img src={image.public_url || image.url} alt="" />
+              <span>移除</span>
+              <X size={13} />
+            </button>
+          ))}
+        </div>
+      )}
+      {images.length > 0 ? (
+        <div className="referenceStrip">
+          {images.map((image) => (
+            <button
+              key={image.id}
+              type="button"
+              className={selectedIds.has(Number(image.id)) ? "active" : ""}
+              onClick={() => onToggle(image)}
+              title="选择为本轮参考图"
+            >
+              <img src={image.public_url || image.url} alt="" />
+              <span>{selectedIds.has(Number(image.id)) ? "已选" : "选择"}</span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <small className="uploadEmpty">当前对话暂无可选历史图，也可以直接上传参考图。</small>
+      )}
+    </section>
   );
 }
 
@@ -1666,7 +1847,9 @@ function Gallery({ items, loading, onDownload }) {
 }
 
 function ImageCard({ image, onDownload, onUseImage }) {
+  const [showPrompt, setShowPrompt] = useState(false);
   const url = image.public_url || image.url;
+  const promptText = image.prompt_text || image.task_prompt || image.message_content || "";
   return (
     <div className="imageCard">
       <img src={url} alt="generated" />
@@ -1685,7 +1868,19 @@ function ImageCard({ image, onDownload, onUseImage }) {
             继续改
           </button>
         )}
+        {promptText && (
+          <button type="button" onClick={() => setShowPrompt((value) => !value)}>
+            <BookOpen size={14} />
+            提示词
+          </button>
+        )}
       </div>
+      {showPrompt && (
+        <div className="imagePromptBox">
+          <strong>原始提示词</strong>
+          <p>{promptText}</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -1712,7 +1907,7 @@ function Select({ label, value, onChange, options }) {
   );
 }
 
-function UploadRow({ label, files, onChange, onRemove, multiple = false }) {
+function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = "" }) {
   const [previews, setPreviews] = useState([]);
 
   useEffect(() => {
@@ -1725,6 +1920,7 @@ function UploadRow({ label, files, onChange, onRemove, multiple = false }) {
     <div className="uploadRow">
       <label className="uploadPicker">
         <span><ImagePlus size={16} /> {label}</span>
+        {hint && <small>{hint}</small>}
         <input
           type="file"
           accept="image/*"
@@ -1855,6 +2051,27 @@ function normalizeTaskImages(task) {
     url: image.public_url || image.url,
     filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "generated-image.png",
   }));
+}
+
+function normalizeImageForClient(image) {
+  return {
+    ...image,
+    url: image.public_url || image.url,
+    public_url: image.public_url || image.url,
+    filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "generated-image.png",
+  };
+}
+
+function uniqueImages(images) {
+  const seen = new Set();
+  const result = [];
+  for (const image of images || []) {
+    const id = image.id || image.url;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    result.push(normalizeImageForClient(image));
+  }
+  return result;
 }
 
 function formatTime(value) {

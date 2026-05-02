@@ -519,6 +519,11 @@ textarea {
   gap: 6px;
 }
 
+.uploadPicker small {
+  color: rgba(245, 243, 234, 0.56);
+  font-size: 11px;
+}
+
 .uploadPicker input {
   position: absolute;
   inline-size: 1px;
@@ -628,6 +633,7 @@ textarea {
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .imageActions a,
@@ -648,6 +654,130 @@ textarea {
 .imageActions button {
   background: #eecb70;
   color: #11130f;
+}
+
+.imagePromptBox {
+  position: absolute;
+  inset: auto 8px 48px 8px;
+  max-height: 48%;
+  overflow: auto;
+  border: 1px solid rgba(238, 203, 112, 0.35);
+  border-radius: 8px;
+  background: rgba(17, 19, 15, 0.88);
+  padding: 9px;
+  backdrop-filter: blur(14px);
+}
+
+.imagePromptBox strong {
+  display: block;
+  color: #eecb70;
+  font-size: 12px;
+  margin-bottom: 5px;
+}
+
+.imagePromptBox p {
+  color: rgba(245, 243, 234, 0.9);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.referencePicker {
+  border: 1px dashed rgba(238, 203, 112, 0.24);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+  background: rgba(238, 203, 112, 0.045);
+}
+
+.referencePickerHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.referencePickerHead strong {
+  color: #eecb70;
+}
+
+.referencePickerHead small {
+  color: rgba(245, 243, 234, 0.58);
+}
+
+.referenceStrip,
+.selectedRefs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.selectedRefs {
+  margin-bottom: 8px;
+}
+
+.referenceStrip button,
+.selectedRefs button {
+  position: relative;
+  flex: 0 0 86px;
+  height: 70px;
+  border: 1px solid rgba(245, 243, 234, 0.16);
+  border-radius: 8px;
+  overflow: hidden;
+  padding: 0;
+  background: rgba(17, 19, 15, 0.44);
+  color: #f5f3ea;
+}
+
+.referenceStrip button.active {
+  border-color: #eecb70;
+  box-shadow: inset 0 0 0 2px rgba(238, 203, 112, 0.28);
+}
+
+.referenceStrip img,
+.selectedRefs img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.referenceStrip span,
+.selectedRefs span {
+  position: absolute;
+  left: 5px;
+  bottom: 5px;
+  border-radius: 5px;
+  padding: 2px 5px;
+  background: rgba(17, 19, 15, 0.78);
+  font-size: 11px;
+}
+
+.selectedRefs svg {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  border-radius: 999px;
+  background: #d64c39;
+}
+
+.taskBubble {
+  display: grid;
+  gap: 8px;
+}
+
+.taskBubbleHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.taskBubbleHead strong {
+  color: #eecb70;
+}
+
+.taskBubble small {
+  color: rgba(245, 243, 234, 0.58);
 }
 
 .resultGroup {
@@ -1132,7 +1262,7 @@ textarea {
 
 .promptLibrary {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -1152,6 +1282,59 @@ textarea {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 10px;
+}
+
+.promptFilters {
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  background: rgba(245, 243, 234, 0.045);
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px auto;
+  gap: 8px;
+}
+
+.promptFilters label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: rgba(17, 19, 15, 0.5);
+}
+
+.promptFilters input,
+.promptFilters select,
+.promptFilters button {
+  min-height: 38px;
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  background: rgba(17, 19, 15, 0.5);
+  color: #f5f3ea;
+  border-radius: 8px;
+  padding: 0 10px;
+}
+
+.promptFilters label input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.promptFilters button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.promptFilters button.active,
+.promptCardActions .favorite.active {
+  background: #eecb70;
+  color: #11130f;
+  border-color: transparent;
 }
 
 .promptGrid {
@@ -1214,7 +1397,7 @@ textarea {
   gap: 5px;
 }
 
-.promptCardActions button:nth-child(2) {
+.promptCardActions button:nth-child(3) {
   background: #eecb70;
   color: #11130f;
   border-color: transparent;
@@ -1419,6 +1602,10 @@ textarea {
 
   .promptEditorActions {
     display: grid;
+  }
+
+  .promptFilters {
+    grid-template-columns: 1fr;
   }
 
   .promptEditorActions .secondaryButton,

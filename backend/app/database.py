@@ -100,6 +100,7 @@ def init_db() -> None:
                 content text not null,
                 source text not null default 'manual',
                 mode text,
+                favorite integer not null default 0,
                 created_at text not null,
                 updated_at text not null
             );
@@ -117,9 +118,10 @@ def init_db() -> None:
         ensure_column(conn, "tasks", "cancel_requested", "integer not null default 0")
         ensure_column(conn, "prompts", "source", "text not null default 'manual'")
         ensure_column(conn, "prompts", "mode", "text")
+        ensure_column(conn, "prompts", "favorite", "integer not null default 0")
 
 
-def add_prompt(content: str, *, source: str = "manual", mode: str | None = None) -> int | None:
+def add_prompt(content: str, *, source: str = "manual", mode: str | None = None, favorite: int = 0) -> int | None:
     text = content.strip()
     if not text:
         return None
@@ -127,10 +129,10 @@ def add_prompt(content: str, *, source: str = "manual", mode: str | None = None)
     with connect() as conn:
         cursor = conn.execute(
             """
-            insert into prompts (content, source, mode, created_at, updated_at)
-            values (?, ?, ?, ?, ?)
+            insert into prompts (content, source, mode, favorite, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?)
             """,
-            (text, source, mode, stamp, stamp),
+            (text, source, mode, int(bool(favorite)), stamp, stamp),
         )
         return int(cursor.lastrowid)
 

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import mimetypes
 import re
 from pathlib import Path
@@ -61,6 +62,70 @@ async def post_json(
         assert last_network_error is not None
         raise HTTPException(status_code=502, detail=network_error_detail(endpoint, url, last_network_error))
     return parse_response(response, endpoint=endpoint, url=url, payload=payload)
+
+
+async def post_json_stream(
+    endpoint: str,
+    payload: dict[str, Any],
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: float = 240.0,
+    on_event: Any | None = None,
+) -> dict[str, Any]:
+    url = urljoin(normalize_base_url(base_url) + "/", endpoint.lstrip("/"))
+    key = resolve_api_key(api_key)
+    stream_payload = {**payload, "stream": True}
+    events: list[dict[str, Any]] = []
+    output_items: list[dict[str, Any]] = []
+    terminal_response: dict[str, Any] | None = None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, headers=headers(key), json=stream_payload) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    parsed = httpx.Response(
+                        response.status_code,
+                        content=body,
+                        headers=response.headers,
+                        request=response.request,
+                    )
+                    return parse_response(parsed, endpoint=endpoint, url=url, payload=payload)
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(event)
+                    if on_event is not None:
+                        on_event(event)
+                    event_type = str(event.get("type") or "")
+                    if event_type == "response.output_item.done":
+                        item = event.get("item")
+                        if isinstance(item, dict):
+                            output_items.append(item)
+                    elif event_type in {"response.completed", "response.failed"}:
+                        response_obj = event.get("response")
+                        if isinstance(response_obj, dict):
+                            terminal_response = response_obj
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=network_error_detail(endpoint, url, exc)) from exc
+    result = terminal_response or {"id": None, "output": []}
+    if output_items:
+        existing = result.get("output")
+        if not isinstance(existing, list) or not any(
+            isinstance(item, dict) and item.get("type") == "image_generation_call" and item.get("result")
+            for item in existing
+        ):
+            result["output"] = output_items
+    result["_stream_events"] = summarize_stream_events(events)
+    return result
 
 
 async def post_multipart(
@@ -342,3 +407,17 @@ def sanitize_response(value: Any) -> Any:
                 sanitized[key] = sanitize_response(item)
         return sanitized
     return value
+
+
+def summarize_stream_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for event in events:
+        item = {
+            "type": event.get("type"),
+            "sequence_number": event.get("sequence_number"),
+        }
+        if event.get("type") == "response.image_generation_call.partial_image":
+            item["partial_image_index"] = event.get("partial_image_index")
+            item["partial_image_b64"] = "[partial image omitted]"
+        summary.append({key: value for key, value in item.items() if value is not None})
+    return summary

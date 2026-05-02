@@ -32,6 +32,7 @@ from .openai_compat import (
     extract_text_from_responses,
     guess_mime,
     post_json,
+    post_json_stream,
     safe_storage_folder,
     sanitize_response,
     save_upload,
@@ -70,6 +71,7 @@ class PromptRequest(BaseModel):
     content: str = Field(min_length=1)
     source: str = "manual"
     mode: str | None = None
+    favorite: int = 0
 
 
 class GenerateRequest(BaseModel):
@@ -116,6 +118,7 @@ class ChatRequest(BaseModel):
     input_fidelity: str = "auto"
     partial_images: int = Field(default=0, ge=0, le=3)
     context_limit: int = Field(default=10, ge=0, le=50)
+    reference_image_ids: list[int] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
 
 
@@ -154,17 +157,52 @@ def public_upload_image(path_value: str) -> dict[str, Any] | None:
     path = Path(path_value)
     if not path.exists():
         return None
+    public_url = None
     try:
         relative = path.relative_to(UPLOAD_DIR)
+        public_url = f"/media/uploads/{relative.as_posix()}"
     except ValueError:
-        relative = Path(path.name)
+        try:
+            relative = path.relative_to(OUTPUT_DIR)
+            public_url = f"/media/outputs/{relative.as_posix()}"
+        except ValueError:
+            public_url = f"/media/uploads/{path.name}"
     return {
-        "url": f"/media/uploads/{relative.as_posix()}",
-        "public_url": f"/media/uploads/{relative.as_posix()}",
+        "url": public_url,
+        "public_url": public_url,
         "file_path": str(path),
         "filename": path.name,
         "mime_type": guess_mime(path),
     }
+
+
+def public_input_image(
+    item: tuple[Path, str],
+    *,
+    source: str = "input",
+    title: str | None = None,
+    task_id: int | None = None,
+    conversation_id: int | None = None,
+    message_id: int | None = None,
+) -> dict[str, Any] | None:
+    path, mime_type = item
+    public = public_upload_image(str(path))
+    if not public:
+        return None
+    image_id = db.add_image(
+        source=source,
+        file_path=path,
+        public_url=public["public_url"],
+        mime_type=mime_type,
+        title=title,
+        task_id=task_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    public["id"] = image_id
+    public["source"] = source
+    public["title"] = title
+    return public
 
 
 def compact_params(data: dict[str, Any]) -> dict[str, Any]:
@@ -209,20 +247,48 @@ def normalize_text_fields(data: dict[str, Any], keys: tuple[str, ...] = ("prompt
 
 def summarize_task(row: Any) -> dict[str, Any]:
     item = db.row_to_dict(row)
-    response_json = item.get("response_json")
-    if isinstance(response_json, str) and len(response_json) > 2000:
-        item["response_json"] = f"[response omitted, {len(response_json)} chars]"
+    raw_response_json = item.get("response_json")
     if isinstance(item.get("params_json"), str):
         try:
             item["params"] = json.loads(item["params_json"])
         except json.JSONDecodeError:
             item["params"] = {}
+    if isinstance(raw_response_json, str):
+        try:
+            item["response"] = json.loads(raw_response_json)
+        except json.JSONDecodeError:
+            item["response"] = None
+        if len(raw_response_json) > 2000:
+            item["response_json"] = f"[response omitted, {len(raw_response_json)} chars]"
     if isinstance(item.get("error"), str) and item["error"]:
         try:
             item["error_detail"] = json.loads(item["error"])
         except json.JSONDecodeError:
             item["error_detail"] = item["error"]
+    item["prompt_text"] = prompt_text_for_task(item)
     return item
+
+
+def prompt_text_for_task(task: dict[str, Any]) -> str:
+    response = task.get("response")
+    if isinstance(response, dict):
+        raw = response.get("raw")
+        if isinstance(raw, dict) and raw.get("image_prompt"):
+            return str(raw["image_prompt"])
+        if isinstance(response.get("image_prompt"), str):
+            return response["image_prompt"]
+    params = task.get("params")
+    if isinstance(params, dict) and params.get("prompt"):
+        return str(params["prompt"])
+    return str(task.get("prompt") or "")
+
+
+def enrich_images_with_prompt(images: list[dict[str, Any]], task: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    prompt_text = prompt_text_for_task(task) if task else ""
+    for image in images:
+        if image.get("source") == "api" and prompt_text:
+            image["prompt_text"] = prompt_text
+    return images
 
 
 def task_with_images(task_id: int) -> dict[str, Any]:
@@ -238,7 +304,7 @@ def task_with_images(task_id: int) -> dict[str, Any]:
             ).fetchall()
         ]
     item = summarize_task(row)
-    item["images"] = images
+    item["images"] = enrich_images_with_prompt(images, item)
     return item
 
 
@@ -268,26 +334,25 @@ def build_chat_planner_prompt(
     context = build_context_prompt(history, prompt)
     image_candidates = image_candidates or []
     if image_candidates:
-        source_note = "本轮用户上传了新图片；这些上传图已进入候选列表。" if has_images else "本轮用户没有上传新图片。"
-        lines = [f"{source_note} 当前可用图片候选如下，可由你根据上下文选择作为 edit 输入图："]
+        source_note = "用户本轮已经明确指定了参考图片。" if has_images else "用户本轮没有指定参考图片。"
+        lines = [f"{source_note} 已指定参考图如下；如果你决定执行图片修改，应使用这些参考图，不要自行选择其它历史图片："]
         for index, image in enumerate(image_candidates, start=1):
             lines.append(
                 f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
                 f"image_id={image.get('id')}, message_id={image.get('message_id')}, "
                 f"task_id={image.get('task_id')}, 提示词/说明={image.get('hint') or '无'}"
             )
-        lines.append("候选顺序与随请求附带给你的参考图片顺序一致：候选1对应第1张参考图，候选2对应第2张参考图，以此类推。")
-        lines.append("如果用户说“继续改、改这张、上一张、刚才那张、参考我上传的图”等，请结合上下文和候选说明选择最匹配的 ref。")
+        lines.append("候选顺序与随请求附带给你的参考图片顺序一致。")
         image_note = "\n".join(lines)
     else:
-        image_note = "本轮用户没有上传参考图片，当前对话也没有可用的最近生成图。"
+        image_note = "本轮用户没有上传或选择参考图片。"
     return f"""
 你是一个中文生图对话助手。你的职责不是每次都生图，而是先理解用户意图，再决定是否需要调用生图。
 
 判断规则：
 1. 如果用户只是在聊天、询问能力、补充偏好、没有明确画面/修改目标，不要生图，应继续提问或确认需求。
 2. 如果用户明确要求生成、重画、修改、继续改图，或上下文已经足够且用户表达了开始/按这个来/生成吧，应生图。
-3. 如果用户表达“继续改、修改、调整、保留、换成、参考某张图”等改图意图，应从候选中智能选择 reference_image_refs 后使用 edit。候选可能来自本轮上传图，也可能来自历史生成图。
+3. 如果用户表达“继续改、修改、调整、保留、换成、参考某张图”等改图意图，但本轮没有指定参考图，不要自行从历史图片里猜测，应要求用户选择或上传参考图。
 4. 如果用户在已有图片基础上提出修改意见，应把修改意见融合为新的高质量生图提示词，强调保留不应改变的部分。
 5. 生成提示词要完整、具体、适合直接传给 image_generation 工具。
 6. 如果用户要改图但你无法从候选中判断应修改哪张图，不要生图，should_generate=false，并请用户明确选择哪张。
@@ -300,8 +365,8 @@ def build_chat_planner_prompt(
   "should_generate": true 或 false,
   "action": "generate" 或 "edit" 或 "auto",
   "image_prompt": "should_generate 为 true 时填写最终生图提示词，否则为空字符串",
-  "reference_image_refs": ["需要作为 edit 输入图的 ref，例如 upload:1 或 image:8；没有则为空数组"],
-  "reference_image_ids": [需要作为 edit 输入图的 image_id；没有则为空数组],
+  "reference_image_refs": [],
+  "reference_image_ids": [],
   "reason": "简短说明判断依据"
 }}
 
@@ -367,6 +432,58 @@ def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[di
     return candidates
 
 
+def build_selected_image_candidates(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in selected:
+        path = Path(item["file_path"])
+        if not path.exists():
+            continue
+        candidates.append(
+            {
+                "ref": f"image:{item['id']}",
+                "source": "selected",
+                "id": item["id"],
+                "message_id": item.get("message_id"),
+                "task_id": item.get("task_id"),
+                "path": path,
+                "mime_type": item.get("mime_type") or "image/png",
+                "hint": item.get("task_prompt") or item.get("message_content") or item.get("title") or "用户指定的历史图片",
+            }
+        )
+    return candidates
+
+
+def load_selected_reference_images(image_ids: list[int], limit: int = 3) -> list[dict[str, Any]]:
+    clean_ids: list[int] = []
+    for value in image_ids:
+        try:
+            image_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if image_id > 0 and image_id not in clean_ids:
+            clean_ids.append(image_id)
+        if len(clean_ids) >= limit:
+            break
+    if not clean_ids:
+        return []
+    placeholders = ",".join("?" for _ in clean_ids)
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"""
+            select i.*,
+                   m.content as message_content,
+                   t.prompt as task_prompt
+            from images i
+            left join messages m on m.id = i.message_id
+            left join tasks t on t.id = i.task_id
+            where i.id in ({placeholders}) and i.source = 'api'
+            """,
+            clean_ids,
+        ).fetchall()
+    by_id = {int(row["id"]): db.row_to_dict(row) for row in rows}
+    return [by_id[image_id] for image_id in clean_ids if image_id in by_id and Path(by_id[image_id]["file_path"]).exists()]
+
+
 def load_conversation_image_candidates(conversation_id: int, limit: int = 8) -> list[dict[str, Any]]:
     with db.connect() as conn:
         rows = conn.execute(
@@ -378,7 +495,7 @@ def load_conversation_image_candidates(conversation_id: int, limit: int = 8) -> 
             from images i
             left join messages m on m.id = i.message_id
             left join tasks t on t.id = i.task_id
-            where i.conversation_id = ?
+            where i.conversation_id = ? and i.source = 'api'
             order by i.id desc
             limit ?
             """,
@@ -528,6 +645,7 @@ async def call_responses_image_generation(
     input_fidelity: str | None = None,
     previous_response_id: str | None = None,
     on_stable_retry: Callable[[str], None] | None = None,
+    on_stream_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     def build_payload(tool_quality: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -559,6 +677,19 @@ async def call_responses_image_generation(
 
     payload = build_payload(quality)
     try:
+        if on_stream_event is not None:
+            try:
+                return await post_json_stream(
+                    "responses",
+                    payload,
+                    base_url=config.base_url,
+                    api_key=config.api_key,
+                    timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+                    on_event=on_stream_event,
+                )
+            except HTTPException as exc:
+                if exc.status_code not in {400, 404, 405}:
+                    raise
         return await post_json(
             "responses",
             payload,
@@ -574,6 +705,19 @@ async def call_responses_image_generation(
         if on_stable_retry:
             on_stable_retry(fallback_quality)
         stable_payload = build_payload(fallback_quality)
+        if on_stream_event is not None:
+            try:
+                return await post_json_stream(
+                    "responses",
+                    stable_payload,
+                    base_url=config.base_url,
+                    api_key=config.api_key,
+                    timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+                    on_event=on_stream_event,
+                )
+            except HTTPException as stream_exc:
+                if stream_exc.status_code not in {400, 404, 405}:
+                    raise
         return await post_json(
             "responses",
             stable_payload,
@@ -590,6 +734,22 @@ def update_timeout_retry_stage(task_id: int, quality: str) -> None:
         progress=52,
         stage=f"上游网关超时，已自动切换到{quality}清晰度稳定重试",
     )
+
+
+def handle_image_stream_event(task_id: int, event: dict[str, Any]) -> None:
+    event_type = str(event.get("type") or "")
+    if event_type.endswith(".in_progress") or event_type == "response.in_progress":
+        db.update_task(task_id, progress=45, stage="上游已开始处理图像请求")
+    elif event_type == "response.image_generation_call.partial_image":
+        index = event.get("partial_image_index")
+        label = f"上游返回局部预览 {index}" if index is not None else "上游返回局部预览"
+        db.update_task(task_id, progress=68, stage=label)
+    elif event_type == "response.output_item.done":
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if item.get("type") == "image_generation_call":
+            db.update_task(task_id, progress=88, stage="上游已返回最终图片")
+    elif event_type == "response.completed":
+        db.update_task(task_id, progress=92, stage="上游响应完成，正在保存图片")
 
 
 def responses_payload_for_planner(
@@ -832,11 +992,29 @@ def delete_provider(provider_id: int) -> dict[str, Any]:
 
 
 @app.get("/api/prompts")
-def list_prompts(limit: int = 300) -> dict[str, Any]:
+def list_prompts(
+    limit: int = 300,
+    q: str = "",
+    mode: str = "",
+    favorite: int | None = None,
+) -> dict[str, Any]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    if q.strip():
+        clauses.append("content like ?")
+        values.append(f"%{q.strip()}%")
+    if mode.strip():
+        clauses.append("mode = ?")
+        values.append(mode.strip())
+    if favorite is not None:
+        clauses.append("favorite = ?")
+        values.append(1 if int(favorite) else 0)
+    where = f"where {' and '.join(clauses)}" if clauses else ""
+    values.append(max(1, min(int(limit), 1000)))
     with db.connect() as conn:
         rows = conn.execute(
-            "select * from prompts order by id desc limit ?",
-            (max(1, min(int(limit), 1000)),),
+            f"select * from prompts {where} order by favorite desc, id desc limit ?",
+            values,
         ).fetchall()
     return {"items": [db.row_to_dict(row) for row in rows]}
 
@@ -846,7 +1024,7 @@ def create_prompt(request: PromptRequest) -> dict[str, Any]:
     content = request.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="prompt content is required")
-    prompt_id = db.add_prompt(content, source=request.source.strip() or "manual", mode=request.mode)
+    prompt_id = db.add_prompt(content, source=request.source.strip() or "manual", mode=request.mode, favorite=request.favorite)
     with db.connect() as conn:
         row = conn.execute("select * from prompts where id = ?", (prompt_id,)).fetchone()
     return db.row_to_dict(row)
@@ -861,10 +1039,10 @@ def update_prompt(prompt_id: int, request: PromptRequest) -> dict[str, Any]:
         cursor = conn.execute(
             """
             update prompts
-            set content = ?, source = ?, mode = ?, updated_at = ?
+            set content = ?, source = ?, mode = ?, favorite = ?, updated_at = ?
             where id = ?
             """,
-            (content, request.source.strip() or "manual", request.mode, db.now_iso(), prompt_id),
+            (content, request.source.strip() or "manual", request.mode, int(bool(request.favorite)), db.now_iso(), prompt_id),
         )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="prompt not found")
@@ -934,6 +1112,7 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                 partial_images=request.partial_images,
                 config=request.config,
                 on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                on_stream_event=lambda event: handle_image_stream_event(task_id, event),
             )
             responses.append(sanitize_response(response))
             image_items.extend(extract_images_from_responses(response, request.output_format, folder=bucket))
@@ -998,6 +1177,10 @@ async def edit_image(
         }
     )
     task_id = db.create_task("edit", prompt, payload)
+    for item in saved_images:
+        public_input_image(item, source="input", title=prompt, task_id=task_id)
+    if saved_mask:
+        public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=task_id)
     schedule_task(task_id, run_edit_task(task_id, params, prompt, saved_images, saved_mask))
     return {"task": db.get_task(task_id)}
 
@@ -1040,6 +1223,7 @@ async def run_edit_task(
                 mask=saved_mask,
                 input_fidelity=str(params.get("input_fidelity", "auto")),
                 on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                on_stream_event=lambda event: handle_image_stream_event(task_id, event),
             )
             responses.append(sanitize_response(response))
             image_items.extend(extract_images_from_responses(response, output_format, folder=bucket))
@@ -1083,7 +1267,7 @@ def list_tasks(limit: int = 30) -> dict[str, Any]:
                     (task["id"],),
                 ).fetchall()
             ]
-            task["images"] = images
+            task["images"] = enrich_images_with_prompt(images, task)
     return {"items": tasks, "max_concurrent": MAX_CONCURRENT_TASKS, "active_count": active_task_count()}
 
 
@@ -1128,7 +1312,7 @@ def list_conversations() -> dict[str, Any]:
             """
             select c.*,
                 (select count(*) from messages m where m.conversation_id = c.id) as message_count,
-                (select count(*) from images i where i.conversation_id = c.id) as image_count,
+                (select count(*) from images i where i.conversation_id = c.id and i.source = 'api') as image_count,
                 (
                     select t.status from tasks t
                     where t.conversation_id = c.id
@@ -1206,7 +1390,7 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
         images = [
             db.row_to_dict(row)
             for row in conn.execute(
-                "select * from images where conversation_id = ? order by id asc",
+                "select * from images where conversation_id = ? and source = 'api' order by id asc",
                 (conversation_id,),
             ).fetchall()
         ]
@@ -1227,7 +1411,27 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
             item = public_upload_image(str(path_value))
             if item:
                 uploaded_images.append(item)
+        reference_ids = meta.get("reference_image_ids", []) if isinstance(meta, dict) else []
+        for image in load_selected_reference_images(reference_ids, limit=3):
+            uploaded_images.append(
+                {
+                    "id": image["id"],
+                    "url": image["public_url"],
+                    "public_url": image["public_url"],
+                    "file_path": image["file_path"],
+                    "filename": Path(image["file_path"]).name,
+                    "mime_type": image["mime_type"],
+                    "source": "input_reference",
+                    "prompt_text": image.get("task_prompt") or image.get("message_content") or image.get("title"),
+                }
+            )
         message["uploaded_images"] = uploaded_images
+    task_map = {int(task["id"]): task for task in tasks}
+    images = enrich_images_with_prompt(images, None)
+    for image in images:
+        task = task_map.get(int(image["task_id"])) if image.get("task_id") else None
+        if task:
+            enrich_images_with_prompt([image], task)
     return {"conversation": db.row_to_dict(conversation), "messages": messages, "images": images, "tasks": tasks}
 
 
@@ -1265,12 +1469,25 @@ def gallery(limit: int = 200) -> dict[str, Any]:
             left join conversations c on c.id = i.conversation_id
             left join messages m on m.id = i.message_id
             left join tasks t on t.id = i.task_id
+            where i.source = 'api'
             order by i.id desc
             limit ?
             """,
             (limit,),
         ).fetchall()
-    return {"items": [db.row_to_dict(row) for row in rows]}
+    items = [db.row_to_dict(row) for row in rows]
+    task_ids = [item["task_id"] for item in items if item.get("task_id")]
+    task_map: dict[int, dict[str, Any]] = {}
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        with db.connect() as conn:
+            task_rows = conn.execute(f"select * from tasks where id in ({placeholders})", task_ids).fetchall()
+        task_map = {int(row["id"]): summarize_task(row) for row in task_rows}
+    for item in items:
+        task = task_map.get(int(item["task_id"])) if item.get("task_id") else None
+        if task:
+            enrich_images_with_prompt([item], task)
+    return {"items": items}
 
 
 @app.post("/api/conversations/{conversation_id}/messages")
@@ -1281,7 +1498,14 @@ async def chat_message(
 ) -> dict[str, Any]:
     ensure_task_slot()
     params = ChatRequest(**normalize_text_fields(parse_params(params_json)))
+    if len(images or []) > 3:
+        raise HTTPException(status_code=400, detail="对话模式最多上传 3 张参考图")
     uploaded = [await save_upload(upload) for upload in images or []]
+    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)))
+    selected_reference_uploads = [
+        (Path(item["file_path"]), item.get("mime_type") or "image/png")
+        for item in selected_reference_images
+    ]
     db.add_prompt(params.prompt, source="auto", mode="chat")
 
     with db.connect() as conn:
@@ -1318,7 +1542,13 @@ async def chat_message(
                 conversation_id,
                 "user",
                 params.prompt,
-                db.json_dumps({"uploads": [str(path) for path, _ in uploaded], "context_limit": context_limit}),
+                db.json_dumps(
+                    {
+                        "uploads": [str(path) for path, _ in uploaded],
+                        "reference_image_ids": [item["id"] for item in selected_reference_images],
+                        "context_limit": context_limit,
+                    }
+                ),
                 db.now_iso(),
             ),
         )
@@ -1344,6 +1574,7 @@ async def chat_message(
             "action": params.action,
             "partial_images": params.partial_images,
             "context_limit": context_limit,
+            "reference_image_ids": [item["id"] for item in selected_reference_images],
         }
     )
     task_id = db.create_task(
@@ -1353,6 +1584,10 @@ async def chat_message(
         conversation_id=conversation_id,
         user_message_id=user_message_id,
     )
+    for item in uploaded:
+        public_input_image(item, source="input", title=params.prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
+    for item in selected_reference_uploads:
+        public_input_image(item, source="input_reference", title=params.prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
     schedule_task(
         task_id,
         run_chat_task(
@@ -1361,6 +1596,7 @@ async def chat_message(
             user_message_id,
             params,
             uploaded,
+            selected_reference_images,
             previous_response_id,
             conversation_title,
             recent_messages,
@@ -1376,6 +1612,7 @@ async def run_chat_task(
     user_message_id: int,
     params: ChatRequest,
     uploaded: list[tuple[Path, str]],
+    selected_reference_images: list[dict[str, Any]],
     previous_response_id: str | None,
     conversation_title: str,
     recent_messages: list[dict[str, Any]],
@@ -1385,7 +1622,7 @@ async def run_chat_task(
         db.update_task(task_id, progress=12, stage="AI 正在理解意图")
         image_candidates = [
             *build_uploaded_image_candidates(uploaded),
-            *load_conversation_image_candidates(conversation_id),
+            *build_selected_image_candidates(selected_reference_images),
         ]
         planner_reference_images = [
             (item["path"], item.get("mime_type") or "image/png")
@@ -1394,7 +1631,7 @@ async def run_chat_task(
         planner_prompt = build_chat_planner_prompt(
             recent_messages,
             params.prompt,
-            bool(uploaded),
+            bool(image_candidates),
             image_candidates=image_candidates,
         )
         planner_response = await call_chat_planner(
@@ -1406,15 +1643,14 @@ async def run_chat_task(
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_planner_json(planner_text)
-        reference_uploads = selected_candidate_uploads(
-            image_candidates,
-            plan.get("reference_image_ids", []),
-            plan.get("reference_image_refs", []),
-        )
+        reference_uploads = [
+            (item["path"], item.get("mime_type") or "image/png")
+            for item in image_candidates
+        ]
         if plan["should_generate"] and plan["action"] == "edit" and not reference_uploads:
             plan["should_generate"] = False
-            plan["reply"] = "我需要先确认你要修改哪一张图片。请说明要改本轮上传的第几张，或历史记录/图库里的哪一张。"
-            plan["reason"] = "planner requested edit but did not select a reference image"
+            plan["reply"] = "我需要你先上传或选择要修改的参考图。最多可以选择 3 张，然后我再按你的意见编辑。"
+            plan["reason"] = "planner requested edit but user did not provide selected reference images"
         planner_response_id = planner_response.get("id")
         db.update_task(
             task_id,
@@ -1481,8 +1717,8 @@ async def run_chat_task(
         if reference_uploads:
             action = "edit"
         edit_inputs = reference_uploads
-        raw_for_meta["selected_reference_image_refs"] = plan.get("reference_image_refs", [])
-        raw_for_meta["selected_reference_image_ids"] = plan.get("reference_image_ids", [])
+        raw_for_meta["selected_reference_image_refs"] = [item.get("ref") for item in image_candidates]
+        raw_for_meta["selected_reference_image_ids"] = [item.get("id") for item in image_candidates if item.get("id")]
         raw_for_meta["resolved_action"] = action
         db.update_task(task_id, progress=48, stage=f"AI 决定执行 {action}，正在生成图片")
         image_response = await call_responses_image_generation(
@@ -1502,6 +1738,7 @@ async def run_chat_task(
             input_fidelity=params.input_fidelity,
             previous_response_id=planner_response_id or previous_response_id,
             on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+            on_stream_event=lambda event: handle_image_stream_event(task_id, event),
         )
         db.update_task(task_id, progress=84, stage="正在提取和保存图片")
         bucket = task_image_folder(task_id, conversation_title)
