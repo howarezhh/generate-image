@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -118,6 +119,24 @@ class ChatRequest(BaseModel):
     input_fidelity: str = "auto"
     partial_images: int = Field(default=0, ge=0, le=3)
     context_limit: int = Field(default=10, ge=0, le=50)
+    reference_image_ids: list[int] = Field(default_factory=list)
+    config: ClientConfig = Field(default_factory=ClientConfig)
+
+
+class StoryboardRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    model: str = "gpt-5.4"
+    image_model: str = "gpt-image-2"
+    size: str = "2560x1440"
+    quality: str = "high"
+    background: str = "auto"
+    output_format: str = "png"
+    output_compression: int | None = Field(default=None, ge=0, le=100)
+    moderation: str = "auto"
+    input_fidelity: str = "high"
+    partial_images: int = Field(default=0, ge=0, le=3)
+    context_limit: int = Field(default=10, ge=0, le=50)
+    shot_limit: int = Field(default=6, ge=1, le=12)
     reference_image_ids: list[int] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
 
@@ -293,7 +312,20 @@ def prompt_text_for_task(task: dict[str, Any]) -> str:
 
 def enrich_images_with_prompt(images: list[dict[str, Any]], task: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     prompt_text = prompt_text_for_task(task) if task else ""
+    storyboard_prompts: dict[str, str] = {}
+    if task and task.get("mode") == "storyboard":
+        params = task.get("params") if isinstance(task.get("params"), dict) else {}
+        storyboard = params.get("storyboard") if isinstance(params.get("storyboard"), dict) else {}
+        storyboard_shots = storyboard.get("shots", [])
+        if not isinstance(storyboard_shots, list):
+            storyboard_shots = []
+        for shot in storyboard_shots:
+            if isinstance(shot, dict) and shot.get("name") and shot.get("prompt"):
+                storyboard_prompts[str(shot["name"])] = str(shot["prompt"])
     for image in images:
+        if image.get("source") == "api" and storyboard_prompts.get(str(image.get("title") or "")):
+            image["prompt_text"] = storyboard_prompts[str(image.get("title") or "")]
+            continue
         if image.get("source") == "api" and prompt_text:
             image["prompt_text"] = prompt_text
     return images
@@ -488,6 +520,134 @@ def parse_planner_json(text: str) -> dict[str, Any]:
         "reference_image_ids": [int(value) for value in reference_ids if str(value).isdigit()],
         "reason": str(parsed.get("reason") or "").strip(),
     }
+
+
+def build_storyboard_planner_prompt(
+    history: list[dict[str, Any]],
+    prompt: str,
+    has_images: bool,
+    shot_limit: int,
+) -> str:
+    context = build_context_prompt(history, prompt)
+    image_note = "用户本轮已经提供了角色/场景参考图，可作为第一镜头的 edit 输入。" if has_images else "用户本轮没有提供参考图，第一镜头可从文本生成开始。"
+    return f"""
+你是一个中文分镜连续生图导演助手。你的目标是和用户对话完善视频画面意图，并在信息足够时生成一组连续镜头首帧图。
+
+工作判断：
+1. 如果用户还只是在讨论主题、人物、场景、风格、分镜数量，且信息不足，不要生图，should_generate=false，并用中文提出最关键的下一步问题。
+2. 如果用户明确要求开始、生成、按这个方案做，或上下文已经足够形成镜头序列，应 should_generate=true。
+3. 每个镜头只生成一张图，代表该镜头的首帧画面。
+4. 镜头必须连续：第 N 镜头的首帧要承接第 N-1 镜头画面，保持人物、服装、道具、空间位置、光线逻辑和故事动作一致。
+5. 你需要为每个镜头生成中文名字，名字要短、能作为文件名，必须包含镜头顺序含义，但不要包含文件扩展名。
+6. 每个镜头提示词都要适合直接传给 image_generation 工具；从第 2 镜头开始，提示词必须明确“以上一镜头画面为参考继续编辑”。
+7. 最多输出 {shot_limit} 个镜头；如果用户没有指定数量，优先 3-5 个镜头。
+
+{image_note}
+
+请只输出 JSON，不要 Markdown，不要代码块。格式：
+{{
+  "reply": "给用户看的中文回复，说明是否还需要补充，或说明将按哪些镜头生成。",
+  "should_generate": true 或 false,
+  "character_summary": "人物外观、服装、身份、关键不变量的中文概述；不足则为空",
+  "scene_summary": "场景、时代、光线、色彩、镜头风格的中文概述；不足则为空",
+  "shots": [
+    {{
+      "order": 1,
+      "name": "01-中文镜头名",
+      "prompt": "这一镜头的完整中文生图提示词，包含人物/场景/构图/动作/连续性/禁止变化项",
+      "continuity": "这一镜头与上一镜头的衔接关系；第一镜头说明开场状态"
+    }}
+  ],
+  "reason": "简短说明判断依据"
+}}
+
+对话上下文和当前用户输入：
+{context}
+""".strip()
+
+
+def parse_storyboard_plan(text: str, shot_limit: int) -> dict[str, Any]:
+    base = parse_planner_json(text)
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    parsed: dict[str, Any] = {}
+    if start >= 0 and end >= start:
+        try:
+            value = json.loads(raw[start : end + 1])
+            if isinstance(value, dict):
+                parsed = value
+        except json.JSONDecodeError:
+            parsed = {}
+    if not parsed:
+        return {
+            "reply": base["reply"],
+            "should_generate": False,
+            "character_summary": "",
+            "scene_summary": "",
+            "shots": [],
+            "reason": base["reason"] or "storyboard planner returned non-json text",
+        }
+    shots: list[dict[str, Any]] = []
+    raw_shots = parsed.get("shots") if isinstance(parsed.get("shots"), list) else []
+    for index, item in enumerate(raw_shots[: max(1, min(int(shot_limit), 12))], start=1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or f"{index:02d}-镜头{index}").strip()
+        prompt = str(item.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        shots.append(
+            {
+                "order": int(item.get("order") or index),
+                "name": normalize_shot_name(name, index),
+                "prompt": prompt,
+                "continuity": str(item.get("continuity") or "").strip(),
+                "status": "pending",
+            }
+        )
+    should_generate = bool(parsed.get("should_generate")) and bool(shots)
+    return {
+        "reply": str(parsed.get("reply") or "").strip() or ("我会按分镜顺序生成连续画面。" if should_generate else base["reply"]),
+        "should_generate": should_generate,
+        "character_summary": str(parsed.get("character_summary") or "").strip(),
+        "scene_summary": str(parsed.get("scene_summary") or "").strip(),
+        "shots": shots,
+        "reason": str(parsed.get("reason") or "").strip(),
+    }
+
+
+def normalize_shot_name(name: str, order: int) -> str:
+    clean = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "-", name.strip()).strip("-")
+    if not clean:
+        clean = f"镜头{order}"
+    if not re.match(r"^\d{2}[-_]", clean):
+        clean = f"{order:02d}-{clean}"
+    return clean[:48]
+
+
+def rename_output_image(item: tuple[Path, str, str], name: str) -> tuple[Path, str, str]:
+    path, _public_url, mime_type = item
+    stem = normalize_shot_name(name, 1)
+    suffix = path.suffix or ".png"
+    target = path.with_name(f"{stem}{suffix}")
+    counter = 2
+    while target.exists() and target != path:
+        target = path.with_name(f"{stem}-{counter}{suffix}")
+        counter += 1
+    if target != path:
+        path.rename(target)
+    public_url = "/media/outputs/" + target.relative_to(OUTPUT_DIR).as_posix()
+    return target, public_url, mime_type
+
+
+def update_storyboard_task_state(task_id: int, payload: dict[str, Any], state: dict[str, Any]) -> None:
+    payload["storyboard"] = state
+    db.update_task(task_id, params_json=db.json_dumps(payload))
 
 
 def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[dict[str, Any]]:
@@ -828,6 +988,21 @@ def handle_image_stream_event(task_id: int, event: dict[str, Any]) -> None:
             db.update_task(task_id, progress=88, stage="上游已返回最终图片")
     elif event_type == "response.completed":
         db.update_task(task_id, progress=92, stage="上游响应完成，正在保存图片")
+
+
+def handle_storyboard_stream_event(task_id: int, shot_index: int, total: int, shot_name: str, event: dict[str, Any]) -> None:
+    event_type = str(event.get("type") or "")
+    prefix = f"镜头 {shot_index}/{total}：{shot_name}"
+    if event_type.endswith(".in_progress") or event_type == "response.in_progress":
+        db.update_task(task_id, stage=f"{prefix} 上游已开始处理")
+    elif event_type == "response.image_generation_call.partial_image":
+        db.update_task(task_id, stage=f"{prefix} 上游返回局部预览")
+    elif event_type == "response.output_item.done":
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if item.get("type") == "image_generation_call":
+            db.update_task(task_id, stage=f"{prefix} 上游已返回最终图片")
+    elif event_type == "response.completed":
+        db.update_task(task_id, stage=f"{prefix} 上游响应完成，正在保存图片")
 
 
 def responses_payload_for_planner(
@@ -1414,6 +1589,12 @@ def list_conversations() -> dict[str, Any]:
                 (select count(*) from messages m where m.conversation_id = c.id) as message_count,
                 (select count(*) from images i where i.conversation_id = c.id and i.source = 'api') as image_count,
                 (
+                    select t.mode from tasks t
+                    where t.conversation_id = c.id
+                    order by t.id desc
+                    limit 1
+                ) as latest_task_mode,
+                (
                     select t.status from tasks t
                     where t.conversation_id = c.id
                     order by t.id desc
@@ -1587,6 +1768,352 @@ def update_message(message_id: int, request: MessageUpdate) -> dict[str, Any]:
         )
         updated = conn.execute("select * from messages where id = ?", (message_id,)).fetchone()
     return db.row_to_dict(updated)
+
+
+@app.post("/api/storyboards/{conversation_id}/messages")
+async def storyboard_message(
+    conversation_id: int,
+    params_json: str = Form(...),
+    images: list[UploadFile] | None = File(default=None),
+) -> dict[str, Any]:
+    ensure_task_slot()
+    params = StoryboardRequest(**normalize_text_fields(parse_params(params_json)))
+    if len(images or []) > 3:
+        raise HTTPException(status_code=400, detail="分镜模式最多上传 3 张参考图")
+    uploaded = [await save_upload(upload) for upload in images or []]
+    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)))
+    selected_reference_uploads = [
+        (Path(item["file_path"]), item.get("mime_type") or "image/png")
+        for item in selected_reference_images
+    ]
+    db.add_prompt(params.prompt, source="auto", mode="storyboard")
+
+    with db.connect() as conn:
+        conversation = conn.execute(
+            "select * from conversations where id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if not conversation:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        previous_response_id = conversation["previous_response_id"]
+        conversation_title = conversation["title"]
+        context_limit = max(0, min(int(params.context_limit), 50))
+        recent_messages = [
+            db.row_to_dict(row)
+            for row in conn.execute(
+                """
+                select id, role, content, created_at
+                from messages
+                where conversation_id = ?
+                order by id desc
+                limit ?
+                """,
+                (conversation_id, context_limit),
+            ).fetchall()
+        ]
+        recent_messages = list(reversed(recent_messages))
+        cursor = conn.execute(
+            """
+            insert into messages (conversation_id, role, content, meta_json, created_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                "user",
+                params.prompt,
+                db.json_dumps(
+                    {
+                        "uploads": [str(path) for path, _ in uploaded],
+                        "reference_image_ids": [item["id"] for item in selected_reference_images],
+                        "context_limit": context_limit,
+                        "mode": "storyboard",
+                    }
+                ),
+                db.now_iso(),
+            ),
+        )
+        user_message_id = int(cursor.lastrowid)
+        conn.execute(
+            "update conversations set context_limit = ?, updated_at = ? where id = ?",
+            (context_limit, db.now_iso(), conversation_id),
+        )
+
+    task_params = compact_params(
+        {
+            "endpoint": "/v1/responses",
+            "tool": "image_generation",
+            "model": params.model,
+            "image_model": params.image_model,
+            "prompt": params.prompt,
+            "size": params.size,
+            "quality": params.quality,
+            "background": params.background,
+            "output_format": params.output_format,
+            "output_compression": params.output_compression,
+            "moderation": params.moderation,
+            "input_fidelity": params.input_fidelity,
+            "partial_images": params.partial_images,
+            "context_limit": context_limit,
+            "shot_limit": params.shot_limit,
+            "reference_image_ids": [item["id"] for item in selected_reference_images],
+        }
+    )
+    task_id = db.create_task(
+        "storyboard",
+        params.prompt,
+        task_params,
+        conversation_id=conversation_id,
+        user_message_id=user_message_id,
+    )
+    for item in uploaded:
+        public_input_image(item, source="input", title=params.prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
+    for item in selected_reference_uploads:
+        public_input_image(item, source="input_reference", title=params.prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
+    schedule_task(
+        task_id,
+        run_storyboard_task(
+            task_id,
+            conversation_id,
+            user_message_id,
+            params,
+            uploaded,
+            selected_reference_images,
+            previous_response_id,
+            conversation_title,
+            recent_messages,
+            context_limit,
+            task_params,
+        ),
+    )
+    return {"task": db.get_task(task_id), "user_message_id": user_message_id}
+
+
+async def run_storyboard_task(
+    task_id: int,
+    conversation_id: int,
+    user_message_id: int,
+    params: StoryboardRequest,
+    uploaded: list[tuple[Path, str]],
+    selected_reference_images: list[dict[str, Any]],
+    previous_response_id: str | None,
+    conversation_title: str,
+    recent_messages: list[dict[str, Any]],
+    context_limit: int,
+    task_payload: dict[str, Any],
+) -> None:
+    async def worker() -> None:
+        db.update_task(task_id, progress=12, stage="AI 正在规划连续分镜")
+        image_candidates = [
+            *build_uploaded_image_candidates(uploaded),
+            *build_selected_image_candidates(selected_reference_images),
+        ]
+        planner_reference_images = [
+            (item["path"], item.get("mime_type") or "image/png")
+            for item in image_candidates
+        ]
+        planner_prompt = build_storyboard_planner_prompt(
+            recent_messages,
+            params.prompt,
+            bool(image_candidates),
+            params.shot_limit,
+        )
+        planner_response = await call_chat_planner(
+            model=params.model,
+            prompt=planner_prompt,
+            config=params.config,
+            uploaded=planner_reference_images,
+            previous_response_id=previous_response_id,
+        )
+        planner_text = extract_text_from_responses(planner_response)
+        plan = parse_storyboard_plan(planner_text, params.shot_limit)
+        planner_response_id = planner_response.get("id")
+        storyboard_state = {
+            "character_summary": plan.get("character_summary", ""),
+            "scene_summary": plan.get("scene_summary", ""),
+            "shots": plan.get("shots", []),
+        }
+        update_storyboard_task_state(task_id, task_payload, storyboard_state)
+        db.update_task(
+            task_id,
+            progress=24,
+            stage="AI 已规划镜头，准备逐张生成" if plan["should_generate"] else "AI 已判断需要继续完善分镜",
+        )
+
+        raw_for_meta: dict[str, Any] = {
+            "endpoint": "/v1/responses",
+            "mode": "storyboard",
+            "planner": sanitize_response(planner_response),
+            "plan": plan,
+            "context_limit": context_limit,
+            "image_candidates": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"path"}
+                }
+                for item in image_candidates
+            ],
+        }
+
+        with db.connect() as conn:
+            cursor = conn.execute(
+                """
+                insert into messages (conversation_id, role, content, response_id, meta_json, created_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    "assistant",
+                    plan["reply"] or "我理解了。",
+                    planner_response_id,
+                    db.json_dumps(raw_for_meta),
+                    db.now_iso(),
+                ),
+            )
+            assistant_message_id = int(cursor.lastrowid)
+            conn.execute(
+                "update conversations set previous_response_id = ?, updated_at = ? where id = ?",
+                (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
+            )
+
+        db.update_task(task_id, assistant_message_id=assistant_message_id)
+
+        if not plan["should_generate"]:
+            db.finish_task(
+                task_id,
+                {
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id,
+                    "text": plan["reply"],
+                    "images": [],
+                    "fallback": False,
+                    "raw": raw_for_meta,
+                },
+            )
+            return
+
+        shots = plan["shots"]
+        seed_inputs = [
+            (item["path"], item.get("mime_type") or "image/png")
+            for item in image_candidates
+        ]
+        total = len(shots)
+        bucket = task_image_folder(task_id, f"分镜-{conversation_title}")
+        output_format = params.output_format
+        previous_image: tuple[Path, str] | None = None
+        saved_images: list[dict[str, Any]] = []
+        shot_results: list[dict[str, Any]] = []
+
+        for index, shot in enumerate(shots, start=1):
+            shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
+            shot["name"] = shot_name
+            shot["status"] = "running"
+            update_storyboard_task_state(task_id, task_payload, storyboard_state)
+            progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
+            db.update_task(task_id, progress=progress, stage=f"正在生成镜头 {index}/{total}：{shot_name}")
+            continuity_prompt = "\n".join(
+                part
+                for part in [
+                    f"人物一致性概述：{plan.get('character_summary')}",
+                    f"场景一致性概述：{plan.get('scene_summary')}",
+                    f"镜头顺序：第 {index}/{total} 镜头，文件名/标题：{shot_name}",
+                    f"连续性要求：{shot.get('continuity')}",
+                    "必须保持人物身份、服装、发型、道具、空间方位、光线方向和画面质感连续。",
+                    "每次只输出这一镜头的一张首帧画面，不要拼图，不要多格漫画。",
+                    str(shot.get("prompt") or ""),
+                ]
+                if str(part or "").strip()
+            )
+            edit_inputs = [previous_image] if previous_image else seed_inputs
+            action = "edit" if edit_inputs else "generate"
+            try:
+                response = await call_responses_image_generation(
+                    model=params.model,
+                    prompt=continuity_prompt,
+                    image_model=params.image_model,
+                    size=params.size,
+                    quality=params.quality,
+                    output_format=output_format,
+                    background=params.background,
+                    output_compression=params.output_compression,
+                    moderation=params.moderation,
+                    action=action,
+                    partial_images=params.partial_images,
+                    config=params.config,
+                    uploaded=edit_inputs,
+                    input_fidelity=params.input_fidelity,
+                    previous_response_id=None,
+                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                    on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
+                )
+                image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                if not image_items:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                            "endpoint": "responses",
+                            "upstream": sanitize_response(response),
+                            "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                        },
+                    )
+                renamed = rename_output_image(image_items[0], shot_name)
+                image_record = public_task_image(
+                    renamed,
+                    conversation_id=conversation_id,
+                    message_id=assistant_message_id,
+                    task_id=task_id,
+                    title=shot_name,
+                    bucket=bucket,
+                )
+                saved_images.append(image_record)
+                previous_image = (renamed[0], renamed[2])
+                shot["status"] = "done"
+                shot["image_id"] = image_record["id"]
+                shot["url"] = image_record["url"]
+                shot["prompt"] = continuity_prompt
+                shot_results.append(
+                    {
+                        "shot": shot,
+                        "action": action,
+                        "response": sanitize_response(response),
+                        "image": image_record,
+                    }
+                )
+                db.add_prompt(continuity_prompt, source="auto", mode="storyboard")
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                db.update_task(
+                    task_id,
+                    progress=min(32 + int(index / max(total, 1) * 60), 92),
+                    stage=f"已保存镜头 {index}/{total}：{shot_name}",
+                )
+            except HTTPException as exc:
+                shot["status"] = "failed"
+                shot["error"] = exc.detail
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                raw_for_meta["image_status"] = "failed"
+                raw_for_meta["image_error"] = exc.detail
+                update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+        raw_for_meta["image_status"] = "done"
+        raw_for_meta["storyboard"] = storyboard_state
+        raw_for_meta["shot_results"] = shot_results
+        update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+        db.update_task(task_id, progress=96, stage="正在整理分镜结果")
+        db.finish_task(
+            task_id,
+            {
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "text": plan["reply"],
+                "images": saved_images,
+                "fallback": False,
+                "raw": raw_for_meta,
+            },
+        )
+
+    await run_with_slot(task_id, worker)
 
 
 @app.get("/api/gallery")

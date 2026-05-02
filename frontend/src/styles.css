@@ -147,7 +147,7 @@ p {
 
 .modeSwitch {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 8px;
   margin-bottom: 18px;
 }
@@ -907,6 +907,89 @@ textarea {
 
 .taskBubble small {
   color: rgba(245, 243, 234, 0.58);
+}
+
+.storyboardProgress {
+  border: 1px solid rgba(238, 203, 112, 0.22);
+  background: linear-gradient(135deg, rgba(238, 203, 112, 0.08), rgba(45, 146, 127, 0.07));
+  border-radius: 10px;
+  padding: 14px;
+  margin-top: 14px;
+}
+
+.storyboardBrief {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.storyboardBrief p {
+  margin: 0;
+  color: rgba(245, 243, 234, 0.82);
+  line-height: 1.6;
+}
+
+.storyboardBrief b {
+  color: #eecb70;
+  margin-right: 8px;
+}
+
+.shotTimeline {
+  display: grid;
+  gap: 8px;
+}
+
+.shotStep {
+  display: grid;
+  grid-template-columns: 38px 1fr;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(245, 243, 234, 0.12);
+  border-radius: 8px;
+  background: rgba(17, 19, 15, 0.34);
+}
+
+.shotStep > span {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(245, 243, 234, 0.08);
+  color: #eecb70;
+  font-weight: 800;
+}
+
+.shotStep.done > span {
+  background: #2d927f;
+  color: #f5f3ea;
+}
+
+.shotStep.running > span {
+  background: #eecb70;
+  color: #11130f;
+  box-shadow: 0 0 0 5px rgba(238, 203, 112, 0.12);
+}
+
+.shotStep.failed > span {
+  background: #d64c39;
+  color: white;
+}
+
+.shotStep strong,
+.shotStep small {
+  display: block;
+}
+
+.shotStep small {
+  color: rgba(245, 243, 234, 0.58);
+  margin-top: 2px;
+}
+
+.shotStep p {
+  color: rgba(245, 243, 234, 0.72);
+  margin: 6px 0 0;
+  line-height: 1.55;
 }
 
 .resultGroup {

@@ -6,6 +6,7 @@ import {
   Brush,
   Check,
   ChevronDown,
+  Clapperboard,
   Clock3,
   Copy,
   Download,
@@ -111,6 +112,7 @@ const defaults = {
   input_fidelity: "auto",
   partial_images: 0,
   context_limit: 10,
+  shot_limit: 6,
 };
 
 function persistableForm(form) {
@@ -135,6 +137,10 @@ function normalizeFormSettings(settings) {
   if (!qualityOptions.some((option) => option.value === next.quality)) {
     next.quality = defaults.quality;
   }
+  const shotLimit = Number(next.shot_limit);
+  if (!Number.isFinite(shotLimit) || shotLimit < 1 || shotLimit > 12) {
+    next.shot_limit = defaults.shot_limit;
+  }
   return next;
 }
 
@@ -143,7 +149,7 @@ function optionLabel(options, value) {
 }
 
 function modeLabel(mode) {
-  return { chat: "对话", generate: "生图", edit: "编辑" }[mode] || mode;
+  return { chat: "对话", storyboard: "分镜", generate: "生图", edit: "编辑" }[mode] || mode;
 }
 
 function statusLabel(status) {
@@ -161,7 +167,7 @@ function App() {
   const [providers, setProviders] = useState([]);
   const [providerDraft, setProviderDraft] = useState({ name: "", base_url: "", api_key: "" });
   const [editingProviderId, setEditingProviderId] = useState(null);
-  const [modeProviders, setModeProviders] = useState({ chat: "", generate: "", edit: "" });
+  const [modeProviders, setModeProviders] = useState({ chat: "", storyboard: "", generate: "", edit: "" });
   const [form, setForm] = useState(() => ({
     ...defaults,
     prompt: "",
@@ -374,6 +380,8 @@ function App() {
         if (!editImages.length) throw new Error("编辑模式至少上传一张图片");
         rememberStudioSubmission("edit", form.prompt, [...editImages]);
         await runEdit();
+      } else if (form.mode === "storyboard") {
+        await runStoryboard();
       } else {
         await runChat();
       }
@@ -406,7 +414,7 @@ function App() {
   }
 
   function newStudioTask() {
-    if (form.mode === "chat") {
+    if (["chat", "storyboard"].includes(form.mode)) {
       newChat();
       return;
     }
@@ -530,6 +538,53 @@ function App() {
     return result.task;
   }
 
+  async function runStoryboard() {
+    const active = await ensureConversation();
+    const localUser = {
+      id: `u-${Date.now()}`,
+      role: "user",
+      content: form.prompt,
+      previews: [...chatImages].map((file) => URL.createObjectURL(file)),
+      uploaded_images: chatReferenceImages,
+    };
+    setMessages((items) => [...items, localUser]);
+
+    const data = new FormData();
+    const runConfig = configForMode("storyboard");
+    const params = {
+      prompt: form.prompt,
+      model: form.chatModel,
+      image_model: form.imageModel,
+      size: form.size,
+      quality: form.quality,
+      background: form.background,
+      output_format: form.output_format,
+      output_compression: form.output_compression === "" ? null : Number(form.output_compression),
+      moderation: form.moderation,
+      input_fidelity: form.input_fidelity === "auto" ? "high" : form.input_fidelity,
+      partial_images: Number(form.partial_images),
+      context_limit: Number(form.context_limit),
+      shot_limit: Number(form.shot_limit),
+      reference_image_ids: chatReferenceImages.map((image) => image.id),
+      config: runConfig,
+    };
+    data.append("params_json", JSON.stringify(params));
+    [...chatImages].forEach((file) => data.append("images", file));
+    const res = await fetch(`${API}/api/storyboards/${active.id}/messages`, {
+      method: "POST",
+      body: data,
+    });
+    const result = await parse(res);
+    setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
+    mergeTask(result.task);
+    setChatImages([]);
+    setChatReferenceImages([]);
+    await refreshHistory();
+    await refreshTasks();
+    await refreshPrompts();
+    return result.task;
+  }
+
   async function loadAppSettings() {
     try {
       const res = await fetch(`${API}/api/app-settings`);
@@ -546,7 +601,7 @@ function App() {
         setForm({ ...normalizeFormSettings({ ...defaults, ...savedForm }), prompt: "" });
       }
       if (value.modeProviders) {
-        setModeProviders({ chat: "", generate: "", edit: "", ...value.modeProviders });
+        setModeProviders({ chat: "", storyboard: "", generate: "", edit: "", ...value.modeProviders });
       }
     } catch (err) {
       setError(describeError(err));
@@ -610,9 +665,9 @@ function App() {
         if (latestSelected) setSelectedTask(latestSelected);
       }
       const currentConversation = conversationRef.current;
-      const canRefreshCurrentChat = activeViewRef.current === "studio" && formModeRef.current === "chat" && currentConversation;
+      const canRefreshCurrentChat = activeViewRef.current === "studio" && ["chat", "storyboard"].includes(formModeRef.current) && currentConversation;
       const activeConversationTask = canRefreshCurrentChat && items.some(
-        (task) => task.mode === "chat" && task.conversation_id === currentConversation.id && ["queued", "running", "done"].includes(task.status)
+        (task) => ["chat", "storyboard"].includes(task.mode) && task.conversation_id === currentConversation.id && ["queued", "running", "done"].includes(task.status)
       );
       if (completedNow || activeConversationTask) {
         refreshGallery();
@@ -688,6 +743,7 @@ function App() {
         const ids = new Set(items.map((provider) => String(provider.id)));
         setModeProviders((current) => ({
           chat: ids.has(String(current.chat)) ? current.chat : String(items[0].id),
+          storyboard: ids.has(String(current.storyboard)) ? current.storyboard : String(items[0].id),
           generate: ids.has(String(current.generate)) ? current.generate : String(items[0].id),
           edit: ids.has(String(current.edit)) ? current.edit : String(items[0].id),
         }));
@@ -734,6 +790,7 @@ function App() {
       const fallbackId = fallback ? String(fallback.id) : "";
       return {
         chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
+        storyboard: String(current.storyboard) === String(providerId) ? fallbackId : current.storyboard,
         generate: String(current.generate) === String(providerId) ? fallbackId : current.generate,
         edit: String(current.edit) === String(providerId) ? fallbackId : current.edit,
       };
@@ -742,7 +799,7 @@ function App() {
   }
 
   function syncProviderToAll(providerId) {
-    setModeProviders({ chat: providerId, generate: providerId, edit: providerId });
+    setModeProviders({ chat: providerId, storyboard: providerId, generate: providerId, edit: providerId });
   }
 
   async function newChat() {
@@ -870,7 +927,7 @@ function App() {
   async function loadConversation(id, { openStudio = true, autoRefresh = false } = {}) {
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
-      if (activeViewRef.current !== "studio" || formModeRef.current !== "chat" || currentConversation?.id !== id) {
+      if (activeViewRef.current !== "studio" || !["chat", "storyboard"].includes(formModeRef.current) || currentConversation?.id !== id) {
         return;
       }
     }
@@ -880,7 +937,7 @@ function App() {
     if (loadSeq !== conversationLoadSeqRef.current) return;
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
-      if (activeViewRef.current !== "studio" || formModeRef.current !== "chat" || currentConversation?.id !== id) {
+      if (activeViewRef.current !== "studio" || !["chat", "storyboard"].includes(formModeRef.current) || currentConversation?.id !== id) {
         return;
       }
     }
@@ -923,7 +980,8 @@ function App() {
     if (openStudio) {
       setConversation(data.conversation);
       setMessages(hydrated);
-      setForm((value) => ({ ...value, mode: "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
+      const hasStoryboardTask = (data.tasks || []).some((task) => task.mode === "storyboard");
+      setForm((value) => ({ ...value, mode: hasStoryboardTask ? "storyboard" : "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
       setActiveView("studio");
     }
   }
@@ -1005,6 +1063,7 @@ function App() {
   const modeMeta = useMemo(() => {
     if (form.mode === "generate") return { icon: Wand2, title: "普通生图" };
     if (form.mode === "edit") return { icon: Eraser, title: "图片编辑" };
+    if (form.mode === "storyboard") return { icon: Clapperboard, title: "分镜连续生图" };
     return { icon: MessageCircle, title: "对话生图" };
   }, [form.mode]);
   const ModeIcon = modeMeta.icon;
@@ -1030,6 +1089,7 @@ function App() {
           <div className="modeSwitch">
             {[
               ["chat", MessageCircle, "对话"],
+              ["storyboard", Clapperboard, "分镜"],
               ["generate", Wand2, "生成"],
               ["edit", Brush, "编辑"],
             ].map(([value, Icon, label]) => (
@@ -1054,6 +1114,12 @@ function App() {
               label="对话模式"
               value={modeProviders.chat}
               onChange={(v) => setModeProviders({ ...modeProviders, chat: v })}
+              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+            />
+            <Select
+              label="分镜模式"
+              value={modeProviders.storyboard}
+              onChange={(v) => setModeProviders({ ...modeProviders, storyboard: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
@@ -1115,11 +1181,11 @@ function App() {
 
           <SettingsGroup
             title="模型设置"
-            summary={form.mode === "chat" ? `${form.chatModel} / ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
+            summary={["chat", "storyboard"].includes(form.mode) ? `${form.chatModel} / ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
             open={!!openGroups.models}
             onToggle={() => toggleGroup("models")}
           >
-            {form.mode === "chat" ? (
+            {["chat", "storyboard"].includes(form.mode) ? (
               <>
                 <Select label="对话模型" value={form.chatModel} onChange={(v) => setForm({ ...form, chatModel: v })} options={chatModelOptions} />
                 <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
@@ -1142,7 +1208,7 @@ function App() {
             <Select label="分辨率" value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={qualityOptions} />
             <Select label="背景" value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={backgroundOptions} />
             <Select label="格式" value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={formatOptions} />
-            {form.mode !== "chat" && (
+            {!["chat", "storyboard"].includes(form.mode) && (
               <Field label="数量">
                 <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
               </Field>
@@ -1151,7 +1217,7 @@ function App() {
 
           <SettingsGroup
             title="高级选项"
-            summary={form.mode === "chat" ? `${optionLabel(actionOptions, form.action)} / ${optionLabel(fidelityOptions, form.input_fidelity)}` : optionLabel(moderationOptions, form.moderation)}
+            summary={["chat", "storyboard"].includes(form.mode) ? `${form.mode === "storyboard" ? `${form.shot_limit} 镜头 / ` : `${optionLabel(actionOptions, form.action)} / `}${optionLabel(fidelityOptions, form.input_fidelity)}` : optionLabel(moderationOptions, form.moderation)}
             open={!!openGroups.advanced}
             onToggle={() => toggleGroup("advanced")}
           >
@@ -1162,6 +1228,21 @@ function App() {
                 <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
                 <Field label="上下文条数">
                   <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
+                </Field>
+                <Field label="压缩 0-100">
+                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
+                </Field>
+                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+              </>
+            ) : form.mode === "storyboard" ? (
+              <>
+                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
+                <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+                <Field label="上下文条数">
+                  <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
+                </Field>
+                <Field label="最多镜头">
+                  <input type="number" min="1" max="12" value={form.shot_limit} onChange={(e) => setForm({ ...form, shot_limit: e.target.value })} />
                 </Field>
                 <Field label="压缩 0-100">
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
@@ -1206,7 +1287,7 @@ function App() {
           <div className="stageHead">
             <div>
               <p><ModeIcon size={18} /> {modeMeta.title}</p>
-              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
+              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "storyboard" ? "按镜头顺序生成连续首帧" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
             </div>
             {(activeView === "studio" || runningTasks.length > 0) && (
               <div className="headActions">
@@ -1219,8 +1300,8 @@ function App() {
                     onCancelTask={cancelTask}
                   />
                 )}
-                {activeView === "studio" && form.mode === "chat" && <button className="ghostButton" onClick={newChat}><Plus size={17} /> 新对话</button>}
-                {activeView === "studio" && form.mode !== "chat" && <button className="ghostButton" onClick={newStudioTask}>
+                {activeView === "studio" && ["chat", "storyboard"].includes(form.mode) && <button className="ghostButton" onClick={newChat}><Plus size={17} /> {form.mode === "storyboard" ? "新分镜" : "新对话"}</button>}
+                {activeView === "studio" && !["chat", "storyboard"].includes(form.mode) && <button className="ghostButton" onClick={newStudioTask}>
                   <Plus size={17} /> 新任务
                 </button>}
               </div>
@@ -1280,13 +1361,13 @@ function App() {
               refreshState={refreshFeedback.prompts}
               onRefresh={() => runRefresh("prompts", () => refreshPrompts({ throwError: true }))}
             />
-          ) : form.mode === "chat" ? (
+          ) : ["chat", "storyboard"].includes(form.mode) ? (
             <div className="chatPane" ref={scrollRef}>
               {messages.length === 0 && (
                 <div className="emptyState">
-                  <Bot size={34} />
-                  <h3>把想法直接说出来</h3>
-                  <p>可以先生成，再上传上一张图继续改，动作选择 auto 时会自动判断。</p>
+                  {form.mode === "storyboard" ? <Clapperboard size={34} /> : <Bot size={34} />}
+                  <h3>{form.mode === "storyboard" ? "描述一段视频想法" : "把想法直接说出来"}</h3>
+                  <p>{form.mode === "storyboard" ? "AI 会先和你完善人物、场景与镜头，再按顺序用上一镜头画面继续 edit 生成下一张首帧。" : "可以先生成，再上传上一张图继续改，动作选择 auto 时会自动判断。"}</p>
                 </div>
               )}
               {messages.map((msg) => (
@@ -1324,7 +1405,7 @@ function App() {
                 onRemove={() => setEditMask(null)}
               />
             )}
-            {form.mode === "chat" && (
+            {["chat", "storyboard"].includes(form.mode) && (
               <>
                 <ChatReferencePicker
                   images={chatGeneratedImages}
@@ -1333,7 +1414,7 @@ function App() {
                   onRemove={removeChatReferenceImage}
                 />
                 <UploadRow
-                  label="上传参考"
+                  label={form.mode === "storyboard" ? "上传角色/场景参考" : "上传参考"}
                   files={chatImages}
                   onChange={updateChatUploads}
                   onRemove={(index) => setChatImages((items) => items.filter((_, i) => i !== index))}
@@ -1347,7 +1428,7 @@ function App() {
                 value={form.prompt}
                 onChange={(e) => setForm({ ...form, prompt: e.target.value })}
                 onKeyDown={handlePromptKeyDown}
-                placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : "描述你想生成的画面..."}
+                placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : form.mode === "storyboard" ? "描述视频主题、人物、场景、镜头数量；也可以继续和 AI 讨论完善..." : "描述你想生成的画面..."}
               />
               <button className="sendButton" type="submit" disabled={submitDisabled}>
                 {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
@@ -1575,7 +1656,7 @@ function buildHistoryRecords(conversations, tasks) {
     key: `conversation-${item.id}`,
     kind: "conversation",
     id: item.id,
-    mode: "chat",
+    mode: item.latest_task_mode || "chat",
     title: item.title || "未命名对话",
     status: item.latest_task_status,
     progress: item.latest_task_progress,
@@ -1738,7 +1819,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDele
           {isLive && <button className="ghostButton danger" type="button" onClick={() => onCancel(task.id)}><X size={16} /> 停止</button>}
           {task.conversation_id && (
             <button className="secondaryButton compact" type="button" onClick={() => onContinue(task.conversation_id)}>
-              <MessageCircle size={16} /> 继续对话
+              <MessageCircle size={16} /> {task.mode === "storyboard" ? "继续分镜" : "继续对话"}
             </button>
           )}
           <button className="ghostButton danger" type="button" onClick={() => onDelete(task.id)}>
@@ -1754,6 +1835,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDele
         <span>更新：{formatTime(task.updated_at)}</span>
         <span>模式：{modeLabel(task.mode)}</span>
       </div>
+      {task.mode === "storyboard" && <StoryboardProgress task={task} />}
       {task.error_detail && (
         <section className="taskErrorBox">
           <div className="sectionTitle">
@@ -1790,6 +1872,39 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDele
         <div className="emptyMini detailEmpty">这个任务还没有可查看的图片。</div>
       )}
     </div>
+  );
+}
+
+function StoryboardProgress({ task }) {
+  const storyboard = task.params?.storyboard || task.response?.raw?.storyboard || task.response?.raw?.plan || {};
+  const shots = Array.isArray(storyboard.shots) ? storyboard.shots : [];
+  if (!storyboard.character_summary && !storyboard.scene_summary && shots.length === 0) return null;
+  const doneCount = shots.filter((shot) => shot.status === "done").length;
+  return (
+    <section className="storyboardProgress">
+      <div className="sectionTitle">
+        <strong>分镜连续性</strong>
+        <small>{doneCount}/{shots.length || 0} 张</small>
+      </div>
+      <div className="storyboardBrief">
+        <p><b>人物概述</b>{storyboard.character_summary || "AI 正在整理人物一致性信息"}</p>
+        <p><b>场景概述</b>{storyboard.scene_summary || "AI 正在整理场景一致性信息"}</p>
+      </div>
+      {shots.length > 0 && (
+        <div className="shotTimeline">
+          {shots.map((shot, index) => (
+            <article className={`shotStep ${shot.status || "pending"}`} key={`${shot.name}-${index}`}>
+              <span>{String(shot.order || index + 1).padStart(2, "0")}</span>
+              <div>
+                <strong>{shot.name || `镜头${index + 1}`}</strong>
+                <small>{shot.status === "done" ? "已完成" : shot.status === "running" ? "生成中" : shot.status === "failed" ? "失败" : "等待中"}</small>
+                {shot.continuity && <p>{shot.continuity}</p>}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1832,6 +1947,7 @@ function PromptLibrary({
           options={[
             { value: "", label: "通用" },
             { value: "chat", label: "对话" },
+            { value: "storyboard", label: "分镜" },
             { value: "generate", label: "生成" },
             { value: "edit", label: "编辑" },
           ]}
@@ -1856,6 +1972,7 @@ function PromptLibrary({
         <select value={filter.mode} onChange={(event) => onFilter({ ...filter, mode: event.target.value })}>
           <option value="">全部模式</option>
           <option value="chat">对话</option>
+          <option value="storyboard">分镜</option>
           <option value="generate">生成</option>
           <option value="edit">编辑</option>
         </select>
