@@ -546,7 +546,6 @@ function App() {
     setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
     mergeTask(result.task);
     setChatImages([]);
-    setChatReferenceImages([]);
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
@@ -595,7 +594,6 @@ function App() {
     setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
     mergeTask(result.task);
     setChatImages([]);
-    setChatReferenceImages([]);
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
