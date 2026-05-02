@@ -713,6 +713,7 @@ function App() {
   function mergeTask(task) {
     if (!task) return;
     setTasks((items) => [task, ...items.filter((item) => item.id !== task.id)]);
+    setSelectedTask((current) => (current && Number(current.id) === Number(task.id) ? { ...current, ...task } : current));
   }
 
   function closeTaskEventStream(taskId) {
@@ -755,6 +756,15 @@ function App() {
     )));
   }
 
+  function appendStreamingMessageImage(messageId, image, conversationId) {
+    if (!image || Number(conversationRef.current?.id) !== Number(conversationId)) return;
+    const normalizedImage = normalizeImageForClient(image);
+    setMessages((items) => items.map((item) => {
+      if (Number(item.id) !== Number(messageId)) return item;
+      return { ...item, images: uniqueImages([...(item.images || []), normalizedImage]) };
+    }));
+  }
+
   function startTaskEventStream(taskId, conversationId) {
     if (!taskId || typeof EventSource === "undefined") return;
     closeTaskEventStream(taskId);
@@ -772,6 +782,10 @@ function App() {
     source.addEventListener("task_update", (event) => {
       const data = parseEventData(event);
       if (data.task) mergeTask(data.task);
+    });
+    source.addEventListener("storyboard_image", (event) => {
+      const data = parseEventData(event);
+      appendStreamingMessageImage(data.message_id, data.image, data.conversation_id);
     });
     for (const eventName of ["done", "failed", "canceled"]) {
       source.addEventListener(eventName, async () => {

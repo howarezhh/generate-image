@@ -176,6 +176,11 @@ def public_task_image(
     return {
         "id": image_id,
         "url": public_url,
+        "public_url": public_url,
+        "source": "api",
+        "task_id": task_id,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
         "mime_type": mime_type,
         "filename": file_path.name,
         "title": title,
@@ -382,9 +387,12 @@ def publish_task_event(task_id: int, event: str, data: dict[str, Any], *, snapsh
 
 
 def publish_task_snapshot(task_id: int) -> None:
-    task = db.get_task(task_id)
+    try:
+        task = task_with_images(task_id)
+    except HTTPException:
+        task = None
     if task:
-        publish_task_event(task_id, "task_update", {"task": summarize_task_like(task)}, snapshot=True)
+        publish_task_event(task_id, "task_update", {"task": task}, snapshot=True)
 
 
 def summarize_task_like(task: dict[str, Any]) -> dict[str, Any]:
@@ -768,6 +776,33 @@ def rename_output_image(item: tuple[Path, str, str], name: str) -> tuple[Path, s
 def update_storyboard_task_state(task_id: int, payload: dict[str, Any], state: dict[str, Any]) -> None:
     payload["storyboard"] = state
     db.update_task(task_id, params_json=db.json_dumps(payload))
+
+
+def publish_storyboard_image_saved(
+    task_id: int,
+    *,
+    conversation_id: int | None,
+    message_id: int | None,
+    image: dict[str, Any],
+    shot: dict[str, Any],
+    index: int,
+    total: int,
+) -> None:
+    publish_task_snapshot(task_id)
+    publish_task_event(
+        task_id,
+        "storyboard_image",
+        {
+            "task_id": task_id,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "image": image,
+            "shot": shot,
+            "index": index,
+            "total": total,
+        },
+        snapshot=False,
+    )
 
 
 def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[dict[str, Any]]:
@@ -2391,6 +2426,7 @@ async def run_storyboard_task(
                 shot["image_id"] = image_record["id"]
                 shot["url"] = image_record["url"]
                 shot["prompt"] = continuity_prompt
+                image_record["prompt_text"] = continuity_prompt
                 shot_results.append(
                     {
                         "shot": shot,
@@ -2405,6 +2441,15 @@ async def run_storyboard_task(
                     task_id,
                     progress=min(32 + int(index / max(total, 1) * 60), 92),
                     stage=f"已保存镜头 {index}/{total}：{shot_name}",
+                )
+                publish_storyboard_image_saved(
+                    task_id,
+                    conversation_id=conversation_id,
+                    message_id=assistant_message_id,
+                    image=image_record,
+                    shot=shot,
+                    index=index,
+                    total=total,
                 )
             except HTTPException as exc:
                 shot["status"] = "failed"
@@ -2585,8 +2630,18 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                 shot["status"] = "done"
                 shot["image_id"] = image_record["id"]
                 shot["url"] = image_record["url"]
+                image_record["prompt_text"] = str(shot.get("prompt") or old_task.get("prompt") or "")
                 update_storyboard_task_state(task_id, payload, storyboard)
                 db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已重试保存镜头 {index}/{total}：{shot_name}")
+                publish_storyboard_image_saved(
+                    task_id,
+                    conversation_id=old_task.get("conversation_id"),
+                    message_id=old_task.get("assistant_message_id"),
+                    image=image_record,
+                    shot=shot,
+                    index=index,
+                    total=total,
+                )
             except HTTPException as exc:
                 shot["status"] = "failed"
                 shot["error"] = exc.detail
