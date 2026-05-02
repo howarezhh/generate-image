@@ -32,6 +32,7 @@ import {
 import "./styles.css";
 
 const API = "";
+const APP_SETTINGS_VERSION = 2;
 
 const defaultConfig = {
   base_url: "https://api.asxs.top/v1",
@@ -49,8 +50,10 @@ const imageModelOptions = [
 ];
 
 const sizeOptions = [
-  { value: "1536x1024", label: "电脑横屏 2K 高清" },
-  { value: "1024x1536", label: "手机竖屏 2K 高清" },
+  { value: "2560x1440", label: "电脑横屏 2K 高清" },
+  { value: "1440x2560", label: "手机竖屏 2K 高清" },
+  { value: "1536x1024", label: "横屏 3:2 稳定" },
+  { value: "1024x1536", label: "竖屏 2:3 稳定" },
   { value: "1024x1024", label: "方图 1K 标准" },
   { value: "auto", label: "自动比例" },
 ];
@@ -98,7 +101,7 @@ const defaults = {
   chatModel: "gpt-5.4",
   imageModel: "gpt-image-2",
   action: "auto",
-  size: "1536x1024",
+  size: "2560x1440",
   quality: "high",
   n: 1,
   background: "auto",
@@ -536,7 +539,11 @@ function App() {
         setConfig({ ...defaultConfig, ...value.config });
       }
       if (value.form) {
-        setForm({ ...normalizeFormSettings({ ...defaults, ...value.form }), prompt: "" });
+        const savedForm = { ...value.form };
+        if (!value.settings_version && savedForm.size === "1536x1024") {
+          savedForm.size = defaults.size;
+        }
+        setForm({ ...normalizeFormSettings({ ...defaults, ...savedForm }), prompt: "" });
       }
       if (value.modeProviders) {
         setModeProviders({ chat: "", generate: "", edit: "", ...value.modeProviders });
@@ -564,6 +571,7 @@ function App() {
 
   async function saveAppSettings() {
     const value = {
+      settings_version: APP_SETTINGS_VERSION,
       config,
       form: persistableForm(form),
       modeProviders,

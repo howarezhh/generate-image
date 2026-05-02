@@ -78,8 +78,8 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = "gpt-5.4"
     image_model: str = "gpt-image-2"
-    size: str = "1024x1024"
-    quality: str = "auto"
+    size: str = "2560x1440"
+    quality: str = "high"
     n: int = Field(default=1, ge=1, le=10)
     background: str = "auto"
     output_format: str = "png"
@@ -109,8 +109,8 @@ class ChatRequest(BaseModel):
     model: str = "gpt-5.4"
     image_model: str = "gpt-image-2"
     action: str = "auto"
-    size: str = "1024x1024"
-    quality: str = "auto"
+    size: str = "2560x1440"
+    quality: str = "high"
     background: str = "auto"
     output_format: str = "png"
     output_compression: int | None = Field(default=None, ge=0, le=100)
@@ -1245,8 +1245,8 @@ async def edit_image(
             "model": params.get("model", "gpt-5.4"),
             "image_model": params.get("image_model", "gpt-image-2"),
             "prompt": prompt,
-            "size": params.get("size", "1024x1024"),
-            "quality": params.get("quality", "auto"),
+            "size": params.get("size", "2560x1440"),
+            "quality": params.get("quality", "high"),
             "n": clamp_image_count(params.get("n", 1)),
             "background": params.get("background", "auto"),
             "output_format": params.get("output_format", "png"),
@@ -1291,8 +1291,8 @@ async def run_edit_task(
                 model=str(params.get("model", "gpt-5.4")),
                 prompt=prompt,
                 image_model=str(params.get("image_model", "gpt-image-2")),
-                size=str(params.get("size", "1024x1024")),
-                quality=str(params.get("quality", "auto")),
+                size=str(params.get("size", "2560x1440")),
+                quality=str(params.get("quality", "high")),
                 output_format=output_format,
                 background=params.get("background", "auto"),
                 output_compression=params.get("output_compression"),
