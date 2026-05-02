@@ -125,6 +125,7 @@ async def post_json_stream(
         ):
             result["output"] = output_items
     result["_stream_events"] = summarize_stream_events(events)
+    validate_responses_result(result, endpoint=endpoint, url=url, payload=payload)
     return result
 
 
@@ -212,7 +213,62 @@ def parse_response(
                 "suggestion": suggestion_for_status(response.status_code, endpoint, upstream),
             },
         )
+    validate_responses_result(body, endpoint=endpoint, url=url, payload=payload)
     return body
+
+
+def validate_responses_result(
+    body: Any,
+    *,
+    endpoint: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    if endpoint.strip("/") != "responses" or not isinstance(body, dict):
+        return
+    response_error = body.get("error")
+    status = str(body.get("status") or "")
+    if not response_error and status not in {"failed", "incomplete"}:
+        return
+    message = readable_response_failure_message(body)
+    code = ""
+    if isinstance(response_error, dict):
+        code = str(response_error.get("code") or "")
+    raise HTTPException(
+        status_code=400 if code in {"moderation_blocked", "content_policy_violation"} else 502,
+        detail={
+            "message": message,
+            "status_code": 400 if code in {"moderation_blocked", "content_policy_violation"} else 502,
+            "endpoint": endpoint,
+            "url": url,
+            "upstream": sanitize_response(body),
+            "request": summarize_payload(payload or {}),
+            "suggestion": suggestion_for_response_failure(code, message),
+        },
+    )
+
+
+def readable_response_failure_message(body: dict[str, Any]) -> str:
+    response_error = body.get("error")
+    if isinstance(response_error, dict):
+        code = response_error.get("code")
+        message = response_error.get("message")
+        if code and message:
+            return f"{code}: {message}"
+        if message:
+            return str(message)
+    if body.get("status"):
+        return f"Responses API 返回失败状态：{body.get('status')}"
+    return "Responses API 返回失败状态。"
+
+
+def suggestion_for_response_failure(code: str, message: str) -> str:
+    text = f"{code} {message}".lower()
+    if "moderation" in text or "safety" in text or "sexual" in text:
+        return "上游安全系统拒绝了本次生图请求。请调整提示词，避免露骨性内容、未成年人、强暗示姿势或过度色情化描述；可以改成时尚写真、优雅造型、电影感人像等更安全的表达。"
+    if "model" in text:
+        return "接口可能不支持当前模型或图片工具，请更换 Responses 模型或图片工具模型后重试。"
+    return "上游返回失败状态，请复制完整原因并结合接口地址、模型和提示词排查。"
 
 
 def readable_error_message(upstream: Any, status_code: int) -> str:

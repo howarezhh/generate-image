@@ -312,6 +312,53 @@ def compact_error_detail(detail: Any) -> str:
     return json.dumps(detail, ensure_ascii=False, indent=2) if not isinstance(detail, str) else detail
 
 
+def cancel_running_task(task_id: int) -> None:
+    running = RUNNING_TASKS.get(task_id)
+    if running:
+        running.cancel()
+
+
+def safe_delete_media_files(paths: list[str]) -> None:
+    roots = [UPLOAD_DIR.resolve(), OUTPUT_DIR.resolve()]
+    for raw_path in dict.fromkeys(path for path in paths if path):
+        path = Path(raw_path)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if not any(resolved == root or root in resolved.parents for root in roots):
+            continue
+        try:
+            if resolved.is_file():
+                resolved.unlink()
+        except OSError:
+            pass
+
+
+def deletable_media_paths(rows: list[Any], delete_ids: list[int]) -> list[str]:
+    if not rows:
+        return []
+    ids = [int(value) for value in delete_ids]
+    placeholders = ",".join("?" for _ in ids) if ids else "null"
+    paths: list[str] = []
+    with db.connect() as conn:
+        for row in rows:
+            path = str(row["file_path"])
+            if ids:
+                count = conn.execute(
+                    f"select count(*) as count from images where file_path = ? and id not in ({placeholders})",
+                    [path, *ids],
+                ).fetchone()["count"]
+            else:
+                count = conn.execute(
+                    "select count(*) as count from images where file_path = ?",
+                    (path,),
+                ).fetchone()["count"]
+            if int(count) == 0:
+                paths.append(path)
+    return paths
+
+
 def build_context_prompt(history: list[dict[str, Any]], prompt: str) -> str:
     if not history:
         return prompt
@@ -1276,6 +1323,22 @@ def get_task(task_id: int) -> dict[str, Any]:
     return {"task": task_with_images(task_id)}
 
 
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: int) -> dict[str, Any]:
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    cancel_running_task(task_id)
+    with db.connect() as conn:
+        image_rows = conn.execute("select * from images where task_id = ?", (task_id,)).fetchall()
+        image_ids = [int(row["id"]) for row in image_rows]
+        media_paths = deletable_media_paths(image_rows, image_ids)
+        conn.execute("delete from images where task_id = ?", (task_id,))
+        conn.execute("delete from tasks where id = ?", (task_id,))
+    safe_delete_media_files(media_paths)
+    return {"ok": True}
+
+
 @app.post("/api/tasks/{task_id}/cancel")
 def cancel_task(task_id: int) -> dict[str, Any]:
     task = db.get_task(task_id)
@@ -1369,6 +1432,41 @@ def update_conversation(conversation_id: int, request: ConversationUpdate) -> di
             raise HTTPException(status_code=404, detail="conversation not found")
         row = conn.execute("select * from conversations where id = ?", (conversation_id,)).fetchone()
     return db.row_to_dict(row)
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def delete_conversation(conversation_id: int) -> dict[str, Any]:
+    with db.connect() as conn:
+        conversation = conn.execute("select * from conversations where id = ?", (conversation_id,)).fetchone()
+        if not conversation:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        task_rows = conn.execute("select id from tasks where conversation_id = ?", (conversation_id,)).fetchall()
+        task_ids = [int(row["id"]) for row in task_rows]
+        for task_id in task_ids:
+            cancel_running_task(task_id)
+        image_rows = conn.execute(
+            """
+            select * from images
+            where conversation_id = ?
+               or task_id in (select id from tasks where conversation_id = ?)
+            """,
+            (conversation_id, conversation_id),
+        ).fetchall()
+        image_ids = [int(row["id"]) for row in image_rows]
+        media_paths = deletable_media_paths(image_rows, image_ids)
+        conn.execute(
+            """
+            delete from images
+            where conversation_id = ?
+               or task_id in (select id from tasks where conversation_id = ?)
+            """,
+            (conversation_id, conversation_id),
+        )
+        conn.execute("delete from messages where conversation_id = ?", (conversation_id,))
+        conn.execute("delete from tasks where conversation_id = ?", (conversation_id,))
+        conn.execute("delete from conversations where id = ?", (conversation_id,))
+    safe_delete_media_files(media_paths)
+    return {"ok": True}
 
 
 @app.get("/api/conversations/{conversation_id}")

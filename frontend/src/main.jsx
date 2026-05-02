@@ -593,6 +593,41 @@ function App() {
     await refreshTasks();
   }
 
+  async function deleteTask(taskId) {
+    if (!window.confirm("确认删除这条任务历史吗？这会移除本地数据库记录和该任务关联的图片文件。")) return;
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}`, { method: "DELETE" });
+      await parse(res);
+      setSelectedTask(null);
+      setTasks((items) => items.filter((task) => Number(task.id) !== Number(taskId)));
+      await refreshTasks();
+      await refreshHistory();
+      await refreshGallery();
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function deleteConversation(conversationId) {
+    if (!window.confirm("确认删除这段对话历史吗？这会移除本地数据库记录、消息、任务和关联图片文件。")) return;
+    try {
+      const res = await fetch(`${API}/api/conversations/${conversationId}`, { method: "DELETE" });
+      await parse(res);
+      setSelectedHistory(null);
+      if (conversation?.id === conversationId) {
+        setConversation(null);
+        setMessages([]);
+        setChatImages([]);
+        setChatReferenceImages([]);
+      }
+      await refreshHistory();
+      await refreshTasks();
+      await refreshGallery();
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
   async function saveSettings() {
     const res = await fetch(`${API}/api/settings`, {
       method: "PUT",
@@ -1155,6 +1190,8 @@ function App() {
               onDownload={downloadImage}
               onUseImage={useImageAsReference}
               onCancelTask={cancelTask}
+              onDeleteTask={deleteTask}
+              onDeleteConversation={deleteConversation}
             />
           ) : activeView === "gallery" ? (
             <GalleryHistory items={galleryHistory} onRefresh={refreshGallery} onDownload={downloadImage} onUseImage={useImageAsReference} />
@@ -1326,6 +1363,8 @@ function HistoryPane({
   onDownload,
   onUseImage,
   onCancelTask,
+  onDeleteTask,
+  onDeleteConversation,
 }) {
   const [draftTitle, setDraftTitle] = useState("");
   const [draftLimit, setDraftLimit] = useState(10);
@@ -1379,6 +1418,7 @@ function HistoryPane({
             onDownload={onDownload}
             onUseImage={onUseImage}
             onContinue={onContinue}
+            onDelete={onDeleteTask}
           />
         ) : !selected ? (
           <div className="emptyState">
@@ -1400,6 +1440,9 @@ function HistoryPane({
               </button>
               <button className="ghostButton" type="button" onClick={() => onContinue(selected.conversation.id)}>
                 <MessageCircle size={16} /> 继续对话
+              </button>
+              <button className="ghostButton danger" type="button" onClick={() => onDeleteConversation(selected.conversation.id)}>
+                <Trash2 size={16} /> 删除历史
               </button>
             </div>
             {conversationTasks.length > 0 && (
@@ -1513,7 +1556,7 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
   );
 }
 
-function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
+function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDelete }) {
   const [copyState, setCopyState] = useState("idle");
   const isLive = ["queued", "running"].includes(task.status);
   const images = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
@@ -1546,6 +1589,9 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
               <MessageCircle size={16} /> 继续对话
             </button>
           )}
+          <button className="ghostButton danger" type="button" onClick={() => onDelete(task.id)}>
+            <Trash2 size={16} /> 删除历史
+          </button>
         </div>
       </div>
       <div className="progressTrack large">
@@ -1746,7 +1792,7 @@ function ChatTaskProgress({ task }) {
   );
 }
 
-function ChatReferencePicker({ images, selected, onToggle, onRemove }) {
+function ChatReferencePicker({ images, selected, onToggle }) {
   const selectedIds = new Set((selected || []).map((image) => Number(image.id)));
   return (
     <section className="referencePicker">
@@ -1754,31 +1800,24 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove }) {
         <strong>指定参考图</strong>
         <small>{selected.length}/3，AI 只会使用你指定的图作为 edit 输入</small>
       </div>
-      {selected.length > 0 && (
-        <div className="selectedRefs">
-          {selected.map((image) => (
-            <button key={image.id} type="button" onClick={() => onRemove(image.id)}>
-              <img src={image.public_url || image.url} alt="" />
-              <span>移除</span>
-              <X size={13} />
-            </button>
-          ))}
-        </div>
-      )}
       {images.length > 0 ? (
         <div className="referenceStrip">
-          {images.map((image) => (
-            <button
-              key={image.id}
-              type="button"
-              className={selectedIds.has(Number(image.id)) ? "active" : ""}
-              onClick={() => onToggle(image)}
-              title="选择为本轮参考图"
-            >
-              <img src={image.public_url || image.url} alt="" />
-              <span>{selectedIds.has(Number(image.id)) ? "已选" : "选择"}</span>
-            </button>
-          ))}
+          {images.map((image) => {
+            const isSelected = selectedIds.has(Number(image.id));
+            return (
+              <button
+                key={image.id}
+                type="button"
+                className={isSelected ? "active" : ""}
+                onClick={() => onToggle(image)}
+                title={isSelected ? "取消选择" : "选择为本轮参考图"}
+              >
+                <img src={image.public_url || image.url} alt="" />
+                <span>{isSelected ? "已选" : "选择"}</span>
+                {isSelected && <em>取消</em>}
+              </button>
+            );
+          })}
         </div>
       ) : (
         <small className="uploadEmpty">当前对话暂无可选历史图，也可以直接上传参考图。</small>
