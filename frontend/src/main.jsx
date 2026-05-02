@@ -33,7 +33,7 @@ import {
 import "./styles.css";
 
 const API = "";
-const APP_SETTINGS_VERSION = 2;
+const APP_SETTINGS_VERSION = 3;
 
 const defaultConfig = {
   base_url: "https://api.asxs.top/v1",
@@ -122,7 +122,7 @@ function persistableForm(form) {
 
 function normalizeFormSettings(settings) {
   const next = { ...settings };
-  if (!chatModelOptions.some((option) => option.value === next.chatModel)) {
+  if (!String(next.chatModel || "").trim()) {
     next.chatModel = defaults.chatModel;
   }
   if (!imageModelOptions.some((option) => option.value === next.imageModel)) {
@@ -168,6 +168,7 @@ function App() {
   const [providerDraft, setProviderDraft] = useState({ name: "", base_url: "", api_key: "" });
   const [editingProviderId, setEditingProviderId] = useState(null);
   const [modeProviders, setModeProviders] = useState({ chat: "", storyboard: "", generate: "", edit: "" });
+  const [plannerProviders, setPlannerProviders] = useState({ chat: "", storyboard: "" });
   const [form, setForm] = useState(() => ({
     ...defaults,
     prompt: "",
@@ -230,7 +231,7 @@ function App() {
     return () => {
       if (dbSettingsTimerRef.current) clearTimeout(dbSettingsTimerRef.current);
     };
-  }, [config, form, modeProviders]);
+  }, [config, form, modeProviders, plannerProviders]);
 
   useEffect(() => {
     refreshHistory();
@@ -263,6 +264,7 @@ function App() {
   const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
   const submitDisabled = loading || !form.prompt.trim() || atTaskLimit;
   const activeProvider = providerForMode(form.mode);
+  const activePlannerProvider = ["chat", "storyboard"].includes(form.mode) ? providerForPlannerMode(form.mode) : null;
   const chatGeneratedImages = useMemo(() => uniqueImages(
     messages.flatMap((msg) => msg.images || [])
   ), [messages]);
@@ -286,9 +288,20 @@ function App() {
     return providers.find((provider) => String(provider.id) === String(providerId)) || providers[0] || null;
   }
 
+  function providerForPlannerMode(mode) {
+    const providerId = plannerProviders[mode] || modeProviders[mode];
+    return providers.find((provider) => String(provider.id) === String(providerId)) || providerForMode(mode);
+  }
+
   function configForMode(mode) {
     const provider = providerForMode(mode);
     if (!provider) return config;
+    return { base_url: provider.base_url, api_key: provider.api_key };
+  }
+
+  function plannerConfigForMode(mode) {
+    const provider = providerForPlannerMode(mode);
+    if (!provider) return configForMode(mode);
     return { base_url: provider.base_url, api_key: provider.api_key };
   }
 
@@ -506,7 +519,8 @@ function App() {
     const runConfig = configForMode("chat");
     const params = {
       prompt: form.prompt,
-      model: form.chatModel,
+      model: form.model,
+      planner_model: form.chatModel.trim() || null,
       image_model: form.imageModel,
       action: form.action,
       size: form.size,
@@ -520,6 +534,7 @@ function App() {
       context_limit: Number(form.context_limit),
       reference_image_ids: chatReferenceImages.map((image) => image.id),
       config: runConfig,
+      planner_config: plannerConfigForMode("chat"),
     };
     data.append("params_json", JSON.stringify(params));
     [...chatImages].forEach((file) => data.append("images", file));
@@ -553,7 +568,8 @@ function App() {
     const runConfig = configForMode("storyboard");
     const params = {
       prompt: form.prompt,
-      model: form.chatModel,
+      model: form.model,
+      planner_model: form.chatModel.trim() || null,
       image_model: form.imageModel,
       size: form.size,
       quality: form.quality,
@@ -567,6 +583,7 @@ function App() {
       shot_limit: Number(form.shot_limit),
       reference_image_ids: chatReferenceImages.map((image) => image.id),
       config: runConfig,
+      planner_config: plannerConfigForMode("storyboard"),
     };
     data.append("params_json", JSON.stringify(params));
     [...chatImages].forEach((file) => data.append("images", file));
@@ -603,6 +620,11 @@ function App() {
       if (value.modeProviders) {
         setModeProviders({ chat: "", storyboard: "", generate: "", edit: "", ...value.modeProviders });
       }
+      if (value.plannerProviders) {
+        setPlannerProviders({ chat: "", storyboard: "", ...value.plannerProviders });
+      } else if (value.modeProviders) {
+        setPlannerProviders({ chat: value.modeProviders.chat || "", storyboard: value.modeProviders.storyboard || "" });
+      }
     } catch (err) {
       setError(describeError(err));
     } finally {
@@ -630,6 +652,7 @@ function App() {
       config,
       form: persistableForm(form),
       modeProviders,
+      plannerProviders,
     };
     try {
       await fetch(`${API}/api/app-settings`, {
@@ -684,6 +707,15 @@ function App() {
     const data = await parse(res);
     mergeTask(data.task);
     await refreshTasks();
+  }
+
+  async function retryTask(taskId) {
+    const res = await fetch(`${API}/api/tasks/${taskId}/retry`, { method: "POST" });
+    const data = await parse(res);
+    mergeTask(data.task);
+    await refreshTasks();
+    await refreshHistory();
+    await loadTask(data.task.id);
   }
 
   async function deleteTask(taskId) {
@@ -747,6 +779,10 @@ function App() {
           generate: ids.has(String(current.generate)) ? current.generate : String(items[0].id),
           edit: ids.has(String(current.edit)) ? current.edit : String(items[0].id),
         }));
+        setPlannerProviders((current) => ({
+          chat: ids.has(String(current.chat)) ? current.chat : String(items[0].id),
+          storyboard: ids.has(String(current.storyboard)) ? current.storyboard : String(items[0].id),
+        }));
       }
     } catch (err) {
       setError(describeError(err));
@@ -795,11 +831,20 @@ function App() {
         edit: String(current.edit) === String(providerId) ? fallbackId : current.edit,
       };
     });
+    setPlannerProviders((current) => {
+      const fallback = providers.find((provider) => provider.id !== providerId);
+      const fallbackId = fallback ? String(fallback.id) : "";
+      return {
+        chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
+        storyboard: String(current.storyboard) === String(providerId) ? fallbackId : current.storyboard,
+      };
+    });
     await refreshProviders();
   }
 
   function syncProviderToAll(providerId) {
     setModeProviders({ chat: providerId, storyboard: providerId, generate: providerId, edit: providerId });
+    setPlannerProviders({ chat: providerId, storyboard: providerId });
   }
 
   async function newChat() {
@@ -925,6 +970,7 @@ function App() {
   }
 
   async function loadConversation(id, { openStudio = true, autoRefresh = false } = {}) {
+    const previousConversationId = conversationRef.current?.id;
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
       if (activeViewRef.current !== "studio" || !["chat", "storyboard"].includes(formModeRef.current) || currentConversation?.id !== id) {
@@ -978,10 +1024,17 @@ function App() {
     setSelectedHistory({ ...data, messages: hydrated });
     setSelectedTask(null);
     if (openStudio) {
+      const switchingConversation = Number(previousConversationId) !== Number(data.conversation.id);
       setConversation(data.conversation);
       setMessages(hydrated);
       const hasStoryboardTask = (data.tasks || []).some((task) => task.mode === "storyboard");
       setForm((value) => ({ ...value, mode: hasStoryboardTask ? "storyboard" : "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
+      if (switchingConversation) {
+        setChatImages([]);
+        setChatReferenceImages([]);
+      } else {
+        setChatReferenceImages((items) => items.filter((image) => Number(image.conversation_id) === Number(data.conversation.id)));
+      }
       setActiveView("studio");
     }
   }
@@ -1025,11 +1078,12 @@ function App() {
   }
 
   async function useImageAsReference(image) {
+    const targetMode = formModeRef.current === "storyboard" || image.task_mode === "storyboard" ? "storyboard" : "chat";
     if (image.conversation_id) {
       await loadConversation(image.conversation_id, { openStudio: true });
     } else {
       setActiveView("studio");
-      setForm((value) => ({ ...value, mode: "chat" }));
+      setForm((value) => ({ ...value, mode: targetMode }));
     }
     if (image.id) {
       setChatReferenceImages([normalizeImageForClient(image)]);
@@ -1040,7 +1094,7 @@ function App() {
       const file = new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
       setChatImages([file]);
     }
-    setForm((value) => ({ ...value, prompt: "", mode: "chat", action: "edit" }));
+    setForm((value) => ({ ...value, prompt: "", mode: targetMode, action: targetMode === "chat" ? "edit" : value.action }));
   }
 
   async function downloadImage(image) {
@@ -1106,20 +1160,32 @@ function App() {
 
           <SettingsGroup
             title="提供商管理"
-            summary={activeProvider ? `${modeLabel(form.mode)}：${activeProvider.name}` : "未配置提供商"}
+            summary={activeProvider ? `${modeLabel(form.mode)}生图：${activeProvider.name}${activePlannerProvider ? ` / 规划：${activePlannerProvider.name}` : ""}` : "未配置提供商"}
             open={!!openGroups.providers}
             onToggle={() => toggleGroup("providers")}
           >
             <Select
-              label="对话模式"
+              label="对话生图"
               value={modeProviders.chat}
               onChange={(v) => setModeProviders({ ...modeProviders, chat: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
-              label="分镜模式"
+              label="对话规划"
+              value={plannerProviders.chat}
+              onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
+              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+            />
+            <Select
+              label="分镜生图"
               value={modeProviders.storyboard}
               onChange={(v) => setModeProviders({ ...modeProviders, storyboard: v })}
+              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+            />
+            <Select
+              label="分镜规划"
+              value={plannerProviders.storyboard}
+              onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
               options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
             />
             <Select
@@ -1181,13 +1247,16 @@ function App() {
 
           <SettingsGroup
             title="模型设置"
-            summary={["chat", "storyboard"].includes(form.mode) ? `${form.chatModel} / ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
+            summary={["chat", "storyboard"].includes(form.mode) ? `规划 ${form.chatModel} / 生图 ${form.model} + ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
             open={!!openGroups.models}
             onToggle={() => toggleGroup("models")}
           >
             {["chat", "storyboard"].includes(form.mode) ? (
               <>
-                <Select label="对话模型" value={form.chatModel} onChange={(v) => setForm({ ...form, chatModel: v })} options={chatModelOptions} />
+                <Field label="规划模型">
+                  <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} placeholder="例如 qwen-plus / deepseek-chat / gpt-5.4" />
+                </Field>
+                <Select label="生图 Responses 模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
                 <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
             ) : (
@@ -1329,6 +1398,7 @@ function App() {
               onDownload={downloadImage}
               onUseImage={useImageAsReference}
               onCancelTask={cancelTask}
+              onRetryTask={retryTask}
               onDeleteTask={deleteTask}
               onDeleteConversation={deleteConversation}
             />
@@ -1511,6 +1581,7 @@ function HistoryPane({
   onDownload,
   onUseImage,
   onCancelTask,
+  onRetryTask,
   onDeleteTask,
   onDeleteConversation,
 }) {
@@ -1575,6 +1646,7 @@ function HistoryPane({
             onUseImage={onUseImage}
             onContinue={onContinue}
             onDelete={onDeleteTask}
+            onRetry={onRetryTask}
           />
         ) : !selected ? (
           <div className="emptyState">
@@ -1789,7 +1861,7 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
   );
 }
 
-function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDelete }) {
+function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDelete, onRetry }) {
   const [copyState, setCopyState] = useState("idle");
   const isLive = ["queued", "running"].includes(task.status);
   const images = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
@@ -1820,6 +1892,11 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue, onDele
           {task.conversation_id && (
             <button className="secondaryButton compact" type="button" onClick={() => onContinue(task.conversation_id)}>
               <MessageCircle size={16} /> {task.mode === "storyboard" ? "继续分镜" : "继续对话"}
+            </button>
+          )}
+          {task.mode === "storyboard" && ["failed", "canceled"].includes(task.status) && (
+            <button className="secondaryButton compact" type="button" onClick={() => onRetry(task.id)}>
+              <RefreshCw size={16} /> 继续试一次
             </button>
           )}
           <button className="ghostButton danger" type="button" onClick={() => onDelete(task.id)}>

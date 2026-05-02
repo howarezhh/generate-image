@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import re
 from pathlib import Path
@@ -108,6 +109,7 @@ class MessageUpdate(BaseModel):
 class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = "gpt-5.4"
+    planner_model: str | None = None
     image_model: str = "gpt-image-2"
     action: str = "auto"
     size: str = "2560x1440"
@@ -121,11 +123,13 @@ class ChatRequest(BaseModel):
     context_limit: int = Field(default=10, ge=0, le=50)
     reference_image_ids: list[int] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
+    planner_config: ClientConfig | None = None
 
 
 class StoryboardRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = "gpt-5.4"
+    planner_model: str | None = None
     image_model: str = "gpt-image-2"
     size: str = "2560x1440"
     quality: str = "high"
@@ -139,6 +143,7 @@ class StoryboardRequest(BaseModel):
     shot_limit: int = Field(default=6, ge=1, le=12)
     reference_image_ids: list[int] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
+    planner_config: ClientConfig | None = None
 
 
 def public_task_image(
@@ -420,15 +425,48 @@ def deletable_media_paths(rows: list[Any], delete_ids: list[int]) -> list[str]:
     return paths
 
 
+def image_prompts_from_message_meta(meta: dict[str, Any]) -> list[str]:
+    prompts: list[str] = []
+    image_prompt = str(meta.get("image_prompt") or "").strip()
+    if image_prompt:
+        prompts.append(image_prompt)
+    plan = meta.get("plan") if isinstance(meta.get("plan"), dict) else {}
+    plan_prompt = str(plan.get("image_prompt") or "").strip()
+    if plan_prompt:
+        prompts.append(plan_prompt)
+    storyboard = meta.get("storyboard") if isinstance(meta.get("storyboard"), dict) else {}
+    shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+        name = str(shot.get("name") or "").strip()
+        shot_prompt = str(shot.get("prompt") or "").strip()
+        if shot_prompt:
+            prompts.append(f"{name}：{shot_prompt}" if name else shot_prompt)
+    return list(dict.fromkeys(prompts))
+
+
 def build_context_prompt(history: list[dict[str, Any]], prompt: str) -> str:
     if not history:
         return prompt
-    lines = ["以下是最近的对话上下文，请结合上下文理解当前生图需求："]
+    lines = ["以下是最近的文字对话和已生成图片对应的单张图片生图提示词，请结合它们理解当前需求："]
     for item in history:
         role = "用户" if item.get("role") == "user" else "助手"
         content = str(item.get("content") or "").strip()
         if content:
             lines.append(f"{role}: {content}")
+        meta: dict[str, Any] = {}
+        if isinstance(item.get("meta_json"), str):
+            try:
+                parsed = json.loads(item["meta_json"] or "{}")
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except json.JSONDecodeError:
+                meta = {}
+        elif isinstance(item.get("meta"), dict):
+            meta = item["meta"]
+        for index, image_prompt in enumerate(image_prompts_from_message_meta(meta), start=1):
+            lines.append(f"{role}关联的第 {index} 张图片生图提示词（仅对应一张图片）: {image_prompt}")
     lines.append(f"当前用户需求: {prompt}")
     return "\n".join(lines)
 
@@ -445,25 +483,32 @@ def build_chat_planner_prompt(
         source_note = "用户本轮已经明确指定了参考图片。" if has_images else "用户本轮没有指定参考图片。"
         lines = [f"{source_note} 已指定参考图如下；如果你决定执行图片修改，应使用这些参考图，不要自行选择其它历史图片："]
         for index, image in enumerate(image_candidates, start=1):
+            prompt_hint = image.get("hint") or ""
+            if image.get("source") == "upload":
+                prompt_part = "用户本轮上传的参考图，没有对应生图提示词"
+            else:
+                prompt_part = f"该参考图对应的一张图片生图提示词/说明={prompt_hint or '无'}"
             lines.append(
                 f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
                 f"image_id={image.get('id')}, message_id={image.get('message_id')}, "
-                f"task_id={image.get('task_id')}, 提示词/说明={image.get('hint') or '无'}"
+                f"task_id={image.get('task_id')}, {prompt_part}"
             )
         lines.append("候选顺序与随请求附带给你的参考图片顺序一致。")
         image_note = "\n".join(lines)
     else:
         image_note = "本轮用户没有上传或选择参考图片。"
     return f"""
-你是一个中文生图对话助手。你的职责不是每次都生图，而是先理解用户意图，再决定是否需要调用生图。
+你是本项目“对话式生图 planner”。你只负责理解用户、追问需求、判断是否开始生图、撰写最终提示词；真正的图片生成由后续 image_generation 工具执行。
 
-判断规则：
-1. 如果用户只是在聊天、询问能力、补充偏好、没有明确画面/修改目标，不要生图，应继续提问或确认需求。
-2. 如果用户明确要求生成、重画、修改、继续改图，或上下文已经足够且用户表达了开始/按这个来/生成吧，应生图。
-3. 如果用户表达“继续改、修改、调整、保留、换成、参考某张图”等改图意图，但本轮没有指定参考图，不要自行从历史图片里猜测，应要求用户选择或上传参考图。
-4. 如果用户在已有图片基础上提出修改意见，应把修改意见融合为新的高质量生图提示词，强调保留不应改变的部分。
-5. 生成提示词要完整、具体、适合直接传给 image_generation 工具。
-6. 如果用户要改图但你无法从候选中判断应修改哪张图，不要生图，should_generate=false，并请用户明确选择哪张。
+对话模式工作流：
+1. 先读文字上下文和本轮用户输入，判断用户是在闲聊/补充需求，还是已经明确要生成或修改图片。
+2. 若画面主体、场景、风格或修改目标仍不清楚，should_generate=false，只问最关键的 1-2 个问题，不要急着生图。
+3. 若用户明确说“生成、开始、按这个来、继续改、重画、修改”等，且信息足够，should_generate=true。
+4. 若是从零生成新图，action=generate，image_prompt 必须是一张图片的最终生图提示词，只描述这一张图的画面，不要写解释、流程、JSON、镜头列表或多张图信息。
+5. 若是编辑参考图，action=edit；只能使用本轮用户上传或选择的参考图，禁止自行猜测其它历史图片。
+6. 若用户想改图但没有提供参考图，或无法判断要改哪张参考图，should_generate=false，请用户上传或选择参考图。
+7. 若使用参考图，reference_image_refs 必须填写使用到的 ref；reference_image_ids 只填写已选历史生成图的 image_id。用户本轮上传的参考图没有 image_id，也没有对应生图提示词，不要编造。
+8. image_prompt 必须把用户意图改写成适合 image_generation 的单张图片提示词，并明确保留不应变化的主体、构图、风格或参考图特征。
 
 {image_note}
 
@@ -472,7 +517,7 @@ def build_chat_planner_prompt(
   "reply": "给用户看的中文回复。若要生图，说明你将如何生成/修改；若不要生图，提出下一步问题或建议。",
   "should_generate": true 或 false,
   "action": "generate" 或 "edit" 或 "auto",
-  "image_prompt": "should_generate 为 true 时填写最终生图提示词，否则为空字符串",
+  "image_prompt": "should_generate 为 true 时填写一张图片的最终生图提示词；它只能对应一张图片，不能包含解释、流程、多图列表或其它信息；否则为空字符串",
   "reference_image_refs": [],
   "reference_image_ids": [],
   "reason": "简短说明判断依据"
@@ -531,16 +576,19 @@ def build_storyboard_planner_prompt(
     context = build_context_prompt(history, prompt)
     image_note = "用户本轮已经提供了角色/场景参考图，可作为第一镜头的 edit 输入。" if has_images else "用户本轮没有提供参考图，第一镜头可从文本生成开始。"
     return f"""
-你是一个中文分镜连续生图导演助手。你的目标是和用户对话完善视频画面意图，并在信息足够时生成一组连续镜头首帧图。
+你是本项目“分镜连续生图 planner”。你只负责和用户完善视频意图、规划镜头、为每个镜头撰写单张首帧图片提示词；真正的逐张生图由后续 image_generation 工具按顺序执行。
 
-工作判断：
-1. 如果用户还只是在讨论主题、人物、场景、风格、分镜数量，且信息不足，不要生图，should_generate=false，并用中文提出最关键的下一步问题。
-2. 如果用户明确要求开始、生成、按这个方案做，或上下文已经足够形成镜头序列，应 should_generate=true。
-3. 每个镜头只生成一张图，代表该镜头的首帧画面。
-4. 镜头必须连续：第 N 镜头的首帧要承接第 N-1 镜头画面，保持人物、服装、道具、空间位置、光线逻辑和故事动作一致。
-5. 你需要为每个镜头生成中文名字，名字要短、能作为文件名，必须包含镜头顺序含义，但不要包含文件扩展名。
-6. 每个镜头提示词都要适合直接传给 image_generation 工具；从第 2 镜头开始，提示词必须明确“以上一镜头画面为参考继续编辑”。
-7. 最多输出 {shot_limit} 个镜头；如果用户没有指定数量，优先 3-5 个镜头。
+分镜模式工作流：
+1. 先判断用户是在讨论创意，还是已经准备开始生成连续镜头首帧。
+2. 如果主题、主角、场景、风格、镜头数量或连续动作仍不足以稳定规划，should_generate=false，只提出最关键的补充问题。
+3. 如果用户明确要求开始、生成、按这个方案做，或上下文已经足够形成镜头序列，should_generate=true。
+4. 必须先给出 character_summary 和 scene_summary，作为所有镜头的人物、场景、光线、风格不变量。
+5. 每个 shots[i].prompt 都必须是一张图片的生图提示词，只对应该镜头的首帧图片；禁止把多个镜头、解释文字、流程说明或文件保存说明写进同一个 prompt。
+6. 每个镜头只生成一张图，代表该镜头最开始的一帧画面；不要合图、拼图、多格漫画或一次描述多张图。
+7. 镜头必须连续：第 N 镜头的首帧要承接第 N-1 镜头画面，保持人物、服装、道具、空间位置、光线逻辑和故事动作一致。
+8. 第 1 镜头可基于文本或用户显式参考图；第 2 个及后续镜头的 prompt 必须写明“以上一镜头输出画面作为参考继续编辑”，并说明从上一镜头到当前首帧发生了什么连续变化。
+9. 你需要为每个镜头生成中文名字，名字要短、能作为文件名，必须包含镜头顺序含义，但不要包含文件扩展名。
+10. 最多输出 {shot_limit} 个镜头；如果用户没有指定数量，优先 3-5 个镜头。
 
 {image_note}
 
@@ -554,7 +602,7 @@ def build_storyboard_planner_prompt(
     {{
       "order": 1,
       "name": "01-中文镜头名",
-      "prompt": "这一镜头的完整中文生图提示词，包含人物/场景/构图/动作/连续性/禁止变化项",
+      "prompt": "这一镜头的一张首帧图片生图提示词，包含人物/场景/构图/动作/连续性/禁止变化项；只能对应这一张图片",
       "continuity": "这一镜头与上一镜头的衔接关系；第一镜头说明开场状态"
     }}
   ],
@@ -662,7 +710,7 @@ def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[di
                 "task_id": None,
                 "path": path,
                 "mime_type": mime_type,
-                "hint": f"本轮用户上传的第 {index} 张图片",
+                "hint": f"本轮用户上传的第 {index} 张图片，没有历史生图提示词",
             }
         )
     return candidates
@@ -689,7 +737,7 @@ def build_selected_image_candidates(selected: list[dict[str, Any]]) -> list[dict
     return candidates
 
 
-def load_selected_reference_images(image_ids: list[int], limit: int = 3) -> list[dict[str, Any]]:
+def load_selected_reference_images(image_ids: list[int], limit: int = 3, conversation_id: int | None = None) -> list[dict[str, Any]]:
     clean_ids: list[int] = []
     for value in image_ids:
         try:
@@ -703,6 +751,10 @@ def load_selected_reference_images(image_ids: list[int], limit: int = 3) -> list
     if not clean_ids:
         return []
     placeholders = ",".join("?" for _ in clean_ids)
+    conversation_clause = "and i.conversation_id = ?" if conversation_id is not None else ""
+    query_values: list[Any] = [*clean_ids]
+    if conversation_id is not None:
+        query_values.append(conversation_id)
     with db.connect() as conn:
         rows = conn.execute(
             f"""
@@ -712,9 +764,9 @@ def load_selected_reference_images(image_ids: list[int], limit: int = 3) -> list
             from images i
             left join messages m on m.id = i.message_id
             left join tasks t on t.id = i.task_id
-            where i.id in ({placeholders}) and i.source = 'api'
+            where i.id in ({placeholders}) and i.source = 'api' {conversation_clause}
             """,
-            clean_ids,
+            query_values,
         ).fetchall()
     by_id = {int(row["id"]): db.row_to_dict(row) for row in rows}
     return [by_id[image_id] for image_id in clean_ids if image_id in by_id and Path(by_id[image_id]["file_path"]).exists()]
@@ -1026,11 +1078,20 @@ async def call_chat_planner(
     prompt: str,
     config: ClientConfig,
     uploaded: list[tuple[Path, str]] | None = None,
+    image_contexts: list[dict[str, Any]] | None = None,
     previous_response_id: str | None = None,
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    contexts = image_contexts or []
     for idx, (path, mime_type) in enumerate(uploaded or [], start=1):
-        content.append({"type": "input_text", "text": f"Reference image {idx}: user supplied this image for possible edit context."})
+        context = contexts[idx - 1] if idx - 1 < len(contexts) else {}
+        ref = context.get("ref") or f"reference:{idx}"
+        if context.get("source") == "upload":
+            reference_text = f"Reference image {idx}: ref={ref}; 这是用户本轮上传的参考图，没有对应生图提示词。下一张 input_image 就是这个 ref 对应的图片。"
+        else:
+            hint = context.get("hint") or "无对应历史提示词"
+            reference_text = f"Reference image {idx}: ref={ref}; 该参考图对应的一张图片生图提示词/说明={hint}。下一张 input_image 就是这个 ref 对应的图片。"
+        content.append({"type": "input_text", "text": reference_text})
         content.append({"type": "input_image", "image_url": data_url_for_file(path, mime_type)})
     payload = responses_payload_for_planner(model=model, content=content, previous_response_id=previous_response_id)
     return await post_json(
@@ -1728,7 +1789,7 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
             if item:
                 uploaded_images.append(item)
         reference_ids = meta.get("reference_image_ids", []) if isinstance(meta, dict) else []
-        for image in load_selected_reference_images(reference_ids, limit=3):
+        for image in load_selected_reference_images(reference_ids, limit=3, conversation_id=conversation_id):
             uploaded_images.append(
                 {
                     "id": image["id"],
@@ -1781,7 +1842,7 @@ async def storyboard_message(
     if len(images or []) > 3:
         raise HTTPException(status_code=400, detail="分镜模式最多上传 3 张参考图")
     uploaded = [await save_upload(upload) for upload in images or []]
-    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)))
+    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)), conversation_id=conversation_id)
     selected_reference_uploads = [
         (Path(item["file_path"]), item.get("mime_type") or "image/png")
         for item in selected_reference_images
@@ -1802,7 +1863,7 @@ async def storyboard_message(
             db.row_to_dict(row)
             for row in conn.execute(
                 """
-                select id, role, content, created_at
+                select id, role, content, meta_json, created_at
                 from messages
                 where conversation_id = ?
                 order by id desc
@@ -1843,6 +1904,7 @@ async def storyboard_message(
             "endpoint": "/v1/responses",
             "tool": "image_generation",
             "model": params.model,
+            "planner_model": params.planner_model,
             "image_model": params.image_model,
             "prompt": params.prompt,
             "size": params.size,
@@ -1856,6 +1918,7 @@ async def storyboard_message(
             "context_limit": context_limit,
             "shot_limit": params.shot_limit,
             "reference_image_ids": [item["id"] for item in selected_reference_images],
+            "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
     )
     task_id = db.create_task(
@@ -1918,11 +1981,12 @@ async def run_storyboard_task(
             params.shot_limit,
         )
         planner_response = await call_chat_planner(
-            model=params.model,
+            model=params.planner_model or params.model,
             prompt=planner_prompt,
-            config=params.config,
+            config=params.planner_config or params.config,
             uploaded=planner_reference_images,
-            previous_response_id=previous_response_id,
+            image_contexts=image_candidates,
+            previous_response_id=None,
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_storyboard_plan(planner_text, params.shot_limit)
@@ -2095,6 +2159,14 @@ async def run_storyboard_task(
                 raw_for_meta["image_error"] = exc.detail
                 update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            except Exception as exc:
+                shot["status"] = "failed"
+                shot["error"] = str(exc)
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                raw_for_meta["image_status"] = "failed"
+                raw_for_meta["image_error"] = str(exc)
+                update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                raise
 
         raw_for_meta["image_status"] = "done"
         raw_for_meta["storyboard"] = storyboard_state
@@ -2112,6 +2184,165 @@ async def run_storyboard_task(
                 "raw": raw_for_meta,
             },
         )
+
+    await run_with_slot(task_id, worker)
+
+
+@app.post("/api/tasks/{task_id}/retry")
+async def retry_task(task_id: int) -> dict[str, Any]:
+    ensure_task_slot()
+    old_task = task_with_images(task_id)
+    if old_task.get("mode") != "storyboard":
+        raise HTTPException(status_code=400, detail="当前仅支持重试分镜连续生图任务")
+    params = copy.deepcopy(old_task.get("params") or {})
+    storyboard = params.get("storyboard") if isinstance(params.get("storyboard"), dict) else {}
+    shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
+    if not shots:
+        raise HTTPException(status_code=400, detail="该分镜任务没有可重试的镜头状态")
+    for shot in shots:
+        if isinstance(shot, dict) and shot.get("status") in {"running", "failed"}:
+            shot["status"] = "pending"
+            shot.pop("error", None)
+    retry_payload = compact_params({**params, "retry_of": task_id})
+    retry_id = db.create_task(
+        "storyboard",
+        f"重试：{old_task.get('prompt') or '分镜任务'}",
+        retry_payload,
+        conversation_id=old_task.get("conversation_id"),
+        user_message_id=old_task.get("user_message_id"),
+        assistant_message_id=old_task.get("assistant_message_id"),
+    )
+    schedule_task(retry_id, run_storyboard_retry_task(retry_id, old_task, retry_payload))
+    return {"task": db.get_task(retry_id)}
+
+
+async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payload: dict[str, Any]) -> None:
+    async def worker() -> None:
+        storyboard = payload.get("storyboard") if isinstance(payload.get("storyboard"), dict) else {}
+        shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
+        total = len(shots)
+        output_format = str(payload.get("output_format", "png"))
+        client_config = ClientConfig(**payload.get("config", {})) if isinstance(payload.get("config"), dict) else ClientConfig()
+        old_images = [image for image in old_task.get("images", []) if image.get("source") == "api"]
+        by_id = {int(image["id"]): image for image in old_images if image.get("id")}
+        by_title = {str(image.get("title") or ""): image for image in old_images}
+        done_count = 0
+        previous_image: tuple[Path, str] | None = None
+        saved_images: list[dict[str, Any]] = []
+        conversation_id = old_task.get("conversation_id")
+        assistant_message_id = old_task.get("assistant_message_id")
+
+        def image_for_shot(shot: dict[str, Any]) -> dict[str, Any] | None:
+            try:
+                image_id = int(shot.get("image_id") or 0)
+            except (TypeError, ValueError):
+                image_id = 0
+            if image_id and image_id in by_id:
+                return by_id[image_id]
+            return by_title.get(str(shot.get("name") or ""))
+
+        for shot in shots:
+            if not isinstance(shot, dict) or shot.get("status") != "done":
+                break
+            done_count += 1
+            image = image_for_shot(shot)
+            if image and image.get("file_path") and Path(image["file_path"]).exists():
+                public_url = image.get("public_url") or image.get("url") or ""
+                copied_image_id = db.add_image(
+                    source="api",
+                    file_path=Path(image["file_path"]),
+                    public_url=public_url,
+                    mime_type=image.get("mime_type") or "image/png",
+                    title=str(shot.get("name") or image.get("title") or ""),
+                    bucket=image.get("bucket"),
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    message_id=assistant_message_id,
+                )
+                shot["image_id"] = copied_image_id
+                shot["url"] = public_url
+                copied_image = {
+                    **image,
+                    "id": copied_image_id,
+                    "task_id": task_id,
+                    "conversation_id": conversation_id,
+                    "message_id": assistant_message_id,
+                    "public_url": public_url,
+                    "url": public_url,
+                }
+                saved_images.append(copied_image)
+                previous_image = (Path(image["file_path"]), image.get("mime_type") or "image/png")
+
+        bucket = task_image_folder(task_id, f"重试分镜-{old_task.get('prompt') or task_id}")
+        db.update_task(task_id, progress=12, stage=f"准备从第 {done_count + 1}/{total} 个镜头继续")
+        update_storyboard_task_state(task_id, payload, storyboard)
+        for index, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict) or shot.get("status") == "done":
+                continue
+            shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
+            shot["name"] = shot_name
+            shot["status"] = "running"
+            update_storyboard_task_state(task_id, payload, storyboard)
+            db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"重试生成镜头 {index}/{total}：{shot_name}")
+            action = "edit" if previous_image else "generate"
+            try:
+                if previous_image is None and index > 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": "无法继续分镜：没有找到上一镜头输出图作为 edit 输入。",
+                            "suggestion": "请从原对话重新提交分镜需求，或选择一张参考图后重试。",
+                        },
+                    )
+                response = await call_responses_image_generation(
+                    model=str(payload.get("model", "gpt-5.4")),
+                    prompt=str(shot.get("prompt") or old_task.get("prompt") or ""),
+                    image_model=str(payload.get("image_model", "gpt-image-2")),
+                    size=str(payload.get("size", "2560x1440")),
+                    quality=str(payload.get("quality", "high")),
+                    output_format=output_format,
+                    background=payload.get("background", "auto"),
+                    output_compression=payload.get("output_compression"),
+                    moderation=payload.get("moderation", "auto"),
+                    action=action,
+                    partial_images=payload.get("partial_images"),
+                    config=client_config,
+                    uploaded=[previous_image] if previous_image else None,
+                    input_fidelity=str(payload.get("input_fidelity", "high")),
+                    previous_response_id=None,
+                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                    on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
+                )
+                image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                if not image_items:
+                    raise HTTPException(status_code=502, detail="Responses API 已返回，但没有找到 image_generation_call.result 图片数据。")
+                renamed = rename_output_image(image_items[0], shot_name)
+                image_record = public_task_image(
+                    renamed,
+                    conversation_id=old_task.get("conversation_id"),
+                    message_id=old_task.get("assistant_message_id"),
+                    task_id=task_id,
+                    title=shot_name,
+                    bucket=bucket,
+                )
+                saved_images.append(image_record)
+                previous_image = (renamed[0], renamed[2])
+                shot["status"] = "done"
+                shot["image_id"] = image_record["id"]
+                shot["url"] = image_record["url"]
+                update_storyboard_task_state(task_id, payload, storyboard)
+                db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已重试保存镜头 {index}/{total}：{shot_name}")
+            except HTTPException as exc:
+                shot["status"] = "failed"
+                shot["error"] = exc.detail
+                update_storyboard_task_state(task_id, payload, storyboard)
+                raise
+            except Exception as exc:
+                shot["status"] = "failed"
+                shot["error"] = str(exc)
+                update_storyboard_task_state(task_id, payload, storyboard)
+                raise
+        db.finish_task(task_id, {"retry_of": old_task.get("id"), "images": saved_images, "raw": {"storyboard": storyboard}})
 
     await run_with_slot(task_id, worker)
 
@@ -2163,7 +2394,7 @@ async def chat_message(
     if len(images or []) > 3:
         raise HTTPException(status_code=400, detail="对话模式最多上传 3 张参考图")
     uploaded = [await save_upload(upload) for upload in images or []]
-    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)))
+    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)), conversation_id=conversation_id)
     selected_reference_uploads = [
         (Path(item["file_path"]), item.get("mime_type") or "image/png")
         for item in selected_reference_images
@@ -2185,7 +2416,7 @@ async def chat_message(
             db.row_to_dict(row)
             for row in conn.execute(
                 """
-                select id, role, content, created_at
+                select id, role, content, meta_json, created_at
                 from messages
                 where conversation_id = ?
                 order by id desc
@@ -2225,6 +2456,7 @@ async def chat_message(
             "endpoint": "/v1/responses",
             "tool": "image_generation",
             "model": params.model,
+            "planner_model": params.planner_model,
             "image_model": params.image_model,
             "prompt": params.prompt,
             "size": params.size,
@@ -2237,6 +2469,7 @@ async def chat_message(
             "partial_images": params.partial_images,
             "context_limit": context_limit,
             "reference_image_ids": [item["id"] for item in selected_reference_images],
+            "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
     )
     task_id = db.create_task(
@@ -2297,11 +2530,12 @@ async def run_chat_task(
             image_candidates=image_candidates,
         )
         planner_response = await call_chat_planner(
-            model=params.model,
+            model=params.planner_model or params.model,
             prompt=planner_prompt,
-            config=params.config,
+            config=params.planner_config or params.config,
             uploaded=planner_reference_images,
-            previous_response_id=previous_response_id,
+            image_contexts=image_candidates,
+            previous_response_id=None,
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_planner_json(planner_text)
