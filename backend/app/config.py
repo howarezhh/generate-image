@@ -13,6 +13,27 @@ def get_env(name: str, default: str = "") -> str:
     return value if value is not None else default
 
 
+def get_int_env(name: str, default: int) -> int:
+    raw = get_env(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def get_float_env(name: str, default: float) -> float:
+    raw = get_env(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def get_bool_env(name: str, default: bool = False) -> bool:
+    raw = get_env(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 HOST = get_env("HOST", "0.0.0.0")
 PORT = int(get_env("PORT", "8010"))
 DATABASE_PATH = ROOT_DIR / get_env("DATABASE_PATH", "storage/app.db")
@@ -23,6 +44,14 @@ FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 
 DEFAULT_API_BASE_URL = get_env("IMAGE_API_BASE_URL", "https://api.openai.com")
 DEFAULT_API_KEY = get_env("IMAGE_API_KEY", "")
+
+MAX_CONCURRENT_TASKS = max(1, get_int_env("MAX_CONCURRENT_TASKS", 3))
+IMAGE_REQUEST_TIMEOUT_SECONDS = max(30.0, get_float_env("IMAGE_REQUEST_TIMEOUT_SECONDS", 300.0))
+CHAT_PLANNER_TIMEOUT_SECONDS = max(30.0, get_float_env("CHAT_PLANNER_TIMEOUT_SECONDS", 180.0))
+IMAGE_REQUEST_MAX_ATTEMPTS = max(1, get_int_env("IMAGE_REQUEST_MAX_ATTEMPTS", 2))
+CHAT_PLANNER_MAX_ATTEMPTS = max(1, get_int_env("CHAT_PLANNER_MAX_ATTEMPTS", 2))
+ENABLE_IMAGE_STABLE_RETRY = get_bool_env("ENABLE_IMAGE_STABLE_RETRY", True)
+IMAGE_STABLE_RETRY_QUALITY = get_env("IMAGE_STABLE_RETRY_QUALITY", "medium").strip() or "medium"
 
 
 def ensure_dirs() -> None:

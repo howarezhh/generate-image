@@ -1,7 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,14 @@ from . import database as db
 from .config import (
     DEFAULT_API_BASE_URL,
     DEFAULT_API_KEY,
+    CHAT_PLANNER_MAX_ATTEMPTS,
+    CHAT_PLANNER_TIMEOUT_SECONDS,
+    ENABLE_IMAGE_STABLE_RETRY,
     FRONTEND_DIST,
+    IMAGE_REQUEST_MAX_ATTEMPTS,
+    IMAGE_REQUEST_TIMEOUT_SECONDS,
+    IMAGE_STABLE_RETRY_QUALITY,
+    MAX_CONCURRENT_TASKS,
     OUTPUT_DIR,
     ROOT_DIR,
     UPLOAD_DIR,
@@ -23,6 +30,7 @@ from .openai_compat import (
     data_url_for_file,
     extract_images_from_responses,
     extract_text_from_responses,
+    guess_mime,
     post_json,
     safe_storage_folder,
     sanitize_response,
@@ -39,7 +47,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_CONCURRENT_TASKS = 3
 RUNNING_TASKS: dict[int, asyncio.Task[Any]] = {}
 TASK_SEMAPHORE: asyncio.Semaphore | None = None
 
@@ -140,6 +147,23 @@ def public_task_image(
         "filename": file_path.name,
         "title": title,
         "bucket": bucket,
+    }
+
+
+def public_upload_image(path_value: str) -> dict[str, Any] | None:
+    path = Path(path_value)
+    if not path.exists():
+        return None
+    try:
+        relative = path.relative_to(UPLOAD_DIR)
+    except ValueError:
+        relative = Path(path.name)
+    return {
+        "url": f"/media/uploads/{relative.as_posix()}",
+        "public_url": f"/media/uploads/{relative.as_posix()}",
+        "file_path": str(path),
+        "filename": path.name,
+        "mime_type": guess_mime(path),
     }
 
 
@@ -426,6 +450,22 @@ def build_image_generation_tool(
     return tool
 
 
+def is_gateway_timeout_error(exc: HTTPException) -> bool:
+    detail = exc.detail
+    status_code = exc.status_code
+    text = json.dumps(detail, ensure_ascii=False).lower() if not isinstance(detail, str) else detail.lower()
+    return status_code in {520, 522, 524} or "timeout" in text or "timed out" in text or "超时" in text
+
+
+def stable_retry_quality(current: str) -> str | None:
+    fallback = IMAGE_STABLE_RETRY_QUALITY
+    if not fallback or fallback == current:
+        return None
+    if current in {"high", "auto"}:
+        return fallback
+    return None
+
+
 def build_responses_input(
     *,
     prompt: str,
@@ -487,39 +527,84 @@ async def call_responses_image_generation(
     mask: tuple[Path, str] | None = None,
     input_fidelity: str | None = None,
     previous_response_id: str | None = None,
+    on_stable_retry: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    def build_payload(tool_quality: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": build_responses_input(
+                prompt=prompt,
+                uploaded=uploaded,
+                mask=mask,
+                input_fidelity=input_fidelity,
+            ),
+            "tools": [
+                build_image_generation_tool(
+                    image_model=image_model,
+                    size=size,
+                    quality=tool_quality,
+                    output_format=output_format,
+                    background=background,
+                    output_compression=output_compression,
+                    moderation=moderation,
+                    action=action,
+                    partial_images=partial_images,
+                )
+            ],
+            "tool_choice": {"type": "image_generation"},
+        }
+        if previous_response_id:
+            payload["previous_response_id"] = previous_response_id
+        return payload
+
+    payload = build_payload(quality)
+    try:
+        return await post_json(
+            "responses",
+            payload,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+            max_attempts=IMAGE_REQUEST_MAX_ATTEMPTS,
+        )
+    except HTTPException as exc:
+        fallback_quality = stable_retry_quality(quality)
+        if not ENABLE_IMAGE_STABLE_RETRY or not fallback_quality or not is_gateway_timeout_error(exc):
+            raise
+        if on_stable_retry:
+            on_stable_retry(fallback_quality)
+        stable_payload = build_payload(fallback_quality)
+        return await post_json(
+            "responses",
+            stable_payload,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=IMAGE_REQUEST_TIMEOUT_SECONDS,
+            max_attempts=1,
+        )
+
+
+def update_timeout_retry_stage(task_id: int, quality: str) -> None:
+    db.update_task(
+        task_id,
+        progress=52,
+        stage=f"上游网关超时，已自动切换到{quality}清晰度稳定重试",
+    )
+
+
+def responses_payload_for_planner(
+    *,
+    model: str,
+    content: list[dict[str, Any]],
+    previous_response_id: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
-        "input": build_responses_input(
-            prompt=prompt,
-            uploaded=uploaded,
-            mask=mask,
-            input_fidelity=input_fidelity,
-        ),
-        "tools": [
-            build_image_generation_tool(
-                image_model=image_model,
-                size=size,
-                quality=quality,
-                output_format=output_format,
-                background=background,
-                output_compression=output_compression,
-                moderation=moderation,
-                action=action,
-                partial_images=partial_images,
-            )
-        ],
-        "tool_choice": {"type": "image_generation"},
+        "input": [{"role": "user", "content": content}],
     }
     if previous_response_id:
         payload["previous_response_id"] = previous_response_id
-    return await post_json(
-        "responses",
-        payload,
-        base_url=config.base_url,
-        api_key=config.api_key,
-        timeout=300.0,
-    )
+    return payload
 
 
 async def call_chat_planner(
@@ -534,18 +619,14 @@ async def call_chat_planner(
     for idx, (path, mime_type) in enumerate(uploaded or [], start=1):
         content.append({"type": "input_text", "text": f"Reference image {idx}: user supplied this image for possible edit context."})
         content.append({"type": "input_image", "image_url": data_url_for_file(path, mime_type)})
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": [{"role": "user", "content": content}],
-    }
-    if previous_response_id:
-        payload["previous_response_id"] = previous_response_id
+    payload = responses_payload_for_planner(model=model, content=content, previous_response_id=previous_response_id)
     return await post_json(
         "responses",
         payload,
         base_url=config.base_url,
         api_key=config.api_key,
-        timeout=180.0,
+        timeout=CHAT_PLANNER_TIMEOUT_SECONDS,
+        max_attempts=CHAT_PLANNER_MAX_ATTEMPTS,
     )
 
 
@@ -852,6 +933,7 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                 action=request.action,
                 partial_images=request.partial_images,
                 config=request.config,
+                on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
             )
             responses.append(sanitize_response(response))
             image_items.extend(extract_images_from_responses(response, request.output_format, folder=bucket))
@@ -957,6 +1039,7 @@ async def run_edit_task(
                 uploaded=saved_images,
                 mask=saved_mask,
                 input_fidelity=str(params.get("input_fidelity", "auto")),
+                on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
             )
             responses.append(sanitize_response(response))
             image_items.extend(extract_images_from_responses(response, output_format, folder=bucket))
@@ -1134,6 +1217,17 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
                 (conversation_id,),
             ).fetchall()
         ]
+    for message in messages:
+        uploaded_images = []
+        try:
+            meta = json.loads(message.get("meta_json") or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+        for path_value in meta.get("uploads", []) if isinstance(meta, dict) else []:
+            item = public_upload_image(str(path_value))
+            if item:
+                uploaded_images.append(item)
+        message["uploaded_images"] = uploaded_images
     return {"conversation": db.row_to_dict(conversation), "messages": messages, "images": images, "tasks": tasks}
 
 
@@ -1407,6 +1501,7 @@ async def run_chat_task(
             uploaded=edit_inputs,
             input_fidelity=params.input_fidelity,
             previous_response_id=planner_response_id or previous_response_id,
+            on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
         )
         db.update_task(task_id, progress=84, stage="正在提取和保存图片")
         bucket = task_image_folder(task_id, conversation_title)

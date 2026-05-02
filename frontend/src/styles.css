@@ -606,6 +606,11 @@ textarea {
   aspect-ratio: 1;
 }
 
+.uploadedImageGrid .imageCard {
+  border-style: dashed;
+  border-color: rgba(238, 203, 112, 0.34);
+}
+
 .imageCard img,
 .imageGrid > img {
   width: 100%;
@@ -708,6 +713,30 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.copyFeedbackButton {
+  transition: transform 120ms ease, background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.copyFeedbackButton:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+.copyFeedbackButton.success,
+.sectionTitle .copyFeedbackButton.success,
+.promptCardActions .copyFeedbackButton.success {
+  background: #2d927f;
+  color: white;
+  border-color: transparent;
+}
+
+.copyFeedbackButton.failed,
+.sectionTitle .copyFeedbackButton.failed,
+.promptCardActions .copyFeedbackButton.failed {
+  background: rgba(214, 76, 57, 0.2);
+  color: #ffd9d1;
+  border-color: rgba(214, 76, 57, 0.45);
 }
 
 .errorMeta {

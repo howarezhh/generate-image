@@ -167,11 +167,11 @@ def readable_error_message(upstream: Any, status_code: int) -> str:
 def suggestion_for_status(status_code: int, endpoint: str, upstream: Any) -> str:
     text = readable_error_message(upstream, status_code).lower()
     if status_code in {524, 522, 520} or "timeout" in text:
-        return "上游接口超时或网关异常。项目已自动重试一次，仍失败时请稍后重试，或降低图片质量/尺寸后再试。"
+        return "上游接口超时或网关异常。项目会按配置自动重试；如果仍失败，请降低分辨率/清晰度、把并发降到 1，或改用不经过短超时网关的提供商。"
     if status_code == 404:
         return f"当前接口没有找到 /{endpoint}。如果你使用中转服务，请确认它支持该 OpenAI 兼容路径，或换成它文档里的 base_url。"
     if status_code == 429:
-        return "上游接口限流。项目已自动重试一次，仍失败时请稍等几十秒再重试，或降低并发/减少连续生图次数。"
+        return "上游接口限流。项目会按配置自动重试；如果仍失败，请稍等几十秒再重试，或降低并发/减少连续生图次数。"
     if status_code in {401, 403}:
         return "密钥校验失败或没有该模型权限，请检查前端保存的密钥和模型名称。"
     if "model" in text:

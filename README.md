@@ -88,6 +88,11 @@ bash scripts/update_project.sh
 - `IMAGE_API_BASE_URL`：OpenAI 或兼容服务地址，例如 `https://api.openai.com` 或你的中转地址。
 - `IMAGE_API_KEY`：API 密钥。
 - `PORT`：后端服务端口，默认 `8010`。
+- `MAX_CONCURRENT_TASKS`：后台生图并发上限，默认 `3`。如果中转服务经常 524/429，建议先改成 `1`。
+- `IMAGE_REQUEST_TIMEOUT_SECONDS`：单次 Responses 生图请求等待时间，默认 `300` 秒。
+- `IMAGE_REQUEST_MAX_ATTEMPTS`：上游 5xx/429 的自动重试次数，默认 `2`。
+- `ENABLE_IMAGE_STABLE_RETRY`：遇到 524/网关超时时是否自动降清晰度稳定重试，默认 `1`。
+- `IMAGE_STABLE_RETRY_QUALITY`：稳定重试使用的清晰度，默认 `medium`。
 - `DATABASE_PATH`：SQLite 数据库位置。
 - `STORAGE_DIR`：上传和输出图片目录。
 

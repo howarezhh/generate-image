@@ -178,6 +178,7 @@ function App() {
   const [activeView, setActiveView] = useState("studio");
   const [conversation, setConversation] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [studioSubmissions, setStudioSubmissions] = useState({ generate: [], edit: [] });
   const [editImages, setEditImages] = useState([]);
   const [editMask, setEditMask] = useState(null);
   const [chatImages, setChatImages] = useState([]);
@@ -225,10 +226,8 @@ function App() {
   }, [messages, loading]);
 
   const runningTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
-  const modeTasks = runningTasks.filter((task) => task.mode === form.mode);
-  const latestModeTask = modeTasks[0];
   const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
-  const submitDisabled = latestModeTask ? false : !form.prompt.trim() || atTaskLimit;
+  const submitDisabled = loading || !form.prompt.trim() || atTaskLimit;
   const activeProvider = providerForMode(form.mode);
 
   function switchView(view) {
@@ -265,37 +264,67 @@ function App() {
   async function handleSubmit(event) {
     event.preventDefault();
     setError(null);
-    if (latestModeTask) {
-      await cancelTask(latestModeTask.id);
-      return;
-    }
     await startTask();
   }
 
-  async function startTask({ openCreatedTask = false } = {}) {
+  async function startTask() {
     if (atTaskLimit) {
-      setError(describeError({ detail: { message: "已有 3 个任务运行或排队，请等待完成后再创建新任务。" } }));
+      setError(describeError({ detail: { message: `已有 ${taskMeta.max_concurrent || 3} 个任务运行或排队，请等待完成后再创建新任务。` } }));
       return;
     }
     setLoading(true);
     try {
-      let createdTask = null;
       if (form.mode === "generate") {
-        createdTask = await runGenerate();
+        rememberStudioSubmission("generate", form.prompt);
+        await runGenerate();
       } else if (form.mode === "edit") {
-        createdTask = await runEdit();
+        if (!editImages.length) throw new Error("编辑模式至少上传一张图片");
+        rememberStudioSubmission("edit", form.prompt, [...editImages]);
+        await runEdit();
       } else {
-        createdTask = await runChat();
+        await runChat();
       }
       setForm((value) => ({ ...value, prompt: "" }));
-      if (openCreatedTask && createdTask?.id) {
-        await loadTask(createdTask.id);
-      }
     } catch (err) {
       setError(describeError(err));
     } finally {
       setLoading(false);
     }
+  }
+
+  function rememberStudioSubmission(mode, prompt, files = []) {
+    if (!["generate", "edit"].includes(mode)) return;
+    const previews = files.map((file) => ({
+      name: file.name,
+      url: URL.createObjectURL(file),
+    }));
+    setStudioSubmissions((current) => ({
+      ...current,
+      [mode]: [
+        ...current[mode],
+        {
+          id: `${mode}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          prompt,
+          previews,
+          created_at: new Date().toISOString(),
+        },
+      ],
+    }));
+  }
+
+  function newStudioTask() {
+    if (form.mode === "chat") {
+      newChat();
+      return;
+    }
+    setStudioSubmissions((current) => ({ ...current, [form.mode]: [] }));
+    setForm((value) => ({ ...value, prompt: "" }));
+    if (form.mode === "edit") {
+      setEditImages([]);
+      setEditMask(null);
+    }
+    setError(null);
+    setActiveView("studio");
   }
 
   async function runGenerate() {
@@ -478,12 +507,12 @@ function App() {
         const latestSelected = items.find((task) => task.id === selectedTask.id);
         if (latestSelected) setSelectedTask(latestSelected);
       }
-      const activeConversationTask = conversation && items.some(
+      const activeConversationTask = activeView === "studio" && form.mode === "chat" && conversation && items.some(
         (task) => task.mode === "chat" && task.conversation_id === conversation.id && ["queued", "running", "done"].includes(task.status)
       );
       if (completedNow || activeConversationTask) {
         refreshGallery();
-        if (conversation) loadConversation(conversation.id, { openStudio: activeView === "studio" });
+        if (activeConversationTask) loadConversation(conversation.id, { openStudio: true });
       }
     } catch (err) {
       setError(describeError(err));
@@ -656,7 +685,7 @@ function App() {
 
   async function copyPromptEntry(item) {
     try {
-      await navigator.clipboard.writeText(item.content || "");
+      await copyTextToClipboard(item.content || "");
       setPromptCopyId(item.id);
       setTimeout(() => setPromptCopyId(null), 1400);
     } catch (err) {
@@ -688,7 +717,15 @@ function App() {
       });
       imagesByMessage.set(image.message_id, list);
     }
-    const hydrated = (data.messages || []).map((msg) => ({ ...msg, images: imagesByMessage.get(msg.id) || [] }));
+    const hydrated = (data.messages || []).map((msg) => ({
+      ...msg,
+      images: imagesByMessage.get(msg.id) || [],
+      uploaded_images: (msg.uploaded_images || []).map((image) => ({
+        ...image,
+        url: image.public_url || image.url,
+        filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "uploaded-image.png",
+      })),
+    }));
     setConversation(data.conversation);
     setMessages(hydrated);
     setForm((value) => ({ ...value, mode: "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
@@ -998,9 +1035,9 @@ function App() {
             {activeView === "studio" && (
               <div className="headActions">
                 {form.mode === "chat" && <button className="ghostButton" onClick={newChat}><RefreshCw size={17} /> 新对话</button>}
-                <button className="ghostButton" onClick={() => startTask({ openCreatedTask: true })} disabled={!form.prompt.trim() || atTaskLimit}>
+                {form.mode !== "chat" && <button className="ghostButton" onClick={newStudioTask}>
                   <Plus size={17} /> 新任务
-                </button>
+                </button>}
               </div>
             )}
           </div>
@@ -1063,7 +1100,7 @@ function App() {
               )}
             </div>
           ) : (
-            <Gallery items={[]} loading={loading} onDownload={downloadImage} />
+            <Gallery items={studioSubmissions[form.mode] || []} loading={loading} onDownload={downloadImage} />
           )}
 
           {activeView === "studio" && <form className="composer" onSubmit={handleSubmit}>
@@ -1099,8 +1136,8 @@ function App() {
                 onChange={(e) => setForm({ ...form, prompt: e.target.value })}
                 placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : "描述你想生成的画面..."}
               />
-              <button className={`sendButton ${latestModeTask ? "stop" : ""}`} disabled={submitDisabled}>
-                {latestModeTask ? <X size={20} /> : loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
+              <button className="sendButton" disabled={submitDisabled}>
+                {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
               </button>
             </div>
           </form>}
@@ -1126,14 +1163,19 @@ function SettingsGroup({ title, summary, open, onToggle, children }) {
 }
 
 function ErrorPanel({ error, onClose }) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState("idle");
   const detailText = error.displayDetail || error.detail || error.raw || error.summary;
   const copyText = error.copyDetail || error.detail || error.raw || error.summary;
 
   async function copyError() {
-    await navigator.clipboard.writeText(copyText);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1400);
+    setCopyState("copying");
+    try {
+      await copyTextToClipboard(copyText);
+      setCopyState("success");
+    } catch {
+      setCopyState("failed");
+    }
+    setTimeout(() => setCopyState("idle"), 1400);
   }
 
   return (
@@ -1144,7 +1186,9 @@ function ErrorPanel({ error, onClose }) {
           <span>{error.summary}</span>
         </div>
         <div className="errorActions">
-          <button type="button" onClick={copyError}><Copy size={15} /> {copied ? "已复制" : "复制原因"}</button>
+          <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
+            <Copy size={15} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
+          </button>
           <button type="button" onClick={onClose} title="关闭"><X size={15} /></button>
         </div>
       </div>
@@ -1278,6 +1322,13 @@ function HistoryPane({
                       ))}
                     </div>
                   )}
+                  {msg.uploaded_images?.length > 0 && (
+                    <div className="imageGrid uploadedImageGrid">
+                      {msg.uploaded_images.map((image) => (
+                        <ImageCard key={image.url} image={image} onDownload={onDownload} />
+                      ))}
+                    </div>
+                  )}
                 </article>
               ))}
             </div>
@@ -1353,15 +1404,20 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
 }
 
 function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState("idle");
   const isLive = ["queued", "running"].includes(task.status);
   const images = normalizeTaskImages(task);
   const errorText = task.error_detail ? formatTaskError(task.error_detail) : "";
 
   async function copyError() {
-    await navigator.clipboard.writeText(errorText || "暂无失败原因");
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1400);
+    setCopyState("copying");
+    try {
+      await copyTextToClipboard(errorText || "暂无失败原因");
+      setCopyState("success");
+    } catch {
+      setCopyState("failed");
+    }
+    setTimeout(() => setCopyState("idle"), 1400);
   }
 
   return (
@@ -1393,7 +1449,9 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onContinue }) {
         <section className="taskErrorBox">
           <div className="sectionTitle">
             <strong>失败原因</strong>
-            <button type="button" onClick={copyError}><Copy size={15} /> {copied ? "已复制" : "复制原因"}</button>
+            <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
+              <Copy size={15} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
+            </button>
           </div>
           <pre>{errorText}</pre>
         </section>
@@ -1469,7 +1527,9 @@ function PromptLibrary({
               </div>
               <p>{item.content}</p>
               <div className="promptCardActions">
-                <button type="button" onClick={() => onCopy(item)}><Copy size={15} /> {copiedId === item.id ? "已复制" : "复制"}</button>
+                <button className={`copyFeedbackButton ${copiedId === item.id ? "success" : ""}`} type="button" onClick={() => onCopy(item)}>
+                  <Copy size={15} /> {copiedId === item.id ? "复制成功" : "复制"}
+                </button>
                 <button type="button" onClick={() => onUse(item)}><Send size={15} /> 使用</button>
                 <button type="button" onClick={() => onEdit(item)}><Edit3 size={15} /> 修改</button>
                 <button type="button" onClick={() => onDelete(item.id)}><Trash2 size={15} /> 删除</button>
@@ -1522,6 +1582,11 @@ function Message({ msg, onDownload }) {
             {msg.previews.map((url) => <img key={url} src={url} alt="" />)}
           </div>
         )}
+        {msg.uploaded_images?.length > 0 && (
+          <div className="imageGrid uploadedImageGrid">
+            {msg.uploaded_images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
+          </div>
+        )}
         {msg.images?.length > 0 && (
           <div className="imageGrid">
             {msg.images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
@@ -1551,11 +1616,14 @@ function Gallery({ items, loading, onDownload }) {
       )}
       {items.map((item, index) => (
         <article className="resultGroup" key={`${item.prompt}-${index}`}>
-          <span>{item.mode}</span>
+          <span>已提交到后台</span>
           <h3>{item.prompt}</h3>
-          <div className="imageGrid">
-            {item.images.map((image) => <ImageCard key={image.url} image={image} onDownload={onDownload} />)}
-          </div>
+          <small>{formatTime(item.created_at)}，可切换页面或继续提交其它任务。</small>
+          {item.previews?.length > 0 && (
+            <div className="imageGrid uploadedImageGrid">
+              {item.previews.map((image) => <img key={image.url} src={image.url} alt={image.name || "uploaded"} />)}
+            </div>
+          )}
         </article>
       ))}
     </div>
@@ -1718,6 +1786,32 @@ function formatTaskError(error) {
   return typeof error === "string"
     ? compactString(error)
     : JSON.stringify(compactErrorForDisplay(error), null, 2);
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall through to the legacy path for HTTP deployments and strict mobile browsers.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const ok = document.execCommand("copy");
+  textarea.remove();
+  if (!ok) throw new Error("复制失败，请手动选择文本复制。");
+  return true;
 }
 
 function normalizeTaskImages(task) {
