@@ -187,6 +187,18 @@ function App() {
   const taskStatusRef = useRef({});
   const dbSettingsReadyRef = useRef(false);
   const dbSettingsTimerRef = useRef(null);
+  const activeViewRef = useRef(activeView);
+  const formModeRef = useRef(form.mode);
+  const conversationRef = useRef(conversation);
+  const selectedTaskRef = useRef(selectedTask);
+  const conversationLoadSeqRef = useRef(0);
+
+  useEffect(() => {
+    activeViewRef.current = activeView;
+    formModeRef.current = form.mode;
+    conversationRef.current = conversation;
+    selectedTaskRef.current = selectedTask;
+  }, [activeView, form.mode, conversation, selectedTask]);
 
   useEffect(() => {
     initializeSettings();
@@ -231,6 +243,9 @@ function App() {
   const activeProvider = providerForMode(form.mode);
 
   function switchView(view) {
+    if (view !== "studio") {
+      conversationLoadSeqRef.current += 1;
+    }
     setActiveView(view);
     if (window.innerWidth <= 760) {
       setControlsOpen(false);
@@ -503,16 +518,19 @@ function App() {
       taskStatusRef.current = Object.fromEntries(items.map((task) => [task.id, task.status]));
       setTasks(items);
       setTaskMeta({ active_count: data.active_count || 0, max_concurrent: data.max_concurrent || 3 });
-      if (selectedTask) {
-        const latestSelected = items.find((task) => task.id === selectedTask.id);
+      const currentSelectedTask = selectedTaskRef.current;
+      if (currentSelectedTask) {
+        const latestSelected = items.find((task) => task.id === currentSelectedTask.id);
         if (latestSelected) setSelectedTask(latestSelected);
       }
-      const activeConversationTask = activeView === "studio" && form.mode === "chat" && conversation && items.some(
-        (task) => task.mode === "chat" && task.conversation_id === conversation.id && ["queued", "running", "done"].includes(task.status)
+      const currentConversation = conversationRef.current;
+      const canRefreshCurrentChat = activeViewRef.current === "studio" && formModeRef.current === "chat" && currentConversation;
+      const activeConversationTask = canRefreshCurrentChat && items.some(
+        (task) => task.mode === "chat" && task.conversation_id === currentConversation.id && ["queued", "running", "done"].includes(task.status)
       );
       if (completedNow || activeConversationTask) {
         refreshGallery();
-        if (activeConversationTask) loadConversation(conversation.id, { openStudio: true });
+        if (activeConversationTask) loadConversation(currentConversation.id, { openStudio: true, autoRefresh: true });
       }
     } catch (err) {
       setError(describeError(err));
@@ -698,9 +716,23 @@ function App() {
     switchView("studio");
   }
 
-  async function loadConversation(id, { openStudio = true } = {}) {
+  async function loadConversation(id, { openStudio = true, autoRefresh = false } = {}) {
+    if (autoRefresh) {
+      const currentConversation = conversationRef.current;
+      if (activeViewRef.current !== "studio" || formModeRef.current !== "chat" || currentConversation?.id !== id) {
+        return;
+      }
+    }
+    const loadSeq = ++conversationLoadSeqRef.current;
     const res = await fetch(`${API}/api/conversations/${id}`);
     const data = await parse(res);
+    if (loadSeq !== conversationLoadSeqRef.current) return;
+    if (autoRefresh) {
+      const currentConversation = conversationRef.current;
+      if (activeViewRef.current !== "studio" || formModeRef.current !== "chat" || currentConversation?.id !== id) {
+        return;
+      }
+    }
     const imagesByMessage = new Map();
     for (const image of data.images || []) {
       const list = imagesByMessage.get(image.message_id) || [];
@@ -726,15 +758,18 @@ function App() {
         filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "uploaded-image.png",
       })),
     }));
-    setConversation(data.conversation);
-    setMessages(hydrated);
-    setForm((value) => ({ ...value, mode: "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
     setSelectedHistory({ ...data, messages: hydrated });
     setSelectedTask(null);
-    if (openStudio) setActiveView("studio");
+    if (openStudio) {
+      setConversation(data.conversation);
+      setMessages(hydrated);
+      setForm((value) => ({ ...value, mode: "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
+      setActiveView("studio");
+    }
   }
 
   async function loadTask(taskId) {
+    conversationLoadSeqRef.current += 1;
     const res = await fetch(`${API}/api/tasks/${taskId}`);
     const data = await parse(res);
     setSelectedTask(data.task);
