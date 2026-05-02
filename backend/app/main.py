@@ -213,6 +213,14 @@ def compact_params(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def clamp_image_count(value: Any) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, min(count, 10))
+
+
 def parse_params(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
@@ -1138,7 +1146,7 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
         title = request.prompt[:48] or f"task-{task_id}"
         bucket = task_image_folder(task_id, title)
         responses: list[dict[str, Any]] = []
-        image_items = []
+        saved_images: list[dict[str, Any]] = []
         for index in range(request.n):
             db.update_task(
                 task_id,
@@ -1162,13 +1170,17 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                 on_stream_event=lambda event: handle_image_stream_event(task_id, event),
             )
             responses.append(sanitize_response(response))
-            image_items.extend(extract_images_from_responses(response, request.output_format, folder=bucket))
+            image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
+            saved_images.extend(
+                public_task_image(item, task_id=task_id, title=title, bucket=bucket)
+                for item in image_items
+            )
             db.update_task(
                 task_id,
                 progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
-                stage=f"已收到第 {index + 1}/{request.n} 张结果",
+                stage=f"已保存第 {index + 1}/{request.n} 张结果",
             )
-        if not image_items:
+        if not saved_images:
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -1178,9 +1190,8 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                     "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
                 },
             )
-        db.update_task(task_id, progress=94, stage="正在保存图片")
-        images = [public_task_image(item, task_id=task_id, title=title, bucket=bucket) for item in image_items]
-        raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses}
+        db.update_task(task_id, progress=96, stage="正在整理任务结果")
+        raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses, "images": saved_images}
         db.finish_task(task_id, raw)
     await run_with_slot(task_id, worker)
 
@@ -1213,7 +1224,7 @@ async def edit_image(
             "prompt": prompt,
             "size": params.get("size", "1024x1024"),
             "quality": params.get("quality", "auto"),
-            "n": int(params.get("n", 1)),
+            "n": clamp_image_count(params.get("n", 1)),
             "background": params.get("background", "auto"),
             "output_format": params.get("output_format", "png"),
             "output_compression": params.get("output_compression"),
@@ -1244,9 +1255,9 @@ async def run_edit_task(
         bucket = task_image_folder(task_id, title)
         output_format = str(params.get("output_format", "png"))
         responses: list[dict[str, Any]] = []
-        image_items = []
+        saved_output_images: list[dict[str, Any]] = []
         client_config = ClientConfig(**params.get("config", {}))
-        count = int(params.get("n", 1))
+        count = clamp_image_count(params.get("n", 1))
         for index in range(count):
             db.update_task(
                 task_id,
@@ -1273,13 +1284,17 @@ async def run_edit_task(
                 on_stream_event=lambda event: handle_image_stream_event(task_id, event),
             )
             responses.append(sanitize_response(response))
-            image_items.extend(extract_images_from_responses(response, output_format, folder=bucket))
+            image_items = extract_images_from_responses(response, output_format, folder=bucket)
+            saved_output_images.extend(
+                public_task_image(item, task_id=task_id, title=title, bucket=bucket)
+                for item in image_items
+            )
             db.update_task(
                 task_id,
                 progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
-                stage=f"已收到第 {index + 1}/{count} 张编辑结果",
+                stage=f"已保存第 {index + 1}/{count} 张编辑结果",
             )
-        if not image_items:
+        if not saved_output_images:
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -1289,9 +1304,8 @@ async def run_edit_task(
                     "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
                 },
             )
-        db.update_task(task_id, progress=94, stage="正在保存图片")
-        images_out = [public_task_image(item, task_id=task_id, title=title, bucket=bucket) for item in image_items]
-        raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses}
+        db.update_task(task_id, progress=96, stage="正在整理任务结果")
+        raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses, "images": saved_output_images}
         db.finish_task(task_id, raw)
     await run_with_slot(task_id, worker)
 
