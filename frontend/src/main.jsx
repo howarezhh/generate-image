@@ -134,7 +134,7 @@ const defaults = {
   input_fidelity: "auto",
   partial_images: 0,
   context_limit: 10,
-  shot_limit: 6,
+  shot_limit: 20,
 };
 
 function persistableForm(form) {
@@ -163,7 +163,7 @@ function normalizeFormSettings(settings) {
     next.quality = defaults.quality;
   }
   const shotLimit = Number(next.shot_limit);
-  if (!Number.isFinite(shotLimit) || shotLimit < 1 || shotLimit > 12) {
+  if (!Number.isFinite(shotLimit) || shotLimit < 1 || shotLimit > 100) {
     next.shot_limit = defaults.shot_limit;
   }
   return next;
@@ -970,6 +970,21 @@ function App() {
     )));
   }
 
+  function updateStreamingMessageMeta(messageId, meta, conversationId) {
+    if (Number(conversationRef.current?.id) !== Number(conversationId) || !meta || typeof meta !== "object") return;
+    setMessages((items) => items.map((item) => {
+      if (Number(item.id) !== Number(messageId)) return item;
+      const nextMeta = { ...(item.meta || {}), ...meta };
+      return {
+        ...item,
+        meta: nextMeta,
+        image_error_detail: nextMeta.image_error || null,
+        image_status: nextMeta.image_status || "",
+        image_prompt: nextMeta.image_prompt || "",
+      };
+    }));
+  }
+
   function appendStreamingMessageImage(messageId, image, conversationId) {
     if (!image || Number(conversationRef.current?.id) !== Number(conversationId)) return;
     const normalizedImage = normalizeImageForClient(image);
@@ -1021,6 +1036,10 @@ function App() {
     source.addEventListener("assistant_reply", (event) => {
       const data = parseEventData(event);
       updateStreamingMessageContent(data.message_id, data.content || "", normalizedConversationId);
+    });
+    source.addEventListener("assistant_plan", (event) => {
+      const data = parseEventData(event);
+      updateStreamingMessageMeta(data.message_id, data.meta || {}, data.conversation_id || normalizedConversationId);
     });
     source.addEventListener("task_update", (event) => {
       const data = parseEventData(event);
@@ -1799,7 +1818,7 @@ function App() {
                   <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
                 </Field>
                 <Field label="最多镜头">
-                  <input type="number" min="1" max="12" value={form.shot_limit} onChange={(e) => setForm({ ...form, shot_limit: e.target.value })} />
+                  <input type="number" min="1" max="100" value={form.shot_limit} onChange={(e) => setForm({ ...form, shot_limit: e.target.value })} />
                 </Field>
                 <Field label="压缩 0-100">
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
@@ -2478,15 +2497,21 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
   );
 }
 
-function StoryboardProgress({ task }) {
-  const storyboard = task.params?.storyboard || task.response?.raw?.storyboard || task.response?.raw?.plan || {};
+function StoryboardProgress({ task = null, storyboard: storyboardProp = null, title = "分镜连续性", compact = false }) {
+  const storyboard = storyboardProp || resolveStoryboardState(task);
   const shots = Array.isArray(storyboard.shots) ? storyboard.shots : [];
   if (!storyboard.character_summary && !storyboard.scene_summary && shots.length === 0) return null;
   const doneCount = shots.filter((shot) => shot.status === "done").length;
+  const [expandedPrompts, setExpandedPrompts] = useState({});
+
+  function togglePrompt(key) {
+    setExpandedPrompts((current) => ({ ...current, [key]: !current[key] }));
+  }
+
   return (
-    <section className="storyboardProgress">
+    <section className={`storyboardProgress ${compact ? "compact" : ""}`}>
       <div className="sectionTitle">
-        <strong>分镜连续性</strong>
+        <strong>{title}</strong>
         <small>{doneCount}/{shots.length || 0} 张</small>
       </div>
       <div className="storyboardBrief">
@@ -2494,17 +2519,39 @@ function StoryboardProgress({ task }) {
         <p><b>场景概述</b>{storyboard.scene_summary || "AI 正在整理场景一致性信息"}</p>
       </div>
       {shots.length > 0 && (
+        <div className="storyboardPromptSummary">
+          <strong>本次计划生成 {shots.length} 张图</strong>
+          <small>已先列出全部镜头提示词，随后会按顺序逐张实时生图。</small>
+        </div>
+      )}
+      {shots.length > 0 && (
         <div className="shotTimeline">
-          {shots.map((shot, index) => (
-            <article className={`shotStep ${shot.status || "pending"}`} key={`${shot.name}-${index}`}>
+          {shots.map((shot, index) => {
+            const shotKey = `${shot.name || `镜头${index + 1}`}-${index}`;
+            const prompt = storyboardShotPrompt(shot);
+            const expanded = !!expandedPrompts[shotKey];
+            return (
+            <article className={`shotStep ${shot.status || "pending"}`} key={shotKey}>
               <span>{String(shot.order || index + 1).padStart(2, "0")}</span>
               <div>
                 <strong>{shot.name || `镜头${index + 1}`}</strong>
                 <small>{shot.status === "done" ? "已完成" : shot.status === "running" ? "生成中" : shot.status === "failed" ? "失败" : "等待中"}</small>
                 {shot.continuity && <p>{shot.continuity}</p>}
+                {prompt && (
+                  <button
+                    type="button"
+                    className={`shotPromptToggle ${expanded ? "expanded" : ""}`}
+                    onClick={() => togglePrompt(shotKey)}
+                    aria-expanded={expanded}
+                  >
+                    <span className="shotPromptLabel">生图提示词</span>
+                    <span className={`shotPromptText ${expanded ? "expanded" : ""}`}>{expanded ? prompt : storyboardPromptPreview(shot)}</span>
+                    <em>{expanded ? "点击收起" : "点击展开全部内容"}</em>
+                  </button>
+                )}
               </div>
             </article>
-          ))}
+          )})}
         </div>
       )}
     </section>
@@ -2716,9 +2763,29 @@ function ChatTaskProgress({ task }) {
         </div>
         <small>#{task.id} · {task.params?.action || task.mode} · 上游事件会实时写入这里</small>
         {providerName && <small>当前生图提供商：{providerName}</small>}
+        {task.mode === "storyboard" && <StoryboardProgress task={task} title="本次分镜计划" compact />}
       </div>
     </div>
   );
+}
+
+function resolveStoryboardState(source) {
+  if (!source || typeof source !== "object") return {};
+  if (source.params?.storyboard && typeof source.params.storyboard === "object") return source.params.storyboard;
+  if (source.response?.raw?.storyboard && typeof source.response.raw.storyboard === "object") return source.response.raw.storyboard;
+  if (source.response?.raw?.plan && typeof source.response.raw.plan === "object") return source.response.raw.plan;
+  if (source.storyboard && typeof source.storyboard === "object") return source.storyboard;
+  if (source.plan && typeof source.plan === "object") return source.plan;
+  return {};
+}
+
+function storyboardShotPrompt(shot) {
+  return String(shot?.execution_prompt || shot?.planner_prompt || shot?.prompt || "").trim();
+}
+
+function storyboardPromptPreview(shot) {
+  const singleLine = storyboardShotPrompt(shot).replace(/\s+/g, " ").trim();
+  return singleLine.length > 120 ? `${singleLine.slice(0, 120)}...` : singleLine;
 }
 
 function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {}, onRoleChange, uploadCount = 0 }) {
@@ -2793,11 +2860,13 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
 }
 
 function Message({ msg, onDownload, onPreview, previewImages = [] }) {
+  const storyboard = resolveStoryboardState(msg?.meta);
   return (
     <div className={`message ${msg.role}`}>
       <div className="avatar">{msg.role === "user" ? "你" : <Bot size={18} />}</div>
       <div className="bubble">
         <p>{msg.content}</p>
+        {msg.role === "assistant" && <StoryboardProgress storyboard={storyboard} title="本次分镜计划" compact />}
         {msg.image_error_detail && (
           <InlineErrorBox title="生图失败原因" error={msg.image_error_detail} />
         )}

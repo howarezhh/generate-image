@@ -1243,6 +1243,11 @@ textarea {
   margin-top: 14px;
 }
 
+.storyboardProgress.compact {
+  margin-top: 10px;
+  padding: 12px;
+}
+
 .storyboardBrief {
   display: grid;
   gap: 8px;
@@ -1258,6 +1263,22 @@ textarea {
 .storyboardBrief b {
   color: #eecb70;
   margin-right: 8px;
+}
+
+.storyboardPromptSummary {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.storyboardPromptSummary strong {
+  color: #f5f3ea;
+  font-size: 13px;
+}
+
+.storyboardPromptSummary small {
+  color: rgba(245, 243, 234, 0.62);
+  line-height: 1.5;
 }
 
 .shotTimeline {
@@ -1316,6 +1337,46 @@ textarea {
   color: rgba(245, 243, 234, 0.72);
   margin: 6px 0 0;
   line-height: 1.55;
+}
+
+.shotPromptToggle {
+  margin-top: 10px;
+  width: 100%;
+  border: 1px solid rgba(245, 243, 234, 0.12);
+  background: rgba(17, 19, 15, 0.42);
+  color: #f5f3ea;
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+  text-align: left;
+}
+
+.shotPromptLabel {
+  color: #eecb70;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.shotPromptText {
+  color: rgba(245, 243, 234, 0.82);
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shotPromptText.expanded {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
+}
+
+.shotPromptToggle em {
+  color: rgba(245, 243, 234, 0.58);
+  font-style: normal;
+  font-size: 12px;
 }
 
 .resultGroup {

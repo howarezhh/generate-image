@@ -163,7 +163,7 @@ class StoryboardRequest(BaseModel):
     input_fidelity: str = "high"
     partial_images: int = Field(default=0, ge=0, le=3)
     context_limit: int = Field(default=10, ge=0, le=50)
-    shot_limit: int = Field(default=6, ge=1, le=12)
+    shot_limit: int = Field(default=20, ge=1, le=100)
     reference_image_ids: list[int] = Field(default_factory=list)
     reference_image_roles: dict[str, str] = Field(default_factory=dict)
     upload_reference_roles: list[str] = Field(default_factory=list)
@@ -180,6 +180,7 @@ REFERENCE_ROLE_LABELS = {
 DEFAULT_REFERENCE_ROLE_ORDER = ("character", "scene", "wardrobe_prop")
 REFERENCE_ROLE_PRIORITY = {role: index for index, role in enumerate(("character", "scene", "wardrobe_prop", "style"))}
 CONVERSATION_MODES = {"chat", "storyboard", "generate", "edit"}
+MAX_STORYBOARD_SHOTS = 100
 
 
 def normalize_access_password(value: str) -> str:
@@ -1195,7 +1196,7 @@ def parse_storyboard_plan(text: str, shot_limit: int) -> dict[str, Any]:
         }
     shots: list[dict[str, Any]] = []
     raw_shots = parsed.get("shots") if isinstance(parsed.get("shots"), list) else []
-    for index, item in enumerate(raw_shots[: max(1, min(int(shot_limit), 12))], start=1):
+    for index, item in enumerate(raw_shots[: max(1, min(int(shot_limit), MAX_STORYBOARD_SHOTS))], start=1):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or f"{index:02d}-镜头{index}").strip()
@@ -1387,7 +1388,7 @@ def load_conversation_image_candidates(conversation_id: int, limit: int = 8) -> 
             order by i.id desc
             limit ?
             """,
-            (conversation_id, max(1, min(limit, 12))),
+            (conversation_id, max(1, min(limit, MAX_STORYBOARD_SHOTS))),
         ).fetchall()
     candidates: list[dict[str, Any]] = []
     for row in rows:
@@ -3184,6 +3185,7 @@ async def run_storyboard_task(
             "shots": plan.get("shots", []),
         }
         update_storyboard_task_state(task_id, task_payload, storyboard_state)
+        raw_for_meta_storyboard = copy.deepcopy(storyboard_state)
         db.update_task(
             task_id,
             progress=24,
@@ -3198,6 +3200,7 @@ async def run_storyboard_task(
             "context_limit": context_limit,
             "image_candidates": sanitize_reference_candidates(image_candidates),
         }
+        raw_for_meta["storyboard"] = raw_for_meta_storyboard
 
         with db.connect() as conn:
             conn.execute(
@@ -3206,6 +3209,17 @@ async def run_storyboard_task(
             )
         update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
         update_message_meta(assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
+        publish_task_snapshot(task_id)
+        publish_task_event(
+            task_id,
+            "assistant_plan",
+            {
+                "message_id": assistant_message_id,
+                "conversation_id": conversation_id,
+                "meta": {**raw_for_meta, "planner_status": "done"},
+            },
+            snapshot=True,
+        )
         publish_task_event(
             task_id,
             "assistant_reply",
@@ -3246,6 +3260,7 @@ async def run_storyboard_task(
                 update_storyboard_task_state(task_id, task_payload, storyboard_state)
                 progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
                 db.update_task(task_id, progress=progress, stage=f"正在使用 {provider['name']} 生成镜头 {index}/{total}：{shot_name}")
+                publish_task_snapshot(task_id)
                 continuity_prompt = "\n".join(
                     part
                     for part in [
@@ -3337,6 +3352,7 @@ async def run_storyboard_task(
                     shot["status"] = "failed"
                     shot["error"] = exc.detail
                     update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                    publish_task_snapshot(task_id)
                     raw_for_meta["image_status"] = "failed"
                     raw_for_meta["image_error"] = exc.detail
                     update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
@@ -3345,6 +3361,7 @@ async def run_storyboard_task(
                     shot["status"] = "failed"
                     shot["error"] = str(exc)
                     update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                    publish_task_snapshot(task_id)
                     raw_for_meta["image_status"] = "failed"
                     raw_for_meta["image_error"] = str(exc)
                     update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
@@ -3537,6 +3554,7 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
         bucket = task_image_folder(task_id, f"重试分镜-{old_task.get('prompt') or task_id}")
         db.update_task(task_id, progress=12, stage=f"准备从第 {done_count + 1}/{total} 个镜头继续")
         update_storyboard_task_state(task_id, payload, storyboard)
+        publish_task_snapshot(task_id)
         lease = await acquire_image_provider_slot(task_id)
         provider = lease["provider"]
         client_config = provider_client_config(provider)
@@ -3549,6 +3567,7 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                 shot["status"] = "running"
                 update_storyboard_task_state(task_id, payload, storyboard)
                 db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"正在使用 {provider['name']} 重试镜头 {index}/{total}：{shot_name}")
+                publish_task_snapshot(task_id)
                 edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
                 action = "edit" if edit_inputs else "generate"
                 try:
@@ -3613,11 +3632,13 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                     shot["status"] = "failed"
                     shot["error"] = exc.detail
                     update_storyboard_task_state(task_id, payload, storyboard)
+                    publish_task_snapshot(task_id)
                     raise
                 except Exception as exc:
                     shot["status"] = "failed"
                     shot["error"] = str(exc)
                     update_storyboard_task_state(task_id, payload, storyboard)
+                    publish_task_snapshot(task_id)
                     raise
             db.finish_task(
                 task_id,
