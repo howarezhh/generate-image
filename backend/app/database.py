@@ -56,6 +56,8 @@ def init_db() -> None:
                 conversation_id integer,
                 user_message_id integer,
                 assistant_message_id integer,
+                image_provider_id integer,
+                image_provider_name text,
                 cancel_requested integer not null default 0,
                 created_at text not null,
                 updated_at text not null
@@ -78,6 +80,7 @@ def init_db() -> None:
             create table if not exists conversations (
                 id integer primary key autoincrement,
                 title text not null,
+                mode text,
                 context_limit integer not null default 10,
                 previous_response_id text,
                 created_at text not null,
@@ -106,6 +109,7 @@ def init_db() -> None:
             );
             """
         )
+        ensure_column(conn, "conversations", "mode", "text")
         ensure_column(conn, "images", "title", "text")
         ensure_column(conn, "images", "bucket", "text")
         ensure_column(conn, "conversations", "context_limit", "integer not null default 10")
@@ -115,6 +119,8 @@ def init_db() -> None:
         ensure_column(conn, "tasks", "conversation_id", "integer")
         ensure_column(conn, "tasks", "user_message_id", "integer")
         ensure_column(conn, "tasks", "assistant_message_id", "integer")
+        ensure_column(conn, "tasks", "image_provider_id", "integer")
+        ensure_column(conn, "tasks", "image_provider_name", "text")
         ensure_column(conn, "tasks", "cancel_requested", "integer not null default 0")
         ensure_column(conn, "prompts", "source", "text not null default 'manual'")
         ensure_column(conn, "prompts", "mode", "text")

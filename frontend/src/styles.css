@@ -88,7 +88,6 @@ p {
   font-size: 13px;
 }
 
-.iconButton,
 .sendButton,
 .secondaryButton,
 .ghostButton {
@@ -101,16 +100,6 @@ p {
   align-items: center;
   justify-content: center;
   gap: 8px;
-}
-
-.iconButton {
-  width: 42px;
-}
-
-.iconButton.active {
-  background: #eecb70;
-  color: #11130f;
-  border-color: transparent;
 }
 
 .secondaryButton,
@@ -230,11 +219,64 @@ p {
   padding-top: 12px;
 }
 
+.providerModeGrid,
+.providerEditorGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+
+.fieldCompact {
+  margin-bottom: 0;
+}
+
+.fieldFull {
+  grid-column: 1 / -1;
+}
+
+.providerPoolStats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.providerPoolStats span {
+  border: 1px solid rgba(238, 203, 112, 0.2);
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: rgba(238, 203, 112, 0.08);
+  color: rgba(245, 243, 234, 0.84);
+  font-size: 12px;
+}
+
 .providerActions {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+  margin-top: 10px;
+}
+
+.settingsSaveAction {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.settingsSaveNotice {
+  min-height: 18px;
+  font-size: 12px;
+  color: rgba(245, 243, 234, 0.62);
+}
+
+.settingsSaveNotice.success {
+  color: #79d8c3;
+}
+
+.settingsSaveNotice.failed {
+  color: #ffb5a8;
 }
 
 .providerList {
@@ -270,6 +312,19 @@ p {
 .providerItem small {
   color: rgba(245, 243, 234, 0.56);
   margin-top: 3px;
+}
+
+.providerPoolToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: rgba(245, 243, 234, 0.82);
+  font-size: 12px;
+}
+
+.providerPoolToggle input {
+  margin: 0;
 }
 
 .providerItem > div:last-child {
@@ -349,10 +404,18 @@ textarea:focus {
   grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 
+.viewTabsBar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 22px 0;
+}
+
 .viewTabs {
+  flex: 1;
   display: flex;
   gap: 8px;
-  padding: 12px 22px 0;
+  padding: 0;
   overflow-x: auto;
 }
 
@@ -375,6 +438,28 @@ textarea:focus {
   background: #eecb70;
   color: #11130f;
   border-color: transparent;
+}
+
+.settingsToggle {
+  border: 0;
+  background: transparent;
+  color: rgba(245, 243, 234, 0.72);
+  min-height: 36px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  transition: color 140ms ease, opacity 140ms ease;
+}
+
+.settingsToggle:hover {
+  color: #f5f3ea;
+}
+
+.settingsToggle.active {
+  color: #eecb70;
 }
 
 .runningPanel {
@@ -602,6 +687,17 @@ textarea:focus {
   padding: 14px;
   border-top: 1px solid rgba(245, 243, 234, 0.12);
   background: rgba(17, 19, 15, 0.72);
+}
+
+.composerHint {
+  margin-bottom: 10px;
+  border: 1px solid rgba(238, 203, 112, 0.22);
+  border-radius: 8px;
+  padding: 10px 11px;
+  background: rgba(238, 203, 112, 0.08);
+  color: rgba(245, 243, 234, 0.84);
+  line-height: 1.6;
+  font-size: 13px;
 }
 
 .promptRow {
@@ -1009,6 +1105,66 @@ textarea {
   gap: 8px;
   overflow-x: auto;
   padding-bottom: 2px;
+}
+
+.selectedReferenceStrip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.selectedReferenceCard {
+  border: 1px solid rgba(238, 203, 112, 0.24);
+  border-radius: 10px;
+  background: rgba(17, 19, 15, 0.5);
+  overflow: hidden;
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.selectedReferenceCard img {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  border-radius: 8px;
+  display: block;
+}
+
+.selectedReferenceMeta {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.selectedReferenceMeta strong,
+.selectedReferenceMeta small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selectedReferenceMeta strong {
+  font-size: 13px;
+}
+
+.selectedReferenceMeta small {
+  color: rgba(245, 243, 234, 0.62);
+}
+
+.selectedReferenceRemove {
+  border: 1px solid rgba(245, 243, 234, 0.15);
+  background: rgba(245, 243, 234, 0.06);
+  color: rgba(245, 243, 234, 0.84);
+  min-height: 34px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
 }
 
 .referenceChoice {
@@ -1565,37 +1721,66 @@ textarea {
   border: 1px solid rgba(214, 76, 57, 0.34);
   background: rgba(214, 76, 57, 0.1);
   border-radius: 8px;
-  padding: 10px;
-}
-
-.taskMiniError .sectionTitle {
-  margin-bottom: 8px;
-}
-
-.taskMiniError pre {
-  margin: 0;
-  max-height: 180px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: #ffd9d1;
-  font-size: 12px;
-  line-height: 1.55;
 }
 
 .inlineErrorBox {
   border: 1px solid rgba(214, 76, 57, 0.34);
   background: rgba(214, 76, 57, 0.1);
   border-radius: 8px;
-  padding: 10px;
   margin: 10px 0;
 }
 
-.inlineErrorBox .sectionTitle {
+.errorSummaryToggle {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  text-align: left;
+}
+
+.errorSummaryToggle > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.errorSummaryToggle strong {
+  color: #ffd9d1;
+}
+
+.errorSummaryToggle span {
+  color: #ffe8e2;
+  font-size: 12px;
+  line-height: 1.5;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.errorSummaryToggle svg {
+  color: rgba(255, 217, 209, 0.78);
+  transition: transform 140ms ease;
+}
+
+.inlineErrorBox.open .errorSummaryToggle svg {
+  transform: rotate(180deg);
+}
+
+.errorDetailBody {
+  padding: 0 10px 10px;
+}
+
+.errorDetailBody .sectionTitle {
   margin-bottom: 8px;
 }
 
-.inlineErrorBox pre {
+.errorDetailBody pre {
   margin: 0;
   max-height: 210px;
   overflow: auto;
@@ -1665,15 +1850,9 @@ textarea {
   margin-bottom: 0;
 }
 
-.taskErrorBox pre {
+.taskErrorBox .errorDetailBody pre,
+.taskMiniError .errorDetailBody pre {
   max-height: 260px;
-  overflow: auto;
-  margin: 0;
-  color: #ffd9d1;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 12px;
-  line-height: 1.55;
 }
 
 .detailEmpty {
@@ -1713,9 +1892,59 @@ textarea {
   margin-bottom: 14px;
 }
 
-.galleryGroup > div:first-child {
+.galleryGroupHead {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.galleryGroupMeta {
+  min-width: 0;
   display: grid;
   gap: 4px;
+}
+
+.paneToolbarActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.paneToolbarActions select {
+  min-height: 34px;
+  border-radius: 8px;
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  background: rgba(17, 19, 15, 0.5);
+  color: #f5f3ea;
+  padding: 0 10px;
+}
+
+.galleryGroupToggle {
+  flex: 0 0 auto;
+  border: 1px solid rgba(245, 243, 234, 0.15);
+  background: rgba(245, 243, 234, 0.055);
+  color: rgba(245, 243, 234, 0.82);
+  min-height: 34px;
+  border-radius: 8px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+.galleryGroupToggle:hover {
+  border-color: rgba(238, 203, 112, 0.42);
+  color: #f5f3ea;
+}
+
+.galleryGroupHint {
+  display: block;
+  margin-top: 10px;
+  line-height: 1.6;
 }
 
 .promptLibrary {
@@ -1886,7 +2115,6 @@ textarea {
     height: auto;
     padding: 12px;
     align-items: flex-start;
-    gap: 12px;
   }
 
   .brand {
@@ -1909,10 +2137,6 @@ textarea {
     margin-top: 2px;
     white-space: normal;
     line-height: 1.4;
-  }
-
-  .topbar .iconButton {
-    flex: 0 0 auto;
   }
 
   .workspace {
@@ -1957,8 +2181,13 @@ textarea {
     gap: 6px;
   }
 
-  .viewTabs {
+  .viewTabsBar {
     padding: 10px 10px 0;
+    gap: 10px;
+    align-items: flex-start;
+  }
+
+  .viewTabs {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
@@ -1970,6 +2199,21 @@ textarea {
     justify-content: center;
     padding: 0 6px;
     font-size: 14px;
+  }
+
+  .settingsToggle {
+    min-height: 38px;
+    padding: 0 2px;
+  }
+
+  .providerModeGrid,
+  .providerEditorGrid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .fieldFull {
+    grid-column: auto;
   }
 
   .headActions {
@@ -2107,6 +2351,15 @@ textarea {
     padding: 14px;
   }
 
+  .galleryGroupHead {
+    display: grid;
+    gap: 10px;
+  }
+
+  .galleryGroupToggle {
+    width: 100%;
+  }
+
   .historyList {
     border-right: 0;
     border-bottom: 1px solid rgba(245, 243, 234, 0.12);
@@ -2117,6 +2370,20 @@ textarea {
   .historyMeta .secondaryButton,
   .historyMeta .ghostButton {
     min-height: 40px;
+  }
+
+  .settingsSaveAction {
+    justify-items: stretch;
+  }
+
+  .settingsSaveAction button,
+  .paneToolbarActions select {
+    width: 100%;
+  }
+
+  .paneToolbarActions {
+    width: 100%;
+    justify-content: stretch;
   }
 
   .historyItemTop {
@@ -2291,14 +2558,31 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .viewTabs {
+  .viewTabsBar {
     padding: 8px 8px 0;
+    gap: 8px;
+  }
+
+  .viewTabs {
     gap: 8px;
   }
 
   .viewTabs button {
     min-height: 38px;
     font-size: 13px;
+  }
+
+  .galleryGroup {
+    padding: 12px;
+  }
+
+  .settingsToggle {
+    min-height: 38px;
+    font-size: 13px;
+  }
+
+  .errorSummaryToggle {
+    grid-template-columns: 1fr;
   }
 
   .chatPane,

@@ -22,11 +22,11 @@ import {
   KeyRound,
   Loader2,
   MessageCircle,
-  PanelLeft,
   Plus,
   RefreshCw,
   Send,
   Search,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   Wand2,
@@ -35,7 +35,7 @@ import {
 import "./styles.css";
 
 const API = "";
-const APP_SETTINGS_VERSION = 4;
+const APP_SETTINGS_VERSION = 5;
 
 const defaultConfig = {
   base_url: "https://api.asxs.top/v1",
@@ -169,12 +169,51 @@ function normalizeFormSettings(settings) {
   return next;
 }
 
+function uniqueProviderIds(values) {
+  const seen = new Set();
+  const ids = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const id = String(value || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
 function optionLabel(options, value) {
   return options.find((option) => option.value === value)?.label || value;
 }
 
 function modeLabel(mode) {
   return { chat: "对话", storyboard: "分镜", generate: "生图", edit: "编辑" }[mode] || mode;
+}
+
+function continueLabel(mode) {
+  return { chat: "继续对话", storyboard: "继续分镜", generate: "继续生图", edit: "继续编辑" }[mode] || "继续";
+}
+
+function taskProviderName(task) {
+  return (
+    task?.image_provider_name ||
+    task?.response?.raw?.image_provider?.name ||
+    task?.response?.image_provider?.name ||
+    ""
+  );
+}
+
+function isConversationalMode(mode) {
+  return ["chat", "storyboard"].includes(mode);
+}
+
+function isSessionMode(mode) {
+  return ["chat", "storyboard", "generate", "edit"].includes(mode);
+}
+
+function resolveConversationMode(conversation) {
+  if (!conversation) return "";
+  const mode = String(conversation.mode || conversation.latest_task_mode || "").trim();
+  return isSessionMode(mode) ? mode : "chat";
 }
 
 function defaultReferenceRole(index) {
@@ -206,6 +245,7 @@ function App() {
   const [editingProviderId, setEditingProviderId] = useState(null);
   const [modeProviders, setModeProviders] = useState({ chat: "", storyboard: "", generate: "", edit: "" });
   const [plannerProviders, setPlannerProviders] = useState({ chat: "", storyboard: "" });
+  const [imageProviderPool, setImageProviderPool] = useState([]);
   const [form, setForm] = useState(() => ({
     ...defaults,
     prompt: "",
@@ -222,11 +262,23 @@ function App() {
   const [editingPromptId, setEditingPromptId] = useState(null);
   const [promptCopyId, setPromptCopyId] = useState(null);
   const [refreshFeedback, setRefreshFeedback] = useState({});
+  const [sectionSaveFeedback, setSectionSaveFeedback] = useState({});
   const [conversations, setConversations] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
   const [tasks, setTasks] = useState([]);
-  const [taskMeta, setTaskMeta] = useState({ active_count: 0, max_concurrent: 3 });
+  const [taskMeta, setTaskMeta] = useState({
+    active_count: 0,
+    max_concurrent: 3,
+    image_provider_pool: {
+      total_providers: 0,
+      used_providers: 0,
+      idle_providers: 0,
+      limit_per_provider: 3,
+      total_capacity: 3,
+      providers: [],
+    },
+  });
   const [activeView, setActiveView] = useState("studio");
   const [conversation, setConversation] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -238,7 +290,6 @@ function App() {
   const [chatUploadRoles, setChatUploadRoles] = useState({});
   const [chatReferenceRoles, setChatReferenceRoles] = useState({});
   const [previewState, setPreviewState] = useState(null);
-  const [copied, setCopied] = useState("");
   const [runningPanelOpen, setRunningPanelOpen] = useState(false);
   const scrollRef = useRef(null);
   const taskStatusRef = useRef({});
@@ -275,17 +326,6 @@ function App() {
       taskEventConversationIdsRef.current.clear();
     };
   }, []);
-
-  useEffect(() => {
-    if (!dbSettingsReadyRef.current) return;
-    if (dbSettingsTimerRef.current) clearTimeout(dbSettingsTimerRef.current);
-    dbSettingsTimerRef.current = setTimeout(() => {
-      saveAppSettings();
-    }, 500);
-    return () => {
-      if (dbSettingsTimerRef.current) clearTimeout(dbSettingsTimerRef.current);
-    };
-  }, [config, form, modeProviders, plannerProviders]);
 
   useEffect(() => {
     refreshHistory();
@@ -338,16 +378,18 @@ function App() {
 
   const runningTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
   const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
-  const submitDisabled = loading || !form.prompt.trim() || atTaskLimit;
-  const activeProvider = providerForMode(form.mode);
+  const activeConversationMode = resolveConversationMode(conversation);
   const activePlannerProvider = ["chat", "storyboard"].includes(form.mode) ? providerForPlannerMode(form.mode) : null;
+  const imageProviderPoolMeta = taskMeta.image_provider_pool || { total_providers: 0, used_providers: 0, idle_providers: 0, limit_per_provider: 3, total_capacity: 3, providers: [] };
   const chatGeneratedImages = useMemo(() => uniqueImages(
     messages.flatMap((msg) => msg.images || [])
   ), [messages]);
-  const liveChatTasks = useMemo(() => {
+  const liveConversationTasks = useMemo(() => {
     if (!conversation) return [];
     return tasks.filter((task) => Number(task.conversation_id) === Number(conversation.id) && ["queued", "running"].includes(task.status));
   }, [tasks, conversation]);
+  const activeConversationLocked = isSessionMode(form.mode) && !!conversation && activeConversationMode === form.mode && liveConversationTasks.length > 0;
+  const submitDisabled = loading || !form.prompt.trim() || atTaskLimit || activeConversationLocked;
 
   function switchView(view) {
     if (view !== "studio") {
@@ -359,20 +401,13 @@ function App() {
     }
   }
 
-  function providerForMode(mode) {
-    const providerId = modeProviders[mode];
-    return providers.find((provider) => String(provider.id) === String(providerId)) || providers[0] || null;
-  }
-
   function providerForPlannerMode(mode) {
     const providerId = plannerProviders[mode] || modeProviders[mode];
-    return providers.find((provider) => String(provider.id) === String(providerId)) || providerForMode(mode);
+    return providers.find((provider) => String(provider.id) === String(providerId)) || null;
   }
 
   function configForMode(mode) {
-    const provider = providerForMode(mode);
-    if (!provider) return config;
-    return { base_url: provider.base_url, api_key: provider.api_key };
+    return { ...config };
   }
 
   function openImagePreview(images, index = 0) {
@@ -400,12 +435,17 @@ function App() {
     return { base_url: provider.base_url, api_key: provider.api_key };
   }
 
-  async function ensureConversation() {
-    if (conversation) return conversation;
+  async function ensureConversation(targetMode = formModeRef.current) {
+    const currentConversation = conversationRef.current;
+    if (currentConversation && resolveConversationMode(currentConversation) === targetMode) return currentConversation;
     const res = await fetch(`${API}/api/conversations`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: form.prompt.slice(0, 24) || "新的生图对话", context_limit: Number(form.context_limit) }),
+      body: JSON.stringify({
+        title: form.prompt.slice(0, 24) || "新的生图对话",
+        context_limit: Number(form.context_limit),
+        mode: isSessionMode(targetMode) ? targetMode : null,
+      }),
     });
     const data = await parse(res);
     setConversation(data);
@@ -524,6 +564,10 @@ function App() {
       setError(describeError({ detail: { message: `已有 ${taskMeta.max_concurrent || 3} 个任务运行或排队，请等待完成后再创建新任务。` } }));
       return;
     }
+    if (activeConversationLocked) {
+      setError(describeError({ detail: { message: `当前${modeLabel(form.mode)}会话仍有任务运行中，请先停止该会话任务，或点击“新任务”新开对话后再继续发送。` } }));
+      return;
+    }
     setLoading(true);
     try {
       if (form.mode === "generate") {
@@ -567,8 +611,8 @@ function App() {
   }
 
   function newStudioTask() {
-    if (["chat", "storyboard"].includes(form.mode)) {
-      newChat();
+    if (isSessionMode(form.mode)) {
+      newChat(form.mode);
       return;
     }
     setStudioSubmissions((current) => ({ ...current, [form.mode]: [] }));
@@ -582,9 +626,20 @@ function App() {
   }
 
   async function runGenerate() {
+    await saveAppSettings({ throwError: true });
+    const active = await ensureConversation("generate");
+    const localUser = {
+      id: `u-${Date.now()}`,
+      role: "user",
+      content: form.prompt,
+      images: [],
+      uploaded_images: [],
+    };
+    setMessages((items) => [...items, localUser]);
     const runConfig = configForMode("generate");
     const body = {
       prompt: form.prompt,
+      conversation_id: active.id,
       model: form.model,
       image_model: form.imageModel,
       size: form.size,
@@ -604,10 +659,14 @@ function App() {
       body: JSON.stringify(body),
     });
     const data = await parse(res);
+    if (data.user_message_id) {
+      setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: data.user_message_id } : item)));
+    }
     mergeTask(data.task);
     await refreshTasks();
     await refreshHistory();
     await refreshPrompts();
+    await loadConversation(active.id, { openStudio: true, autoRefresh: true });
     return data.task;
   }
 
@@ -615,10 +674,30 @@ function App() {
     if (!editImages.length) {
       throw new Error("编辑模式至少上传一张图片");
     }
+    await saveAppSettings({ throwError: true });
+    const active = await ensureConversation("edit");
+    const localUploads = [...editImages].map((file) => {
+      const previewUrl = URL.createObjectURL(file);
+      return {
+        id: `upload-${file.name}-${Date.now()}`,
+        url: previewUrl,
+        public_url: previewUrl,
+        filename: file.name,
+      };
+    });
+    const localUser = {
+      id: `u-${Date.now()}`,
+      role: "user",
+      content: form.prompt,
+      images: [],
+      uploaded_images: localUploads,
+    };
+    setMessages((items) => [...items, localUser]);
     const data = new FormData();
     const runConfig = configForMode("edit");
     const params = {
       prompt: form.prompt,
+      conversation_id: active.id,
       model: form.model,
       image_model: form.imageModel,
       size: form.size,
@@ -637,15 +716,20 @@ function App() {
     if (editMask) data.append("mask", editMask);
     const res = await fetch(`${API}/api/images/edit`, { method: "POST", body: data });
     const result = await parse(res);
+    if (result.user_message_id) {
+      setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
+    }
     mergeTask(result.task);
     await refreshTasks();
     await refreshHistory();
     await refreshPrompts();
+    await loadConversation(active.id, { openStudio: true, autoRefresh: true });
     return result.task;
   }
 
   async function runChat() {
-    const active = await ensureConversation();
+    await saveAppSettings({ throwError: true });
+    const active = await ensureConversation("chat");
     const localUser = {
       id: `u-${Date.now()}`,
       role: "user",
@@ -698,7 +782,8 @@ function App() {
   }
 
   async function runStoryboard() {
-    const active = await ensureConversation();
+    await saveAppSettings({ throwError: true });
+    const active = await ensureConversation("storyboard");
     const localUser = {
       id: `u-${Date.now()}`,
       role: "user",
@@ -768,6 +853,11 @@ function App() {
       if (value.modeProviders) {
         setModeProviders({ chat: "", storyboard: "", generate: "", edit: "", ...value.modeProviders });
       }
+      if (value.imageProviderPool) {
+        setImageProviderPool(uniqueProviderIds(value.imageProviderPool));
+      } else if (value.modeProviders) {
+        setImageProviderPool(uniqueProviderIds(Object.values(value.modeProviders)));
+      }
       if (value.plannerProviders) {
         setPlannerProviders({ chat: "", storyboard: "", ...value.plannerProviders });
       } else if (value.modeProviders) {
@@ -794,13 +884,18 @@ function App() {
     await loadAppSettings();
   }
 
-  async function saveAppSettings() {
+  async function saveAppSettings(options = {}) {
+    if (dbSettingsTimerRef.current) {
+      clearTimeout(dbSettingsTimerRef.current);
+      dbSettingsTimerRef.current = null;
+    }
     const value = {
       settings_version: APP_SETTINGS_VERSION,
       config,
       form: persistableForm(form),
       modeProviders,
       plannerProviders,
+      imageProviderPool,
     };
     try {
       await fetch(`${API}/api/app-settings`, {
@@ -810,6 +905,7 @@ function App() {
       });
     } catch (err) {
       setError(describeError(err));
+      if (options.throwError) throw err;
     }
   }
 
@@ -959,16 +1055,21 @@ function App() {
       });
       taskStatusRef.current = Object.fromEntries(items.map((task) => [task.id, task.status]));
       setTasks(items);
-      setTaskMeta({ active_count: data.active_count || 0, max_concurrent: data.max_concurrent || 3 });
+      setTaskMeta((current) => ({
+        ...current,
+        active_count: data.active_count || 0,
+        max_concurrent: data.max_concurrent || 3,
+        image_provider_pool: data.image_provider_pool || current.image_provider_pool,
+      }));
       const currentSelectedTask = selectedTaskRef.current;
       if (currentSelectedTask) {
         const latestSelected = items.find((task) => task.id === currentSelectedTask.id);
         if (latestSelected) setSelectedTask(latestSelected);
       }
       const currentConversation = conversationRef.current;
-      const canRefreshCurrentChat = activeViewRef.current === "studio" && ["chat", "storyboard"].includes(formModeRef.current) && currentConversation;
-      const activeConversationTask = canRefreshCurrentChat && items.some(
-        (task) => ["chat", "storyboard"].includes(task.mode) && task.conversation_id === currentConversation.id && ["queued", "running", "done"].includes(task.status)
+      const canRefreshCurrentConversation = activeViewRef.current === "studio" && isSessionMode(formModeRef.current) && currentConversation;
+      const activeConversationTask = canRefreshCurrentConversation && items.some(
+        (task) => isSessionMode(task.mode) && task.conversation_id === currentConversation.id && ["queued", "running", "done"].includes(task.status)
       );
       if (completedNow || activeConversationTask) {
         refreshGallery();
@@ -989,6 +1090,7 @@ function App() {
   }
 
   async function retryTask(taskId) {
+    await saveAppSettings({ throwError: true });
     const res = await fetch(`${API}/api/tasks/${taskId}/retry`, { method: "POST" });
     const data = await parse(res);
     mergeTask(data.task);
@@ -1043,8 +1145,28 @@ function App() {
     });
     await parse(res);
     await saveAppSettings();
-    setCopied("配置已保存");
-    setTimeout(() => setCopied(""), 1400);
+  }
+
+  function setSettingsFeedback(section, state, message) {
+    setSectionSaveFeedback((current) => ({ ...current, [section]: { state, message } }));
+    window.setTimeout(() => {
+      setSectionSaveFeedback((current) => {
+        if (!current[section] || current[section].message !== message) return current;
+        const next = { ...current };
+        delete next[section];
+        return next;
+      });
+    }, 1800);
+  }
+
+  async function saveSettingsSection(section, successMessage) {
+    setSettingsFeedback(section, "loading", "正在保存...");
+    try {
+      await saveAppSettings({ throwError: true });
+      setSettingsFeedback(section, "success", successMessage);
+    } catch {
+      setSettingsFeedback(section, "failed", "保存失败");
+    }
   }
 
   async function refreshProviders() {
@@ -1053,6 +1175,12 @@ function App() {
       const data = await parse(res);
       const items = data.items || [];
       setProviders(items);
+      const apiPoolIds = uniqueProviderIds((data.image_provider_pool?.providers || []).map((provider) => provider.id));
+      setTaskMeta((current) => ({
+        ...current,
+        image_provider_pool: data.image_provider_pool || current.image_provider_pool,
+        max_concurrent: data.image_provider_pool?.total_capacity || current.max_concurrent || 3,
+      }));
       if (items.length) {
         const ids = new Set(items.map((provider) => String(provider.id)));
         setModeProviders((current) => ({
@@ -1065,6 +1193,14 @@ function App() {
           chat: ids.has(String(current.chat)) ? current.chat : String(items[0].id),
           storyboard: ids.has(String(current.storyboard)) ? current.storyboard : String(items[0].id),
         }));
+        setImageProviderPool((current) => {
+          const next = uniqueProviderIds(current).filter((id) => ids.has(String(id)));
+          if (next.length) return next;
+          if (apiPoolIds.length) return apiPoolIds;
+          return items.map((provider) => String(provider.id));
+        });
+      } else {
+        setImageProviderPool([]);
       }
     } catch (err) {
       setError(describeError(err));
@@ -1072,27 +1208,32 @@ function App() {
   }
 
   async function saveProvider() {
-    const payload = {
-      name: providerDraft.name.trim(),
-      base_url: providerDraft.base_url.trim(),
-      api_key: providerDraft.api_key.trim(),
-    };
-    if (!payload.name || !payload.base_url) {
-      setError(describeError({ detail: { message: "提供商名称和接口地址不能为空" } }));
-      return;
+    try {
+      const payload = {
+        name: providerDraft.name.trim(),
+        base_url: providerDraft.base_url.trim(),
+        api_key: providerDraft.api_key.trim(),
+      };
+      if (!payload.name || !payload.base_url) {
+        setError(describeError({ detail: { message: "提供商名称和接口地址不能为空" } }));
+        setSettingsFeedback("providers", "failed", "保存失败");
+        return;
+      }
+      const url = editingProviderId ? `${API}/api/providers/${editingProviderId}` : `${API}/api/providers`;
+      const res = await fetch(url, {
+        method: editingProviderId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const saved = await parse(res);
+      await refreshProviders();
+      setProviderDraft({ name: "", base_url: "", api_key: "" });
+      setEditingProviderId(null);
+      setSettingsFeedback("providers", "success", `已保存 ${saved.name}`);
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("providers", "failed", "保存失败");
     }
-    const url = editingProviderId ? `${API}/api/providers/${editingProviderId}` : `${API}/api/providers`;
-    const res = await fetch(url, {
-      method: editingProviderId ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const saved = await parse(res);
-    await refreshProviders();
-    setProviderDraft({ name: "", base_url: "", api_key: "" });
-    setEditingProviderId(null);
-    setCopied(`已保存 ${saved.name}`);
-    setTimeout(() => setCopied(""), 1400);
   }
 
   function editProvider(provider) {
@@ -1101,41 +1242,63 @@ function App() {
   }
 
   async function deleteProvider(providerId) {
-    const res = await fetch(`${API}/api/providers/${providerId}`, { method: "DELETE" });
-    await parse(res);
-    setModeProviders((current) => {
-      const fallback = providers.find((provider) => provider.id !== providerId);
-      const fallbackId = fallback ? String(fallback.id) : "";
-      return {
-        chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
-        storyboard: String(current.storyboard) === String(providerId) ? fallbackId : current.storyboard,
-        generate: String(current.generate) === String(providerId) ? fallbackId : current.generate,
-        edit: String(current.edit) === String(providerId) ? fallbackId : current.edit,
-      };
-    });
-    setPlannerProviders((current) => {
-      const fallback = providers.find((provider) => provider.id !== providerId);
-      const fallbackId = fallback ? String(fallback.id) : "";
-      return {
-        chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
-        storyboard: String(current.storyboard) === String(providerId) ? fallbackId : current.storyboard,
-      };
-    });
-    await refreshProviders();
+    try {
+      const res = await fetch(`${API}/api/providers/${providerId}`, { method: "DELETE" });
+      await parse(res);
+      setModeProviders((current) => {
+        const fallback = providers.find((provider) => provider.id !== providerId);
+        const fallbackId = fallback ? String(fallback.id) : "";
+        return {
+          chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
+          storyboard: String(current.storyboard) === String(providerId) ? fallbackId : current.storyboard,
+          generate: String(current.generate) === String(providerId) ? fallbackId : current.generate,
+          edit: String(current.edit) === String(providerId) ? fallbackId : current.edit,
+        };
+      });
+      setPlannerProviders((current) => {
+        const fallback = providers.find((provider) => provider.id !== providerId);
+        const fallbackId = fallback ? String(fallback.id) : "";
+        return {
+          chat: String(current.chat) === String(providerId) ? fallbackId : current.chat,
+          storyboard: String(current.storyboard) === String(providerId) ? fallbackId : current.storyboard,
+        };
+      });
+      setImageProviderPool((current) => {
+        const next = current.filter((id) => String(id) !== String(providerId));
+        if (next.length) return next;
+        const fallback = providers.find((provider) => provider.id !== providerId);
+        return fallback ? [String(fallback.id)] : [];
+      });
+      await refreshProviders();
+      setSettingsFeedback("providers", "success", "提供商已删除");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("providers", "failed", "删除失败");
+    }
   }
 
-  function syncProviderToAll(providerId) {
-    setModeProviders({ chat: providerId, storyboard: providerId, generate: providerId, edit: providerId });
-    setPlannerProviders({ chat: providerId, storyboard: providerId });
+  function toggleImageProvider(providerId) {
+    const normalizedId = String(providerId);
+    setImageProviderPool((current) => {
+      const exists = current.includes(normalizedId);
+      if (exists && current.length <= 1) {
+        setError(describeError({ detail: { message: "生图提供商池至少保留一个提供商。" } }));
+        return current;
+      }
+      if (exists) return current.filter((id) => id !== normalizedId);
+      return [...current, normalizedId];
+    });
   }
 
-  async function newChat() {
+  async function newChat(targetMode = formModeRef.current) {
     setConversation(null);
     setMessages([]);
     setChatImages([]);
     setChatReferenceImages([]);
     setChatUploadRoles({});
     setChatReferenceRoles({});
+    setSelectedTask(null);
+    setForm((value) => ({ ...value, mode: targetMode }));
     setActiveView("studio");
   }
 
@@ -1257,7 +1420,7 @@ function App() {
     const previousConversationId = conversationRef.current?.id;
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
-      if (activeViewRef.current !== "studio" || !["chat", "storyboard"].includes(formModeRef.current) || currentConversation?.id !== id) {
+      if (activeViewRef.current !== "studio" || !isSessionMode(formModeRef.current) || currentConversation?.id !== id) {
         return;
       }
     }
@@ -1267,7 +1430,7 @@ function App() {
     if (loadSeq !== conversationLoadSeqRef.current) return;
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
-      if (activeViewRef.current !== "studio" || !["chat", "storyboard"].includes(formModeRef.current) || currentConversation?.id !== id) {
+      if (activeViewRef.current !== "studio" || !isSessionMode(formModeRef.current) || currentConversation?.id !== id) {
         return;
       }
     }
@@ -1309,10 +1472,10 @@ function App() {
     setSelectedTask(null);
     if (openStudio) {
       const switchingConversation = Number(previousConversationId) !== Number(data.conversation.id);
-      setConversation(data.conversation);
+      const conversationMode = resolveConversationMode(data.conversation);
+      setConversation({ ...data.conversation, mode: conversationMode });
       setMessages(hydrated);
-      const hasStoryboardTask = (data.tasks || []).some((task) => task.mode === "storyboard");
-      setForm((value) => ({ ...value, mode: hasStoryboardTask ? "storyboard" : "chat", context_limit: data.conversation.context_limit ?? value.context_limit }));
+      setForm((value) => ({ ...value, mode: conversationMode, context_limit: data.conversation.context_limit ?? value.context_limit }));
       if (switchingConversation) {
         setChatImages([]);
         setChatReferenceImages([]);
@@ -1366,30 +1529,41 @@ function App() {
     }
   }
 
+  async function historyImageToFile(image) {
+    const response = await fetch(image.public_url || image.url);
+    const blob = await response.blob();
+    const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
+    return new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
+  }
+
   async function useImageAsReference(image) {
-    const targetMode = formModeRef.current === "storyboard" || image.task_mode === "storyboard" ? "storyboard" : "chat";
+    const targetMode = image.task_mode === "storyboard" ? "storyboard" : "chat";
+    let useConversationReference = false;
     if (image.conversation_id) {
       await loadConversation(image.conversation_id, { openStudio: true });
+      if (resolveConversationMode(conversationRef.current) !== targetMode) {
+        await newChat(targetMode);
+      } else if (image.id && image.source === "api") {
+        useConversationReference = true;
+      }
     } else {
       setActiveView("studio");
       setForm((value) => ({ ...value, mode: targetMode }));
     }
-    if (image.id) {
+    if (useConversationReference) {
       const normalized = normalizeImageForClient(image);
       setChatReferenceImages([normalized]);
       setChatReferenceRoles({ [String(normalized.id)]: "character" });
       setChatImages([]);
       setChatUploadRoles({});
     } else {
-      const response = await fetch(image.public_url || image.url);
-      const blob = await response.blob();
-      const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
-      const file = new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
+      const file = await historyImageToFile(image);
       setChatImages([file]);
       setChatUploadRoles({ [uploadFileRoleKey(file, 0)]: "character" });
       setChatReferenceImages([]);
       setChatReferenceRoles({});
     }
+    setActiveView("studio");
     setForm((value) => ({ ...value, prompt: "", mode: targetMode, action: targetMode === "chat" ? "edit" : value.action }));
   }
 
@@ -1429,20 +1603,23 @@ function App() {
             <span>个人生图工作台</span>
           </div>
         </div>
-        <button className={`iconButton ${controlsOpen ? "active" : ""}`} onClick={() => setControlsOpen((v) => !v)} title="配置">
-          <PanelLeft size={20} />
-        </button>
       </header>
 
       <section className={`workspace ${controlsOpen ? "withControls" : "withoutControls"}`}>
         {controlsOpen && (
-        <aside className="controls">
+        <aside className="controls" id="studio-controls">
           <div className="modeSwitch">
             {modeOptions.map(({ value, icon: Icon, label, help }) => (
               <button
                 key={value}
                 className={form.mode === value ? "active" : ""}
-                onClick={() => setForm((f) => ({ ...f, mode: value }))}
+                onClick={() => {
+                  if (isSessionMode(value) && conversationRef.current && resolveConversationMode(conversationRef.current) !== value) {
+                    newChat(value);
+                    return;
+                  }
+                  setForm((f) => ({ ...f, mode: value }));
+                }}
                 title={help}
                 aria-label={`${label}：${help}`}
               >
@@ -1454,67 +1631,47 @@ function App() {
 
           <SettingsGroup
             title="提供商管理"
-            summary={activeProvider ? `${modeLabel(form.mode)}生图：${activeProvider.name}${activePlannerProvider ? ` / 规划：${activePlannerProvider.name}` : ""}` : "未配置提供商"}
+            summary={`生图池 ${imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length} 个 / 已用 ${imageProviderPoolMeta.used_providers || 0} / 空闲 ${imageProviderPoolMeta.idle_providers || 0}${activePlannerProvider ? ` / 当前规划：${activePlannerProvider.name}` : ""}`}
             open={!!openGroups.providers}
             onToggle={() => toggleGroup("providers")}
           >
-            <Select
-              label="对话生图"
-              help="对话模式真正执行 image_generation 生图的接口线路。"
-              value={modeProviders.chat}
-              onChange={(v) => setModeProviders({ ...modeProviders, chat: v })}
-              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-            />
-            <Select
-              label="对话规划"
-              help="负责理解对话、判断是否生图、撰写单张图片提示词的模型线路。"
-              value={plannerProviders.chat}
-              onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
-              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-            />
-            <Select
-              label="分镜生图"
-              help="分镜模式逐张生成镜头首帧图片时使用的生图接口线路。"
-              value={modeProviders.storyboard}
-              onChange={(v) => setModeProviders({ ...modeProviders, storyboard: v })}
-              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-            />
-            <Select
-              label="分镜规划"
-              help="负责规划人物场景概述、镜头列表和每张首帧提示词的模型线路。"
-              value={plannerProviders.storyboard}
-              onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
-              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-            />
-            <Select
-              label="生成模式"
-              help="普通文本生图任务使用的生图接口线路。"
-              value={modeProviders.generate}
-              onChange={(v) => setModeProviders({ ...modeProviders, generate: v })}
-              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-            />
-            <Select
-              label="编辑模式"
-              help="上传图片后进行编辑、改图或局部处理时使用的接口线路。"
-              value={modeProviders.edit}
-              onChange={(v) => setModeProviders({ ...modeProviders, edit: v })}
-              options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-            />
-            <button className="secondaryButton" type="button" onClick={() => syncProviderToAll(modeProviders[form.mode] || String(providers[0]?.id || ""))}>
-              <Check size={17} />
-              当前提供商同步到全部模式
-            </button>
+            <div className="providerModeGrid">
+              <Select
+                className="fieldCompact"
+                label="对话规划"
+                help="负责理解对话、判断是否生图、撰写单张图片提示词的模型线路。"
+                value={plannerProviders.chat}
+                onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
+                options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+              />
+              <Select
+                className="fieldCompact"
+                label="分镜规划"
+                help="负责规划人物场景概述、镜头列表和每张首帧提示词的模型线路。"
+                value={plannerProviders.storyboard}
+                onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
+                options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+              />
+            </div>
+            <div className="providerPoolStats">
+              <span>池中总数 {imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length}</span>
+              <span>已使用 {imageProviderPoolMeta.used_providers || 0}</span>
+              <span>空闲 {imageProviderPoolMeta.idle_providers || 0}</span>
+              <span>单提供商上限 {imageProviderPoolMeta.limit_per_provider || 3}</span>
+            </div>
 
             <div className="providerEditor">
-              <Field label="提供商名称">
+              <div className="providerEditorGrid">
+              <Field className="fieldCompact" label="提供商名称">
                 <input value={providerDraft.name} onChange={(e) => setProviderDraft({ ...providerDraft, name: e.target.value })} placeholder="例如 asxs / OpenAI / 备用线路" />
               </Field>
-              <Field label="接口地址">
+              <Field className="fieldCompact" label="接口地址">
                 <input value={providerDraft.base_url} onChange={(e) => setProviderDraft({ ...providerDraft, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
               </Field>
-              <Field label="密钥">
+              <Field className="fieldFull" label="密钥">
                 <input type="password" value={providerDraft.api_key} onChange={(e) => setProviderDraft({ ...providerDraft, api_key: e.target.value })} placeholder="sk-..." />
               </Field>
+              </div>
               <div className="providerActions">
                 <button className="secondaryButton" type="button" onClick={saveProvider}>
                   <KeyRound size={16} />
@@ -1533,8 +1690,17 @@ function App() {
               {providers.map((provider) => (
                 <article className="providerItem" key={provider.id}>
                   <div>
+                    <label className="providerPoolToggle">
+                      <input
+                        type="checkbox"
+                        checked={imageProviderPool.includes(String(provider.id))}
+                        onChange={() => toggleImageProvider(provider.id)}
+                      />
+                      <span>加入生图池</span>
+                    </label>
                     <strong>{provider.name}</strong>
                     <small>{provider.base_url}</small>
+                    <small>当前任务 {provider.pool_assigned_tasks || 0} / 运行中 {provider.pool_running_tasks || 0} / 空闲槽位 {provider.pool_idle_slots ?? (imageProviderPoolMeta.limit_per_provider || 3)}</small>
                   </div>
                   <div>
                     <button type="button" onClick={() => editProvider(provider)} title="编辑"><Edit3 size={15} /></button>
@@ -1543,6 +1709,11 @@ function App() {
                 </article>
               ))}
             </div>
+            <SettingsSaveAction
+              feedback={sectionSaveFeedback.providers}
+              label="保存提供商选择"
+              onClick={() => saveSettingsSection("providers", "提供商选择已保存")}
+            />
           </SettingsGroup>
 
           <SettingsGroup
@@ -1572,6 +1743,11 @@ function App() {
                 <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
             )}
+            <SettingsSaveAction
+              feedback={sectionSaveFeedback.models}
+              label="保存模型设置"
+              onClick={() => saveSettingsSection("models", "模型设置已保存")}
+            />
           </SettingsGroup>
 
           <SettingsGroup
@@ -1589,6 +1765,11 @@ function App() {
                 <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
               </Field>
             )}
+            <SettingsSaveAction
+              feedback={sectionSaveFeedback.image}
+              label="保存图片参数"
+              onClick={() => saveSettingsSection("image", "图片参数已保存")}
+            />
           </SettingsGroup>
 
           <SettingsGroup
@@ -1642,28 +1823,45 @@ function App() {
                 <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             )}
+            <SettingsSaveAction
+              feedback={sectionSaveFeedback.advanced}
+              label="保存高级选项"
+              onClick={() => saveSettingsSection("advanced", "高级选项已保存")}
+            />
           </SettingsGroup>
         </aside>
         )}
 
         <section className="stage">
-          <nav className="viewTabs">
-            {[
-              ["studio", Sparkles, "工作台"],
-              ["history", Clock3, "历史"],
-              ["gallery", Images, "图库"],
-              ["prompts", BookOpen, "提示词"],
-            ].map(([value, Icon, label]) => (
-              <button key={value} className={activeView === value ? "active" : ""} onClick={() => switchView(value)}>
-                <Icon size={16} />
-                {label}
+          <div className="viewTabsBar">
+            <nav className="viewTabs">
+              {[
+                ["studio", Sparkles, "工作台"],
+                ["history", Clock3, "历史"],
+                ["gallery", Images, "图库"],
+                ["prompts", BookOpen, "提示词"],
+              ].map(([value, Icon, label]) => (
+                <button key={value} className={activeView === value ? "active" : ""} onClick={() => switchView(value)}>
+                  <Icon size={16} />
+                  {label}
+                </button>
+              ))}
+              <button
+                type="button"
+                className={`settingsToggle ${controlsOpen ? "active" : ""}`}
+                onClick={() => setControlsOpen((value) => !value)}
+                aria-expanded={controlsOpen}
+                aria-controls="studio-controls"
+              >
+                <SlidersHorizontal size={16} />
+                设置
               </button>
-            ))}
-          </nav>
+            </nav>
+          </div>
           <div className="stageHead">
             <div>
               <p><ModeIcon size={18} /> {modeMeta.title}</p>
-              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "storyboard" ? "按镜头顺序生成连续首帧" : form.mode === "chat" ? "像聊天一样连续生图" : "提交后生成图片到图库"}</h2>
+              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "storyboard" ? "按镜头顺序生成连续首帧" : form.mode === "chat" ? "像聊天一样连续生图" : form.mode === "edit" ? "同一会话内直接按完整提示词连续编辑" : "同一会话内直接按完整提示词连续生图"}</h2>
             </div>
             {(activeView === "studio" || runningTasks.length > 0) && (
               <div className="headActions">
@@ -1674,10 +1872,11 @@ function App() {
                     onToggle={() => setRunningPanelOpen((value) => !value)}
                     onOpenTask={loadTask}
                     onCancelTask={cancelTask}
+                    poolMeta={imageProviderPoolMeta}
                   />
                 )}
-                {activeView === "studio" && ["chat", "storyboard"].includes(form.mode) && <button className="ghostButton" onClick={newChat}><Plus size={17} /> {form.mode === "storyboard" ? "新分镜" : "新对话"}</button>}
-                {activeView === "studio" && !["chat", "storyboard"].includes(form.mode) && <button className="ghostButton" onClick={newStudioTask}>
+                {activeView === "studio" && isSessionMode(form.mode) && <button className="ghostButton" onClick={newStudioTask}><Plus size={17} /> {form.mode === "storyboard" ? "新分镜会话" : form.mode === "chat" ? "新对话" : form.mode === "generate" ? "新生图会话" : "新编辑会话"}</button>}
+                {activeView === "studio" && !isSessionMode(form.mode) && <button className="ghostButton" onClick={newStudioTask}>
                   <Plus size={17} /> 新任务
                 </button>}
               </div>
@@ -1740,19 +1939,19 @@ function App() {
               refreshState={refreshFeedback.prompts}
               onRefresh={() => runRefresh("prompts", () => refreshPrompts({ throwError: true }))}
             />
-          ) : ["chat", "storyboard"].includes(form.mode) ? (
+          ) : isSessionMode(form.mode) ? (
             <div className="chatPane" ref={scrollRef}>
               {messages.length === 0 && (
                 <div className="emptyState">
-                  {form.mode === "storyboard" ? <Clapperboard size={34} /> : <Bot size={34} />}
-                  <h3>{form.mode === "storyboard" ? "描述一段视频想法" : "把想法直接说出来"}</h3>
-                  <p>{form.mode === "storyboard" ? "AI 会先和你完善人物、场景与镜头，再按顺序用上一镜头画面继续 edit 生成下一张首帧。" : "可以先生成，再上传上一张图继续改，动作选择 auto 时会自动判断。"}</p>
+                  {form.mode === "storyboard" ? <Clapperboard size={34} /> : form.mode === "chat" ? <Bot size={34} /> : form.mode === "edit" ? <Brush size={34} /> : <Wand2 size={34} />}
+                  <h3>{form.mode === "storyboard" ? "描述一段视频想法" : form.mode === "chat" ? "把想法直接说出来" : form.mode === "edit" ? "在同一编辑会话里连续改图" : "在同一生图会话里连续提交完整提示词"}</h3>
+                  <p>{form.mode === "storyboard" ? "AI 会先和你完善人物、场景与镜头，再按顺序用上一镜头画面继续 edit 生成下一张首帧。" : form.mode === "chat" ? "可以先生成，再上传上一张图继续改，动作选择 auto 时会自动判断。" : form.mode === "edit" ? "这里不会调用 AI 回复或扩写提示词，每次都会直接按你这次填写的完整要求编辑图片，但仍会保留在同一会话里。" : "这里不会调用 AI 回复或扩写提示词，每次都会直接按你这次填写的完整要求生图，但仍会保留在同一会话里。"}</p>
                 </div>
               )}
               {messages.map((msg) => (
                 <Message key={msg.id} msg={msg} onDownload={downloadImage} onPreview={openImagePreview} previewImages={chatGeneratedImages} />
               ))}
-              {liveChatTasks.map((task) => (
+              {liveConversationTasks.map((task) => (
                 <ChatTaskProgress key={task.id} task={task} />
               ))}
               {loading && (
@@ -1810,6 +2009,11 @@ function App() {
                   onRoleChange={updateChatUploadRole}
                 />
               </>
+            )}
+            {activeConversationLocked && (
+              <div className="composerHint">
+                当前{modeLabel(form.mode)}会话仍有任务在运行或排队。请先停止该会话任务，或点击“新任务”新开对话后再继续发送。
+              </div>
             )}
             <div className="promptRow">
               <textarea
@@ -1914,7 +2118,12 @@ function HistoryPane({
   const [draftTitle, setDraftTitle] = useState("");
   const [draftLimit, setDraftLimit] = useState(10);
   const [messageDrafts, setMessageDrafts] = useState({});
+  const [modeFilter, setModeFilter] = useState("");
   const records = useMemo(() => buildHistoryRecords(conversations, tasks), [conversations, tasks]);
+  const filteredRecords = useMemo(
+    () => (!modeFilter ? records : records.filter((item) => item.mode === modeFilter)),
+    [records, modeFilter],
+  );
   const conversationTasks = useMemo(() => {
     if (!selected?.conversation) return [];
     const byId = new Map();
@@ -1943,11 +2152,20 @@ function HistoryPane({
       <div className="historyList">
         <div className="paneToolbar">
           <strong>历史记录</strong>
-          <RefreshButton state={refreshState} onClick={onRefresh} />
+          <div className="paneToolbarActions">
+            <select value={modeFilter} onChange={(event) => setModeFilter(event.target.value)}>
+              <option value="">全部模式</option>
+              <option value="chat">对话</option>
+              <option value="storyboard">分镜</option>
+              <option value="generate">生成</option>
+              <option value="edit">编辑</option>
+            </select>
+            <RefreshButton state={refreshState} onClick={onRefresh} />
+          </div>
         </div>
-        {records.length === 0 ? (
-          <div className="emptyMini">暂无历史记录</div>
-        ) : records.map((item) => (
+        {filteredRecords.length === 0 ? (
+          <div className="emptyMini">{records.length === 0 ? "暂无历史记录" : "当前筛选下没有历史记录"}</div>
+        ) : filteredRecords.map((item) => (
           <button
             key={item.key}
             className={`historyItem ${historyRecordActive(item, selected, selectedTask) ? "active" : ""} ${item.status || "idle"}`}
@@ -1998,7 +2216,7 @@ function HistoryPane({
                 <Check size={16} /> 保存历史设置
               </button>
               <button className="ghostButton" type="button" onClick={() => onContinue(selected.conversation.id)}>
-                <MessageCircle size={16} /> 继续对话
+                <MessageCircle size={16} /> {continueLabel(resolveConversationMode(selected.conversation))}
               </button>
               <button className="ghostButton danger" type="button" onClick={() => onDeleteConversation(selected.conversation.id)}>
                 <Trash2 size={16} /> 删除历史
@@ -2012,7 +2230,14 @@ function HistoryPane({
                 </div>
                 <div className="taskMiniList">
                   {conversationTasks.map((task) => (
-                    <TaskMiniRow key={task.id} task={task} onOpenTask={onOpenTask} onCancelTask={onCancelTask} />
+                    <TaskMiniRow
+                      key={task.id}
+                      task={task}
+                      onOpenTask={onOpenTask}
+                      onCancelTask={onCancelTask}
+                      onContinue={onContinue}
+                      onRetryTask={onRetryTask}
+                    />
                   ))}
                 </div>
               </section>
@@ -2068,7 +2293,7 @@ function buildHistoryRecords(conversations, tasks) {
     key: `conversation-${item.id}`,
     kind: "conversation",
     id: item.id,
-    mode: item.latest_task_mode || "chat",
+    mode: item.mode || item.latest_task_mode || "chat",
     title: item.title || "未命名对话",
     status: item.latest_task_status,
     progress: item.latest_task_progress,
@@ -2090,7 +2315,7 @@ function buildHistoryRecords(conversations, tasks) {
       stage: task.stage,
       time: task.updated_at || task.created_at,
       timeLabel: formatTime(task.updated_at || task.created_at),
-      summary: `${modeLabel(task.mode)}任务 #${task.id}`,
+      summary: taskProviderName(task) ? `${modeLabel(task.mode)}任务 #${task.id} · ${taskProviderName(task)}` : `${modeLabel(task.mode)}任务 #${task.id}`,
     }));
   return [...conversationRecords, ...taskRecords].sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
 }
@@ -2113,7 +2338,7 @@ function StatusPill({ mode, status }) {
   );
 }
 
-function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask }) {
+function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask, poolMeta }) {
   const firstTask = tasks[0];
   return (
     <section className={`runningPanel ${open ? "open" : ""}`} aria-live="polite">
@@ -2122,7 +2347,7 @@ function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask }) 
           <Loader2 className="spin" size={15} aria-hidden="true" />
           <strong>{tasks.length} 个任务运行中</strong>
         </span>
-        <small>{firstTask ? `${modeLabel(firstTask.mode)} #${firstTask.id} · ${firstTask.stage || statusLabel(firstTask.status)}` : "等待任务状态"}</small>
+        <small>{firstTask ? `${modeLabel(firstTask.mode)} #${firstTask.id} · ${taskProviderName(firstTask) || "等待分配提供商"}` : `生图池 ${poolMeta?.total_providers || 0} / 已用 ${poolMeta?.used_providers || 0} / 空闲 ${poolMeta?.idle_providers || 0}`}</small>
         <ChevronDown size={16} />
       </button>
       {open && (
@@ -2131,7 +2356,7 @@ function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask }) 
             <article className="runningPanelTask" key={task.id}>
               <div>
                 <strong>{modeLabel(task.mode)}任务 #{task.id}</strong>
-                <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</small>
+                <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%{taskProviderName(task) ? ` · ${taskProviderName(task)}` : ""}</small>
               </div>
               <div className="progressTrack">
                 <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
@@ -2148,22 +2373,11 @@ function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask }) 
   );
 }
 
-function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
-  const [copyState, setCopyState] = useState("idle");
+function TaskMiniRow({ task, onOpenTask, onCancelTask, onContinue, onRetryTask }) {
   const [open, setOpen] = useState(false);
   const isLive = ["queued", "running"].includes(task.status);
-  const errorText = task.error_detail ? formatTaskError(task.error_detail) : "";
-
-  async function copyTaskError() {
-    setCopyState("copying");
-    try {
-      await copyTextToClipboard(errorText || "暂无失败原因");
-      setCopyState("success");
-    } catch {
-      setCopyState("failed");
-    }
-    setTimeout(() => setCopyState("idle"), 1400);
-  }
+  const providerName = taskProviderName(task);
+  const canRetry = ["generate", "edit", "storyboard"].includes(task.mode) && ["failed", "canceled"].includes(task.status);
 
   return (
     <article className={`taskMiniRow ${task.status} ${open ? "open" : ""}`}>
@@ -2172,7 +2386,7 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
           {isLive && <Loader2 className="runningIcon spin" size={13} aria-hidden="true" />}
           <strong>{modeLabel(task.mode)}任务 #{task.id}</strong>
         </span>
-        <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%</small>
+        <small>{task.stage || statusLabel(task.status)} · {Number(task.progress || 0)}%{providerName ? ` · ${providerName}` : ""}</small>
         <ChevronDown size={15} />
       </button>
       {open && (
@@ -2182,19 +2396,11 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
           </div>
           <div className="taskMiniActions">
             <button type="button" onClick={() => onOpenTask(task.id)}>查看详情</button>
+            {task.conversation_id && <button type="button" onClick={() => onContinue(task.conversation_id)}><MessageCircle size={14} /> {continueLabel(task.mode)}</button>}
+            {canRetry && <button type="button" onClick={() => onRetryTask(task.id)}><RefreshCw size={14} /> 重试</button>}
             {isLive && <button className="danger" type="button" onClick={() => onCancelTask(task.id)}><X size={14} /> 停止</button>}
           </div>
-          {task.status === "failed" && errorText && (
-            <div className="taskMiniError">
-              <div className="sectionTitle">
-                <strong>失败原因</strong>
-                <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyTaskError} disabled={copyState === "copying"}>
-                  <Copy size={14} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
-                </button>
-              </div>
-              <pre>{errorText}</pre>
-            </div>
-          )}
+          {task.error_detail && <ErrorSummaryBox title="失败原因" error={task.error_detail} className="taskMiniError" />}
         </div>
       )}
     </article>
@@ -2202,22 +2408,11 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask }) {
 }
 
 function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onContinue, onDelete, onRetry }) {
-  const [copyState, setCopyState] = useState("idle");
   const isLive = ["queued", "running"].includes(task.status);
   const images = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
   const inputImages = normalizeTaskImages(task).filter((image) => ["input", "mask", "input_reference"].includes(image.source));
-  const errorText = task.error_detail ? formatTaskError(task.error_detail) : "";
-
-  async function copyError() {
-    setCopyState("copying");
-    try {
-      await copyTextToClipboard(errorText || "暂无失败原因");
-      setCopyState("success");
-    } catch {
-      setCopyState("failed");
-    }
-    setTimeout(() => setCopyState("idle"), 1400);
-  }
+  const providerName = taskProviderName(task);
+  const canRetry = ["generate", "edit", "storyboard"].includes(task.mode) && ["failed", "canceled"].includes(task.status);
 
   return (
     <div className="taskDetail">
@@ -2231,12 +2426,12 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
           {isLive && <button className="ghostButton danger" type="button" onClick={() => onCancel(task.id)}><X size={16} /> 停止</button>}
           {task.conversation_id && (
             <button className="secondaryButton compact" type="button" onClick={() => onContinue(task.conversation_id)}>
-              <MessageCircle size={16} /> {task.mode === "storyboard" ? "继续分镜" : "继续对话"}
+              <MessageCircle size={16} /> {continueLabel(task.mode)}
             </button>
           )}
-          {task.mode === "storyboard" && ["failed", "canceled"].includes(task.status) && (
+          {canRetry && (
             <button className="secondaryButton compact" type="button" onClick={() => onRetry(task.id)}>
-              <RefreshCw size={16} /> 继续试一次
+              <RefreshCw size={16} /> 重试原任务
             </button>
           )}
           <button className="ghostButton danger" type="button" onClick={() => onDelete(task.id)}>
@@ -2251,19 +2446,10 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
         <span>创建：{formatTime(task.created_at)}</span>
         <span>更新：{formatTime(task.updated_at)}</span>
         <span>模式：{modeLabel(task.mode)}</span>
+        {providerName && <span>生图提供商：{providerName}</span>}
       </div>
       {task.mode === "storyboard" && <StoryboardProgress task={task} />}
-      {task.error_detail && (
-        <section className="taskErrorBox">
-          <div className="sectionTitle">
-            <strong>失败原因</strong>
-            <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
-              <Copy size={15} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
-            </button>
-          </div>
-          <pre>{errorText}</pre>
-        </section>
-      )}
+      {task.error_detail && <ErrorSummaryBox title="失败原因" error={task.error_detail} className="taskErrorBox" />}
       {inputImages.length > 0 && (
         <section>
           <div className="sectionTitle">
@@ -2433,35 +2619,90 @@ function PromptLibrary({
 }
 
 function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage, onPreview }) {
-  const groups = groupImages(items);
+  const groups = useMemo(() => groupImages(items), [items]);
+  const [expandedGroups, setExpandedGroups] = useState({});
+  const [modeFilter, setModeFilter] = useState("");
+  const filteredGroups = useMemo(
+    () => (!modeFilter ? groups : groups.filter((group) => group.mode === modeFilter)),
+    [groups, modeFilter],
+  );
+
+  useEffect(() => {
+    setExpandedGroups((current) => {
+      const next = {};
+      for (const group of filteredGroups) {
+        if (current[group.key]) next[group.key] = true;
+      }
+      return next;
+    });
+  }, [filteredGroups]);
+
+  function toggleGroup(groupKey) {
+    setExpandedGroups((current) => ({ ...current, [groupKey]: !current[groupKey] }));
+  }
+
   return (
     <div className="galleryHistory">
       <div className="paneToolbar">
         <strong>历史图库</strong>
-        <RefreshButton state={refreshState} onClick={onRefresh} />
+        <div className="paneToolbarActions">
+          <select value={modeFilter} onChange={(event) => setModeFilter(event.target.value)}>
+            <option value="">全部模式</option>
+            <option value="chat">对话</option>
+            <option value="storyboard">分镜</option>
+            <option value="generate">生成</option>
+            <option value="edit">编辑</option>
+          </select>
+          <RefreshButton state={refreshState} onClick={onRefresh} />
+        </div>
       </div>
-      {groups.length === 0 ? (
+      {filteredGroups.length === 0 ? (
         <div className="emptyState">
           <Images size={34} />
-          <h3>还没有历史图片</h3>
-          <p>之后生成的图片会按对话标题和时间保存到这里。</p>
+          <h3>{groups.length === 0 ? "还没有历史图片" : "当前筛选下没有图片"}</h3>
+          <p>这里会按会话保存生成图、继续改输入图和参考图，并支持按模式筛选。</p>
         </div>
-      ) : groups.map((group) => (
+      ) : filteredGroups.map((group) => {
+        const expanded = !!expandedGroups[group.key];
+        const visibleItems = expanded ? group.items : group.preview_items;
+        return (
         <article className="galleryGroup" key={group.key}>
-          <div>
-            <span>{group.title}</span>
-            <small>{group.time}</small>
+          <div className="galleryGroupHead">
+            <div className="galleryGroupMeta">
+              <span>{group.title}</span>
+              <small>{group.mode ? modeLabel(group.mode) : "未分类"} · {group.time} · 共 {group.items.length} 张</small>
+            </div>
+            {group.has_more && (
+              <button type="button" className="galleryGroupToggle" onClick={() => toggleGroup(group.key)}>
+                {expanded ? "收起" : `查看详情（全部 ${group.items.length} 张）`}
+              </button>
+            )}
           </div>
           <div className="imageGrid">
-            {group.items.map((image, index) => <ImageCard key={image.id} image={image} onDownload={onDownload} onUseImage={onUseImage} onPreview={() => onPreview(group.items, index)} />)}
+            {visibleItems.map((image) => {
+              const previewIndex = group.items.findIndex((item) => Number(item.id) === Number(image.id));
+              return (
+                <ImageCard
+                  key={image.id}
+                  image={image}
+                  onDownload={onDownload}
+                  onUseImage={onUseImage}
+                  onPreview={() => onPreview(group.items, previewIndex >= 0 ? previewIndex : 0)}
+                />
+              );
+            })}
           </div>
+          {!expanded && group.has_more && (
+            <small className="galleryGroupHint">当前先展示 {group.preview_items.length} 张预览图，点击“查看详情”可查看该会话全部图片。</small>
+          )}
         </article>
-      ))}
+      )})}
     </div>
   );
 }
 
 function ChatTaskProgress({ task }) {
+  const providerName = taskProviderName(task);
   return (
     <div className="message assistant taskMessage">
       <div className="avatar"><Loader2 className="spin" size={18} /></div>
@@ -2474,19 +2715,47 @@ function ChatTaskProgress({ task }) {
           <div style={{ width: `${Math.max(4, Math.min(Number(task.progress || 0), 100))}%` }} />
         </div>
         <small>#{task.id} · {task.params?.action || task.mode} · 上游事件会实时写入这里</small>
+        {providerName && <small>当前生图提供商：{providerName}</small>}
       </div>
     </div>
   );
 }
 
-function ChatReferencePicker({ images, selected, onToggle, roles = {}, onRoleChange, uploadCount = 0 }) {
+function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {}, onRoleChange, uploadCount = 0 }) {
   const selectedIds = new Set((selected || []).map((image) => Number(image.id)));
+  const selectedImages = uniqueImages(selected || []);
   return (
     <section className="referencePicker">
       <div className="referencePickerHead">
         <strong>指定参考图</strong>
         <small>{selected.length}/3，建议明确区分角色、场景和道具锚点</small>
       </div>
+      {selectedImages.length > 0 && (
+        <div className="selectedReferenceStrip">
+          {selectedImages.map((image, index) => {
+            const role = roles[String(image.id)] || defaultReferenceRole(uploadCount + index);
+            return (
+              <div className="selectedReferenceCard" key={image.id || image.url}>
+                <img src={image.public_url || image.url} alt="" />
+                <div className="selectedReferenceMeta">
+                  <strong>{image.title || image.filename || `参考图 ${index + 1}`}</strong>
+                  <small>{referenceRoleLabel(role)}</small>
+                </div>
+                <label className="referenceRoleSelect compact">
+                  <span>用途</span>
+                  <select value={role} onChange={(event) => onRoleChange?.(image.id, event.target.value)}>
+                    {referenceRoleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                </label>
+                <button type="button" className="selectedReferenceRemove" onClick={() => onRemove?.(image.id)}>
+                  <X size={14} />
+                  移除
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
       {images.length > 0 ? (
         <div className="referenceStrip">
           {images.map((image, index) => {
@@ -2517,7 +2786,7 @@ function ChatReferencePicker({ images, selected, onToggle, roles = {}, onRoleCha
           })}
         </div>
       ) : (
-        <small className="uploadEmpty">当前对话暂无可选历史图，也可以直接上传参考图。</small>
+        <small className="uploadEmpty">{selectedImages.length > 0 ? "当前图已加入本轮参考区，可以继续补充上传其它参考图。" : "当前对话暂无可选历史图，也可以直接上传参考图。"}</small>
       )}
     </section>
   );
@@ -2742,9 +3011,11 @@ function RefreshButton({ state = "idle", onClick }) {
   );
 }
 
-function InlineErrorBox({ title = "失败原因", error }) {
+function ErrorSummaryBox({ title = "失败原因", error, className = "" }) {
+  const [open, setOpen] = useState(false);
   const [copyState, setCopyState] = useState("idle");
   const errorText = formatTaskError(error);
+  const summaryText = errorSummaryText(error);
 
   async function copyError() {
     setCopyState("copying");
@@ -2758,30 +3029,57 @@ function InlineErrorBox({ title = "失败原因", error }) {
   }
 
   return (
-    <section className="inlineErrorBox">
-      <div className="sectionTitle">
-        <strong>{title}</strong>
-        <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
-          <Copy size={14} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
-        </button>
-      </div>
-      <pre>{errorText}</pre>
+    <section className={`inlineErrorBox ${open ? "open" : ""} ${className}`.trim()}>
+      <button type="button" className="errorSummaryToggle" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+        <div>
+          <strong>{title}</strong>
+          <span>{summaryText}</span>
+        </div>
+        <ChevronDown size={15} />
+      </button>
+      {open && (
+        <div className="errorDetailBody">
+          <div className="sectionTitle">
+            <small>详细信息</small>
+            <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
+              <Copy size={14} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
+            </button>
+          </div>
+          <pre>{errorText}</pre>
+        </div>
+      )}
     </section>
   );
 }
 
-function Field({ label, children, help = "" }) {
+function InlineErrorBox({ title = "失败原因", error }) {
+  return <ErrorSummaryBox title={title} error={error} />;
+}
+
+function SettingsSaveAction({ feedback, label, onClick }) {
+  const busy = feedback?.state === "loading";
   return (
-    <label className="field">
+    <div className="settingsSaveAction">
+      {feedback?.message && <div className={`settingsSaveNotice ${feedback.state || "idle"}`}>{feedback.message}</div>}
+      <button className="secondaryButton compact" type="button" onClick={onClick} disabled={busy}>
+        <Check size={16} /> {busy ? "保存中" : label}
+      </button>
+    </div>
+  );
+}
+
+function Field({ label, children, help = "", className = "" }) {
+  return (
+    <label className={`field ${className}`.trim()}>
       <span className="fieldLabel" title={help || undefined}>{label}</span>
       {children}
     </label>
   );
 }
 
-function Select({ label, value, onChange, options, help = "" }) {
+function Select({ label, value, onChange, options, help = "", className = "" }) {
   return (
-    <Field label={label} help={help}>
+    <Field label={label} help={help} className={className}>
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {options.map((option) => {
           const normalized = typeof option === "string" ? { value: option, label: option } : option;
@@ -2909,6 +3207,15 @@ function looksLikeHtml(value) {
   return text.includes("<!doctype html") || text.includes("<html") || text.includes("<head");
 }
 
+function errorSummaryText(error) {
+  const detail = error?.detail ?? error ?? {};
+  const summary = typeof detail === "string"
+    ? detail
+    : detail?.message || detail?.upstream?.message || detail?.fallback_error?.upstream?.message || detail?.raw || JSON.stringify(compactErrorForDisplay(detail));
+  const singleLine = compactString(String(summary || "请求失败")).replace(/\s+/g, " ").trim();
+  return singleLine.length > 120 ? `${singleLine.slice(0, 120)}...` : singleLine;
+}
+
 function formatTaskError(error) {
   return typeof error === "string"
     ? compactString(error)
@@ -2990,20 +3297,42 @@ function formatTime(value) {
 function groupImages(items) {
   const map = new Map();
   for (const item of items || []) {
+    const conversationKey = item.conversation_id ? `conversation-${item.conversation_id}` : null;
+    const fallbackKey = item.task_id ? `task-${item.task_id}` : `image-${item.id || item.created_at || Math.random()}`;
+    const key = conversationKey || fallbackKey;
     const title = item.conversation_title || item.title || item.task_prompt || "独立生成";
-    const bucket = item.bucket || item.created_at || "default";
-    const key = `${title}-${bucket}`;
+    const mode = item.task_mode || "";
     if (!map.has(key)) {
       map.set(key, {
         key,
         title,
-        time: item.created_at ? new Date(item.created_at).toLocaleString() : bucket,
         items: [],
+        latest_time: item.created_at || "",
+        mode,
       });
     }
-    map.get(key).items.push(item);
+    const group = map.get(key);
+    group.items.push(item);
+    if (!group.mode && mode) group.mode = mode;
+    const currentStamp = new Date(item.created_at || 0).getTime();
+    const latestStamp = new Date(group.latest_time || 0).getTime();
+    if (Number.isFinite(currentStamp) && currentStamp >= latestStamp) {
+      group.latest_time = item.created_at || group.latest_time;
+    }
   }
-  return [...map.values()];
+  return [...map.values()]
+    .map((group) => {
+      const sortedItems = [...group.items].sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+      const previewItems = sortedItems.slice(0, 6);
+      return {
+        ...group,
+        items: sortedItems,
+        preview_items: previewItems,
+        has_more: sortedItems.length > previewItems.length,
+        time: group.latest_time ? new Date(group.latest_time).toLocaleString() : "未知时间",
+      };
+    })
+    .sort((a, b) => new Date(b.latest_time || 0) - new Date(a.latest_time || 0));
 }
 
 createRoot(document.getElementById("root")).render(<App />);

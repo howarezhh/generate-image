@@ -1,14 +1,19 @@
 import asyncio
 import copy
+import hashlib
+import hmac
+import html
 import json
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -53,9 +58,17 @@ app.add_middleware(
 )
 
 RUNNING_TASKS: dict[int, asyncio.Task[Any]] = {}
-TASK_SEMAPHORE: asyncio.Semaphore | None = None
 TASK_EVENT_SUBSCRIBERS: dict[int, set[asyncio.Queue[dict[str, Any]]]] = {}
 TASK_EVENT_SNAPSHOTS: dict[int, dict[str, dict[str, Any]]] = {}
+IMAGE_PROVIDER_POOL_LOCK: asyncio.Lock | None = None
+IMAGE_PROVIDER_POOL_STATE: dict[int, dict[str, Any]] = {}
+ACCESS_COOKIE_NAME = "studio_access"
+ACCESS_PASSWORD = "hhs54666"
+ACCESS_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9]{8}$")
+ACCESS_ERROR_MESSAGE = "密码错误，请联系管理员，管理员QQ为3286385052。"
+ACCESS_LOGIN_PATH = "/auth/login"
+ACCESS_ALLOWED_PATHS = {ACCESS_LOGIN_PATH, "/favicon.ico"}
+ACCESS_COOKIE_TOKEN = hashlib.sha256(f"gpt-image-studio:{ACCESS_PASSWORD.lower()}".encode("utf-8")).hexdigest()
 
 
 class ClientConfig(BaseModel):
@@ -82,6 +95,7 @@ class PromptRequest(BaseModel):
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
+    conversation_id: int | None = None
     model: str = "gpt-5.4"
     image_model: str = "gpt-image-2"
     size: str = "2560x1440"
@@ -99,6 +113,7 @@ class GenerateRequest(BaseModel):
 class ConversationCreate(BaseModel):
     title: str = "新的生图对话"
     context_limit: int = Field(default=10, ge=0, le=50)
+    mode: str | None = None
 
 
 class ConversationUpdate(BaseModel):
@@ -164,6 +179,208 @@ REFERENCE_ROLE_LABELS = {
 }
 DEFAULT_REFERENCE_ROLE_ORDER = ("character", "scene", "wardrobe_prop")
 REFERENCE_ROLE_PRIORITY = {role: index for index, role in enumerate(("character", "scene", "wardrobe_prop", "style"))}
+CONVERSATION_MODES = {"chat", "storyboard", "generate", "edit"}
+
+
+def normalize_access_password(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def validate_access_password(value: str) -> bool:
+    normalized = normalize_access_password(value)
+    if not ACCESS_PASSWORD_PATTERN.fullmatch(normalized):
+        return False
+    return hmac.compare_digest(normalized, ACCESS_PASSWORD.lower())
+
+
+def access_cookie_valid(request: Request) -> bool:
+    token = str(request.cookies.get(ACCESS_COOKIE_NAME) or "")
+    return hmac.compare_digest(token, ACCESS_COOKIE_TOKEN)
+
+
+def sanitized_next_path(value: str | None) -> str:
+    target = str(value or "").strip()
+    if not target.startswith("/") or target.startswith("//"):
+        return "/"
+    if target.startswith(ACCESS_LOGIN_PATH):
+        return "/"
+    return target
+
+
+def login_page_html(next_path: str = "/", error_message: str = "") -> str:
+    safe_next = html.escape(sanitized_next_path(next_path), quote=True)
+    safe_error = html.escape(error_message.strip()) if error_message else ""
+    error_block = (
+        f'<div class="loginError" role="alert">{safe_error}</div>'
+        if safe_error
+        else '<div class="loginHint">请输入访问密码后继续。</div>'
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>访问验证 - GPT Image Studio</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #11130f;
+      color: #f5f3ea;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top left, rgba(45, 146, 127, 0.24), transparent 32%),
+        radial-gradient(circle at top right, rgba(238, 203, 112, 0.18), transparent 26%),
+        linear-gradient(180deg, rgba(255,255,255,0.03), transparent 40%),
+        #11130f;
+      padding: 24px;
+    }}
+    .loginCard {{
+      width: min(420px, 100%);
+      border: 1px solid rgba(245, 243, 234, 0.12);
+      border-radius: 20px;
+      padding: 28px;
+      background: rgba(17, 19, 15, 0.92);
+      box-shadow: 0 26px 72px rgba(0, 0, 0, 0.42);
+      backdrop-filter: blur(18px);
+    }}
+    .loginMark {{
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      display: grid;
+      place-items: center;
+      background: #eecb70;
+      color: #11130f;
+      font-weight: 800;
+      margin-bottom: 18px;
+      font-size: 18px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 26px;
+      line-height: 1.2;
+    }}
+    p {{
+      margin: 10px 0 0;
+      color: rgba(245, 243, 234, 0.68);
+      line-height: 1.65;
+      font-size: 14px;
+    }}
+    form {{
+      margin-top: 20px;
+      display: grid;
+      gap: 12px;
+    }}
+    label {{
+      display: grid;
+      gap: 8px;
+      color: rgba(245, 243, 234, 0.76);
+      font-size: 13px;
+    }}
+    input {{
+      width: 100%;
+      min-height: 46px;
+      border-radius: 12px;
+      border: 1px solid rgba(245, 243, 234, 0.16);
+      background: rgba(255, 255, 255, 0.04);
+      color: #f5f3ea;
+      padding: 0 14px;
+      outline: none;
+      letter-spacing: 1px;
+    }}
+    input:focus {{
+      border-color: #eecb70;
+    }}
+    button {{
+      min-height: 46px;
+      border: 0;
+      border-radius: 12px;
+      background: #eecb70;
+      color: #11130f;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .loginError, .loginHint {{
+      margin-top: 16px;
+      border-radius: 12px;
+      padding: 12px 14px;
+      line-height: 1.6;
+      font-size: 13px;
+    }}
+    .loginError {{
+      border: 1px solid rgba(214, 76, 57, 0.4);
+      background: rgba(214, 76, 57, 0.12);
+      color: #ffd5ce;
+    }}
+    .loginHint {{
+      border: 1px solid rgba(238, 203, 112, 0.2);
+      background: rgba(238, 203, 112, 0.08);
+      color: rgba(245, 243, 234, 0.84);
+    }}
+  </style>
+</head>
+<body>
+  <section class="loginCard">
+    <div class="loginMark">鉴权</div>
+    <h1>请输入访问密码</h1>
+    <p>访问当前项目之前，需要先完成统一密码验证。密码仅支持 8 位数字或英文字母，英文字母不区分大小写。</p>
+    {error_block}
+    <form method="post" action="{ACCESS_LOGIN_PATH}">
+      <input type="hidden" name="next" value="{safe_next}" />
+      <label>
+        <span>访问密码</span>
+        <input
+          type="password"
+          name="password"
+          maxlength="8"
+          minlength="8"
+          pattern="[A-Za-z0-9]{{8}}"
+          autocomplete="current-password"
+          inputmode="text"
+          autofocus
+          required
+        />
+      </label>
+      <button type="submit">进入项目</button>
+    </form>
+  </section>
+</body>
+</html>"""
+
+
+@app.middleware("http")
+async def require_project_password(request: Request, call_next: Callable[..., Any]):
+    path = request.url.path or "/"
+    if request.method == "OPTIONS" or path in ACCESS_ALLOWED_PATHS:
+        return await call_next(request)
+    if access_cookie_valid(request):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": {
+                    "message": "未通过访问验证，请先输入项目访问密码。",
+                    "status_code": 401,
+                }
+            },
+        )
+    if path == ACCESS_LOGIN_PATH:
+        return await call_next(request)
+    if request.method == "GET":
+        next_path = request.url.path
+        if request.url.query:
+            next_path = f"{next_path}?{request.url.query}"
+        login_url = f"{ACCESS_LOGIN_PATH}?next={quote(sanitized_next_path(next_path), safe='/?=&')}"
+        return RedirectResponse(url=login_url, status_code=303)
+    return HTMLResponse(login_page_html("/", ACCESS_ERROR_MESSAGE), status_code=401)
 
 
 def public_task_image(
@@ -259,6 +476,161 @@ def compact_params(data: dict[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in data.items()
         if value is not None and value != "" and value != "default"
+    }
+
+
+def normalize_conversation_mode(value: Any) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in CONVERSATION_MODES else None
+
+
+def resolved_conversation_mode(conversation: dict[str, Any] | sqlite3.Row | None, fallback: str = "chat") -> str:
+    if not conversation:
+        return fallback
+    if isinstance(conversation, dict):
+        current = normalize_conversation_mode(conversation.get("mode"))
+        latest = normalize_conversation_mode(conversation.get("latest_task_mode"))
+    else:
+        current = normalize_conversation_mode(conversation["mode"]) if "mode" in conversation.keys() else None
+        latest = normalize_conversation_mode(conversation["latest_task_mode"]) if "latest_task_mode" in conversation.keys() else None
+    return current or latest or fallback
+
+
+def serialize_conversation_row(conversation: dict[str, Any] | sqlite3.Row, *, latest_task_mode: str | None = None) -> dict[str, Any]:
+    item = db.row_to_dict(conversation) if not isinstance(conversation, dict) else dict(conversation)
+    item["mode"] = normalize_conversation_mode(item.get("mode")) or normalize_conversation_mode(latest_task_mode) or "chat"
+    return item
+
+
+def conversation_mode_label(mode: str | None) -> str:
+    return {"chat": "对话", "storyboard": "分镜", "generate": "生图", "edit": "编辑"}.get(str(mode or ""), "当前")
+
+
+def task_status_label(status: str | None) -> str:
+    return {
+        "queued": "排队中",
+        "running": "运行中",
+        "done": "已完成",
+        "failed": "失败",
+        "canceled": "已停止",
+    }.get(str(status or ""), "处理中")
+
+
+def load_app_settings_value() -> dict[str, Any]:
+    with db.connect() as conn:
+        row = conn.execute("select value from settings where key = ?", ("app_settings",)).fetchone()
+    if not row:
+        return {}
+    try:
+        value = json.loads(row["value"] or "{}")
+    except json.JSONDecodeError:
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def normalize_provider_id_list(values: Any) -> list[int]:
+    ids: list[int] = []
+    for value in values if isinstance(values, list) else []:
+        try:
+            provider_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if provider_id > 0 and provider_id not in ids:
+            ids.append(provider_id)
+    return ids
+
+
+def configured_image_provider_pool_ids(settings_value: dict[str, Any] | None = None) -> list[int]:
+    value = settings_value or load_app_settings_value()
+    ids = normalize_provider_id_list(value.get("imageProviderPool"))
+    if ids:
+        return ids
+    legacy = value.get("modeProviders") if isinstance(value.get("modeProviders"), dict) else {}
+    return normalize_provider_id_list(list(legacy.values()))
+
+
+def load_provider_rows() -> list[dict[str, Any]]:
+    ensure_default_provider()
+    with db.connect() as conn:
+        rows = conn.execute("select * from providers order by id asc").fetchall()
+    return [db.row_to_dict(row) for row in rows]
+
+
+def provider_client_config(provider: dict[str, Any]) -> ClientConfig:
+    return ClientConfig(
+        base_url=str(provider.get("base_url") or DEFAULT_API_BASE_URL),
+        api_key=str(provider.get("api_key") or DEFAULT_API_KEY),
+    )
+
+
+def load_image_provider_pool() -> list[dict[str, Any]]:
+    providers = load_provider_rows()
+    if not providers:
+        return []
+    configured_ids = configured_image_provider_pool_ids()
+    by_id = {int(provider["id"]): provider for provider in providers}
+    ordered = [by_id[provider_id] for provider_id in configured_ids if provider_id in by_id]
+    return ordered or providers
+
+
+def provider_pool_capacity() -> int:
+    return max(1, len(load_image_provider_pool())) * MAX_CONCURRENT_TASKS
+
+
+def ensure_provider_pool_lock() -> asyncio.Lock:
+    global IMAGE_PROVIDER_POOL_LOCK
+    if IMAGE_PROVIDER_POOL_LOCK is None:
+        IMAGE_PROVIDER_POOL_LOCK = asyncio.Lock()
+    return IMAGE_PROVIDER_POOL_LOCK
+
+
+def ensure_provider_pool_state(provider: dict[str, Any], order_index: int) -> dict[str, Any]:
+    provider_id = int(provider["id"])
+    state = IMAGE_PROVIDER_POOL_STATE.get(provider_id)
+    if state is None:
+        state = {
+            "provider": dict(provider),
+            "order": order_index,
+            "semaphore": asyncio.Semaphore(MAX_CONCURRENT_TASKS),
+            "assigned_count": 0,
+            "running_count": 0,
+        }
+        IMAGE_PROVIDER_POOL_STATE[provider_id] = state
+        return state
+    state["provider"] = dict(provider)
+    state["order"] = order_index
+    return state
+
+
+def image_provider_pool_snapshot() -> dict[str, Any]:
+    pool = load_image_provider_pool()
+    providers: list[dict[str, Any]] = []
+    for index, provider in enumerate(pool):
+        state = IMAGE_PROVIDER_POOL_STATE.get(int(provider["id"]))
+        assigned = int(state["assigned_count"]) if state else 0
+        running = int(state["running_count"]) if state else 0
+        providers.append(
+            {
+                "id": provider["id"],
+                "name": provider["name"],
+                "base_url": provider["base_url"],
+                "assigned_tasks": assigned,
+                "running_tasks": running,
+                "idle_slots": max(0, MAX_CONCURRENT_TASKS - running),
+                "order": index,
+            }
+        )
+    total = len(providers)
+    used = sum(1 for provider in providers if provider["assigned_tasks"] > 0)
+    return {
+        "total_providers": total,
+        "used_providers": used,
+        "idle_providers": max(0, total - used),
+        "limit_per_provider": MAX_CONCURRENT_TASKS,
+        "total_capacity": max(1, total) * MAX_CONCURRENT_TASKS,
+        "assigned_tasks": sum(provider["assigned_tasks"] for provider in providers),
+        "running_tasks": sum(provider["running_tasks"] for provider in providers),
+        "providers": providers,
     }
 
 
@@ -574,17 +946,21 @@ def deletable_media_paths(rows: list[Any], delete_ids: list[int]) -> list[str]:
 
 def image_prompts_from_message_meta(meta: dict[str, Any]) -> list[str]:
     prompts: list[str] = []
-    image_prompt = str(meta.get("image_prompt") or "").strip()
-    if image_prompt:
-        prompts.append(image_prompt)
-    plan = meta.get("plan") if isinstance(meta.get("plan"), dict) else {}
-    plan_prompt = str(plan.get("image_prompt") or "").strip()
-    if plan_prompt:
-        prompts.append(plan_prompt)
+    image_status = str(meta.get("image_status") or "").strip().lower()
+    if image_status == "done":
+        image_prompt = str(meta.get("image_prompt") or "").strip()
+        if image_prompt:
+            prompts.append(image_prompt)
+        plan = meta.get("plan") if isinstance(meta.get("plan"), dict) else {}
+        plan_prompt = str(plan.get("image_prompt") or "").strip()
+        if plan_prompt:
+            prompts.append(plan_prompt)
     storyboard = meta.get("storyboard") if isinstance(meta.get("storyboard"), dict) else {}
     shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
     for shot in shots:
         if not isinstance(shot, dict):
+            continue
+        if str(shot.get("status") or "").strip().lower() != "done":
             continue
         name = str(shot.get("name") or "").strip()
         shot_prompt = str(shot.get("planner_prompt") or shot.get("prompt") or "").strip()
@@ -593,25 +969,33 @@ def image_prompts_from_message_meta(meta: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(prompts))
 
 
+def parse_message_meta(item: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(item.get("meta"), dict):
+        return item["meta"]
+    if isinstance(item.get("meta_json"), str):
+        try:
+            parsed = json.loads(item["meta_json"] or "{}")
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 def build_context_prompt(history: list[dict[str, Any]], prompt: str) -> str:
     if not history:
         return prompt
     lines = ["以下是最近的文字对话和已生成图片对应的单张图片生图提示词，请结合它们理解当前需求："]
     for item in history:
+        meta = parse_message_meta(item)
+        if item.get("role") == "assistant":
+            planner_status = str(meta.get("planner_status") or "").strip().lower()
+            if planner_status and planner_status != "done":
+                continue
         role = "用户" if item.get("role") == "user" else "助手"
         content = str(item.get("content") or "").strip()
         if content:
             lines.append(f"{role}: {content}")
-        meta: dict[str, Any] = {}
-        if isinstance(item.get("meta_json"), str):
-            try:
-                parsed = json.loads(item["meta_json"] or "{}")
-                if isinstance(parsed, dict):
-                    meta = parsed
-            except json.JSONDecodeError:
-                meta = {}
-        elif isinstance(item.get("meta"), dict):
-            meta = item["meta"]
         for index, image_prompt in enumerate(image_prompts_from_message_meta(meta), start=1):
             lines.append(f"{role}关联的第 {index} 张图片生图提示词（仅对应一张图片）: {image_prompt}")
     lines.append(f"当前用户需求: {prompt}")
@@ -1529,12 +1913,206 @@ def active_task_count() -> int:
     return int(row["count"])
 
 
+async def acquire_image_provider_slot(task_id: int, waiting_stage: str | None = None, running_stage: str | None = None) -> dict[str, Any]:
+    pool = load_image_provider_pool()
+    if not pool:
+        raise HTTPException(status_code=400, detail="当前没有可用的生图提供商，请先配置 provider 池。")
+
+    pool_lock = ensure_provider_pool_lock()
+    async with pool_lock:
+        states = [ensure_provider_pool_state(provider, index) for index, provider in enumerate(pool)]
+        state = min(
+            states,
+            key=lambda item: (
+                int(item["running_count"]),
+                int(item["assigned_count"]),
+                int(item["order"]),
+            ),
+        )
+        provider = dict(state["provider"])
+        waiting = int(state["running_count"]) >= MAX_CONCURRENT_TASKS
+        state["assigned_count"] = int(state["assigned_count"]) + 1
+
+    waiting_text = waiting_stage or f"已分配生图提供商：{provider['name']}，等待空闲通道"
+    db.update_task(
+        task_id,
+        image_provider_id=int(provider["id"]),
+        image_provider_name=str(provider["name"]),
+        stage=waiting_text if waiting else str(running_stage or waiting_stage or f"已分配生图提供商：{provider['name']}"),
+    )
+    publish_task_snapshot(task_id)
+
+    await state["semaphore"].acquire()
+    async with pool_lock:
+        state["running_count"] = int(state["running_count"]) + 1
+
+    db.update_task(
+        task_id,
+        image_provider_id=int(provider["id"]),
+        image_provider_name=str(provider["name"]),
+        stage=running_stage or f"正在使用生图提供商：{provider['name']}",
+    )
+    publish_task_snapshot(task_id)
+    return {"provider": provider, "state": state}
+
+
+async def release_image_provider_slot(task_id: int, lease: dict[str, Any] | None) -> None:
+    if not lease:
+        return
+    provider = lease.get("provider") if isinstance(lease, dict) else None
+    state = lease.get("state") if isinstance(lease, dict) else None
+    if not provider or not state:
+        return
+    state["semaphore"].release()
+    pool_lock = ensure_provider_pool_lock()
+    async with pool_lock:
+        state["running_count"] = max(0, int(state["running_count"]) - 1)
+        state["assigned_count"] = max(0, int(state["assigned_count"]) - 1)
+    publish_task_snapshot(task_id)
+
+
+def ensure_conversation_message_allowed(
+    conn: sqlite3.Connection,
+    conversation_id: int,
+    expected_mode: str,
+) -> sqlite3.Row:
+    conversation = conn.execute(
+        """
+        select c.*,
+            (
+                select t.mode from tasks t
+                where t.conversation_id = c.id
+                order by t.id desc
+                limit 1
+            ) as latest_task_mode
+        from conversations c
+        where c.id = ?
+        """,
+        (conversation_id,),
+    ).fetchone()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    current_mode = resolved_conversation_mode(conversation)
+    if current_mode != expected_mode and (
+        normalize_conversation_mode(conversation["mode"]) or normalize_conversation_mode(conversation["latest_task_mode"])
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"当前会话属于{conversation_mode_label(current_mode)}模式，不能直接切换到{conversation_mode_label(expected_mode)}模式继续发送。",
+                "status_code": 409,
+                "suggestion": "请新建一个对应模式的新对话，或回到原模式继续当前会话。",
+            },
+        )
+
+    active_task = conn.execute(
+        """
+        select id, mode, status, stage
+        from tasks
+        where conversation_id = ?
+          and status in ('queued', 'running')
+        order by id desc
+        limit 1
+        """,
+        (conversation_id,),
+    ).fetchone()
+    if active_task:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"当前会话仍有{conversation_mode_label(active_task['mode'])}任务{task_status_label(active_task['status'])}，请先停止该任务或新建对话后再继续发送。",
+                "status_code": 409,
+                "suggestion": "同一会话在任务排队或运行时不能继续发送新消息；你可以先停止该任务，或者点击新对话继续。",
+            },
+        )
+
+    if normalize_conversation_mode(conversation["mode"]) != expected_mode:
+        conn.execute(
+            "update conversations set mode = ?, updated_at = ? where id = ?",
+            (expected_mode, db.now_iso(), conversation_id),
+        )
+        conversation = conn.execute(
+            """
+            select c.*,
+                (
+                    select t.mode from tasks t
+                    where t.conversation_id = c.id
+                    order by t.id desc
+                    limit 1
+                ) as latest_task_mode
+            from conversations c
+            where c.id = ?
+            """,
+            (conversation_id,),
+        ).fetchone()
+    return conversation
+
+
+def create_direct_mode_user_message(
+    *,
+    conversation_id: int,
+    prompt: str,
+    uploads: list[tuple[Path, str]] | None = None,
+) -> int:
+    stamp = db.now_iso()
+    meta = {
+        "uploads": [str(path) for path, _mime in (uploads or [])],
+    }
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            insert into messages (conversation_id, role, content, meta_json, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                "user",
+                prompt,
+                db.json_dumps(meta),
+                stamp,
+                stamp,
+            ),
+        )
+        message_id = int(cursor.lastrowid)
+        conn.execute(
+            "update conversations set updated_at = ? where id = ?",
+            (stamp, conversation_id),
+        )
+    return message_id
+
+
+def ensure_conversation_task_retry_allowed(conn: sqlite3.Connection, conversation_id: int, retry_source_task_id: int) -> None:
+    active_task = conn.execute(
+        """
+        select id, mode, status
+        from tasks
+        where conversation_id = ?
+          and id != ?
+          and status in ('queued', 'running')
+        order by id desc
+        limit 1
+        """,
+        (conversation_id, retry_source_task_id),
+    ).fetchone()
+    if active_task:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"当前会话仍有{conversation_mode_label(active_task['mode'])}任务{task_status_label(active_task['status'])}，请先停止该任务后再重试。",
+                "status_code": 409,
+                "suggestion": "同一会话同一时刻只能运行一个任务；你可以先停止当前任务，或稍后再重试。",
+            },
+        )
+
+
 def ensure_task_slot() -> None:
-    if active_task_count() >= MAX_CONCURRENT_TASKS:
+    capacity = provider_pool_capacity()
+    if active_task_count() >= capacity:
         raise HTTPException(
             status_code=429,
             detail={
-                "message": f"当前已有 {MAX_CONCURRENT_TASKS} 个生图任务在运行或排队，请等待其中一个完成后再创建新任务。",
+                "message": f"当前生图提供商池最多支持 {capacity} 个任务运行或排队，请等待其中一个完成后再创建新任务。",
                 "status_code": 429,
                 "suggestion": "可以在任务卡片里停止不需要的任务，或等待任务完成。",
             },
@@ -1554,22 +2132,16 @@ def schedule_task(task_id: int, coro: Any) -> None:
 
 
 async def run_with_slot(task_id: int, worker: Any) -> None:
-    global TASK_SEMAPHORE
-    if TASK_SEMAPHORE is None:
-        TASK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     try:
-        db.update_task(task_id, status="queued", progress=3, stage="等待生图通道")
-        publish_task_snapshot(task_id)
-        async with TASK_SEMAPHORE:
-            task = db.get_task(task_id)
-            if task and task.get("cancel_requested"):
-                db.cancel_task(task_id)
-                publish_task_snapshot(task_id)
-                publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
-                return
-            db.update_task(task_id, status="running", progress=8, stage="任务已启动")
+        task = db.get_task(task_id)
+        if task and task.get("cancel_requested"):
+            db.cancel_task(task_id)
             publish_task_snapshot(task_id)
-            await worker()
+            publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
+            return
+        db.update_task(task_id, status="running", progress=8, stage="任务已启动")
+        publish_task_snapshot(task_id)
+        await worker()
     except asyncio.CancelledError:
         db.cancel_task(task_id)
         publish_task_snapshot(task_id)
@@ -1609,11 +2181,9 @@ def ensure_default_provider() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    global TASK_SEMAPHORE
     ensure_dirs()
     db.init_db()
     ensure_default_provider()
-    TASK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     with db.connect() as conn:
         conn.execute(
             """
@@ -1623,6 +2193,33 @@ def startup() -> None:
             """,
             ("服务重启后，内存中的后台任务已中断，请重新创建任务。", db.now_iso()),
         )
+
+
+@app.get(ACCESS_LOGIN_PATH, response_class=HTMLResponse, response_model=None)
+def access_login_page(request: Request, next: str = "/"):
+    if access_cookie_valid(request):
+        return RedirectResponse(url=sanitized_next_path(next), status_code=303)
+    return HTMLResponse(login_page_html(next))
+
+
+@app.post(ACCESS_LOGIN_PATH, response_class=HTMLResponse, response_model=None)
+async def access_login_submit(
+    password: str = Form(...),
+    next: str = Form(default="/"),
+):
+    target = sanitized_next_path(next)
+    if not validate_access_password(password):
+        return HTMLResponse(login_page_html(target, ACCESS_ERROR_MESSAGE), status_code=401)
+    response = RedirectResponse(url=target, status_code=303)
+    response.set_cookie(
+        ACCESS_COOKIE_NAME,
+        ACCESS_COOKIE_TOKEN,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+    )
+    return response
 
 
 @app.get("/api/health")
@@ -1684,10 +2281,23 @@ def put_app_settings(request: AppSettingsRequest) -> dict[str, Any]:
 
 @app.get("/api/providers")
 def list_providers() -> dict[str, Any]:
-    ensure_default_provider()
-    with db.connect() as conn:
-        rows = conn.execute("select * from providers order by id asc").fetchall()
-    return {"items": [db.row_to_dict(row) for row in rows]}
+    items = load_provider_rows()
+    pool = image_provider_pool_snapshot()
+    pool_ids = {int(provider["id"]) for provider in pool["providers"]}
+    pool_by_id = {int(provider["id"]): provider for provider in pool["providers"]}
+    return {
+        "items": [
+            {
+                **provider,
+                "in_image_pool": int(provider["id"]) in pool_ids,
+                "pool_assigned_tasks": pool_by_id.get(int(provider["id"]), {}).get("assigned_tasks", 0),
+                "pool_running_tasks": pool_by_id.get(int(provider["id"]), {}).get("running_tasks", 0),
+                "pool_idle_slots": pool_by_id.get(int(provider["id"]), {}).get("idle_slots", MAX_CONCURRENT_TASKS),
+            }
+            for provider in items
+        ],
+        "image_provider_pool": pool,
+    }
 
 
 @app.post("/api/providers")
@@ -1807,6 +2417,16 @@ def delete_prompt(prompt_id: int) -> dict[str, Any]:
 async def generate_image(request: GenerateRequest) -> dict[str, Any]:
     ensure_task_slot()
     db.add_prompt(request.prompt, source="auto", mode="generate")
+    conversation_id: int | None = None
+    user_message_id: int | None = None
+    if request.conversation_id:
+        with db.connect() as conn:
+            conversation = ensure_conversation_message_allowed(conn, int(request.conversation_id), "generate")
+            conversation_id = int(conversation["id"])
+        user_message_id = create_direct_mode_user_message(
+            conversation_id=conversation_id,
+            prompt=request.prompt,
+        )
     payload = compact_params(
         {
             "endpoint": "/v1/responses",
@@ -1823,65 +2443,78 @@ async def generate_image(request: GenerateRequest) -> dict[str, Any]:
             "moderation": request.moderation,
             "action": request.action,
             "partial_images": request.partial_images,
+            "conversation_id": conversation_id,
         }
     )
-    task_id = db.create_task("generate", request.prompt, payload)
-    schedule_task(task_id, run_generate_task(task_id, request, payload))
-    return {"task": db.get_task(task_id)}
+    task_id = db.create_task("generate", request.prompt, payload, conversation_id=conversation_id, user_message_id=user_message_id)
+    schedule_task(task_id, run_generate_task(task_id, request, payload, conversation_id=conversation_id, user_message_id=user_message_id))
+    return {"task": db.get_task(task_id), "user_message_id": user_message_id}
 
 
-async def run_generate_task(task_id: int, request: GenerateRequest, payload: dict[str, Any]) -> None:
+async def run_generate_task(task_id: int, request: GenerateRequest, payload: dict[str, Any], *, conversation_id: int | None = None, user_message_id: int | None = None) -> None:
     async def worker() -> None:
         title = request.prompt[:48] or f"task-{task_id}"
         bucket = task_image_folder(task_id, title)
         responses: list[dict[str, Any]] = []
         saved_images: list[dict[str, Any]] = []
-        for index in range(request.n):
-            db.update_task(
-                task_id,
-                progress=min(15 + int(index / max(request.n, 1) * 70), 85),
-                stage=f"正在生成第 {index + 1}/{request.n} 张",
-            )
-            response = await call_responses_image_generation(
-                model=request.model,
-                prompt=request.prompt,
-                image_model=request.image_model,
-                size=request.size,
-                quality=request.quality,
-                output_format=request.output_format,
-                background=request.background,
-                output_compression=request.output_compression,
-                moderation=request.moderation,
-                action=request.action,
-                partial_images=request.partial_images,
-                config=request.config,
-                on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                on_stream_event=lambda event: handle_image_stream_event(task_id, event),
-            )
-            responses.append(sanitize_response(response))
-            image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
-            saved_images.extend(
-                public_task_image(item, task_id=task_id, title=title, bucket=bucket)
-                for item in image_items
-            )
-            db.update_task(
-                task_id,
-                progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
-                stage=f"已保存第 {index + 1}/{request.n} 张结果",
-            )
-        if not saved_images:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                    "endpoint": "responses",
-                    "upstream": responses,
-                    "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                },
-            )
-        db.update_task(task_id, progress=96, stage="正在整理任务结果")
-        raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses, "images": saved_images}
-        db.finish_task(task_id, raw)
+        lease = await acquire_image_provider_slot(task_id)
+        provider = lease["provider"]
+        provider_config = provider_client_config(provider)
+        try:
+            for index in range(request.n):
+                db.update_task(
+                    task_id,
+                    progress=min(15 + int(index / max(request.n, 1) * 70), 85),
+                    stage=f"正在使用 {provider['name']} 生成第 {index + 1}/{request.n} 张",
+                )
+                response = await call_responses_image_generation(
+                    model=request.model,
+                    prompt=request.prompt,
+                    image_model=request.image_model,
+                    size=request.size,
+                    quality=request.quality,
+                    output_format=request.output_format,
+                    background=request.background,
+                    output_compression=request.output_compression,
+                    moderation=request.moderation,
+                    action=request.action,
+                    partial_images=request.partial_images,
+                    config=provider_config,
+                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                    on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                )
+                responses.append(sanitize_response(response))
+                image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
+                saved_images.extend(
+                    public_task_image(item, task_id=task_id, title=title, bucket=bucket, conversation_id=conversation_id, message_id=user_message_id)
+                    for item in image_items
+                )
+                db.update_task(
+                    task_id,
+                    progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
+                    stage=f"已通过 {provider['name']} 保存第 {index + 1}/{request.n} 张结果",
+                )
+            if not saved_images:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                        "endpoint": "responses",
+                        "upstream": responses,
+                        "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                    },
+                )
+            db.update_task(task_id, progress=96, stage="正在整理任务结果")
+            raw = {
+                "endpoint": "/v1/responses",
+                "tool": "image_generation",
+                "image_provider": {"id": provider["id"], "name": provider["name"]},
+                "responses": responses,
+                "images": saved_images,
+            }
+            db.finish_task(task_id, raw)
+        finally:
+            await release_image_provider_slot(task_id, lease)
     await run_with_slot(task_id, worker)
 
 
@@ -1903,6 +2536,22 @@ async def edit_image(
     if mask is not None:
         mask_path, mask_mime = await save_upload(mask)
         saved_mask = (mask_path, mask_mime)
+    conversation_id = params.get("conversation_id")
+    if conversation_id is not None:
+        try:
+            conversation_id = int(conversation_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="conversation_id is invalid")
+    if conversation_id:
+        with db.connect() as conn:
+            conversation = ensure_conversation_message_allowed(conn, int(conversation_id), "edit")
+            conversation_id = int(conversation["id"])
+    uploads_for_message = [*saved_images, *([saved_mask] if saved_mask else [])]
+    user_message_id = create_direct_mode_user_message(
+        conversation_id=conversation_id,
+        prompt=prompt,
+        uploads=uploads_for_message,
+    ) if conversation_id else None
 
     payload = compact_params(
         {
@@ -1921,15 +2570,16 @@ async def edit_image(
             "input_fidelity": params.get("input_fidelity", "auto"),
             "action": "edit",
             "partial_images": params.get("partial_images"),
+            "conversation_id": conversation_id,
         }
     )
-    task_id = db.create_task("edit", prompt, payload)
+    task_id = db.create_task("edit", prompt, payload, conversation_id=conversation_id, user_message_id=user_message_id)
     for item in saved_images:
-        public_input_image(item, source="input", title=prompt, task_id=task_id)
+        public_input_image(item, source="input", title=prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
     if saved_mask:
-        public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=task_id)
-    schedule_task(task_id, run_edit_task(task_id, params, prompt, saved_images, saved_mask))
-    return {"task": db.get_task(task_id)}
+        public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
+    schedule_task(task_id, run_edit_task(task_id, params, prompt, saved_images, saved_mask, conversation_id=conversation_id, user_message_id=user_message_id))
+    return {"task": db.get_task(task_id), "user_message_id": user_message_id}
 
 
 async def run_edit_task(
@@ -1938,6 +2588,9 @@ async def run_edit_task(
     prompt: str,
     saved_images: list[tuple[Path, str]],
     saved_mask: tuple[Path, str] | None,
+    *,
+    conversation_id: int | None = None,
+    user_message_id: int | None = None,
 ) -> None:
     async def worker() -> None:
         title = prompt[:48] or f"task-{task_id}"
@@ -1945,57 +2598,68 @@ async def run_edit_task(
         output_format = str(params.get("output_format", "png"))
         responses: list[dict[str, Any]] = []
         saved_output_images: list[dict[str, Any]] = []
-        client_config = ClientConfig(**params.get("config", {}))
         count = clamp_image_count(params.get("n", 1))
-        for index in range(count):
-            db.update_task(
-                task_id,
-                progress=min(15 + int(index / max(count, 1) * 70), 85),
-                stage=f"正在编辑第 {index + 1}/{count} 张",
-            )
-            response = await call_responses_image_generation(
-                model=str(params.get("model", "gpt-5.4")),
-                prompt=prompt,
-                image_model=str(params.get("image_model", "gpt-image-2")),
-                size=str(params.get("size", "2560x1440")),
-                quality=str(params.get("quality", "high")),
-                output_format=output_format,
-                background=params.get("background", "auto"),
-                output_compression=params.get("output_compression"),
-                moderation=params.get("moderation", "auto"),
-                action="edit",
-                partial_images=params.get("partial_images"),
-                config=client_config,
-                uploaded=saved_images,
-                mask=saved_mask,
-                input_fidelity=str(params.get("input_fidelity", "auto")),
-                on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                on_stream_event=lambda event: handle_image_stream_event(task_id, event),
-            )
-            responses.append(sanitize_response(response))
-            image_items = extract_images_from_responses(response, output_format, folder=bucket)
-            saved_output_images.extend(
-                public_task_image(item, task_id=task_id, title=title, bucket=bucket)
-                for item in image_items
-            )
-            db.update_task(
-                task_id,
-                progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
-                stage=f"已保存第 {index + 1}/{count} 张编辑结果",
-            )
-        if not saved_output_images:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                    "endpoint": "responses",
-                    "upstream": responses,
-                    "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                },
-            )
-        db.update_task(task_id, progress=96, stage="正在整理任务结果")
-        raw = {"endpoint": "/v1/responses", "tool": "image_generation", "responses": responses, "images": saved_output_images}
-        db.finish_task(task_id, raw)
+        lease = await acquire_image_provider_slot(task_id)
+        provider = lease["provider"]
+        client_config = provider_client_config(provider)
+        try:
+            for index in range(count):
+                db.update_task(
+                    task_id,
+                    progress=min(15 + int(index / max(count, 1) * 70), 85),
+                    stage=f"正在使用 {provider['name']} 编辑第 {index + 1}/{count} 张",
+                )
+                response = await call_responses_image_generation(
+                    model=str(params.get("model", "gpt-5.4")),
+                    prompt=prompt,
+                    image_model=str(params.get("image_model", "gpt-image-2")),
+                    size=str(params.get("size", "2560x1440")),
+                    quality=str(params.get("quality", "high")),
+                    output_format=output_format,
+                    background=params.get("background", "auto"),
+                    output_compression=params.get("output_compression"),
+                    moderation=params.get("moderation", "auto"),
+                    action="edit",
+                    partial_images=params.get("partial_images"),
+                    config=client_config,
+                    uploaded=saved_images,
+                    mask=saved_mask,
+                    input_fidelity=str(params.get("input_fidelity", "auto")),
+                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                    on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                )
+                responses.append(sanitize_response(response))
+                image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                saved_output_images.extend(
+                    public_task_image(item, task_id=task_id, title=title, bucket=bucket, conversation_id=conversation_id, message_id=user_message_id)
+                    for item in image_items
+                )
+                db.update_task(
+                    task_id,
+                    progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
+                    stage=f"已通过 {provider['name']} 保存第 {index + 1}/{count} 张编辑结果",
+                )
+            if not saved_output_images:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                        "endpoint": "responses",
+                        "upstream": responses,
+                        "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                    },
+                )
+            db.update_task(task_id, progress=96, stage="正在整理任务结果")
+            raw = {
+                "endpoint": "/v1/responses",
+                "tool": "image_generation",
+                "image_provider": {"id": provider["id"], "name": provider["name"]},
+                "responses": responses,
+                "images": saved_output_images,
+            }
+            db.finish_task(task_id, raw)
+        finally:
+            await release_image_provider_slot(task_id, lease)
     await run_with_slot(task_id, worker)
 
 
@@ -2018,7 +2682,13 @@ def list_tasks(limit: int = 30) -> dict[str, Any]:
                 ).fetchall()
             ]
             task["images"] = enrich_images_with_prompt(images, task)
-    return {"items": tasks, "max_concurrent": MAX_CONCURRENT_TASKS, "active_count": active_task_count()}
+    pool = image_provider_pool_snapshot()
+    return {
+        "items": tasks,
+        "max_concurrent": pool["total_capacity"],
+        "active_count": active_task_count(),
+        "image_provider_pool": pool,
+    }
 
 
 @app.get("/api/tasks/{task_id}")
@@ -2102,16 +2772,19 @@ def cancel_task(task_id: int) -> dict[str, Any]:
 @app.post("/api/conversations")
 def create_conversation(request: ConversationCreate) -> dict[str, Any]:
     stamp = db.now_iso()
+    mode = normalize_conversation_mode(request.mode)
+    title = request.title.strip() or "新的生图对话"
     with db.connect() as conn:
         cursor = conn.execute(
             """
-            insert into conversations (title, context_limit, created_at, updated_at)
-            values (?, ?, ?, ?)
+            insert into conversations (title, mode, context_limit, created_at, updated_at)
+            values (?, ?, ?, ?, ?)
             """,
-            (request.title, request.context_limit, stamp, stamp),
+            (title, mode, request.context_limit, stamp, stamp),
         )
         conversation_id = int(cursor.lastrowid)
-    return {"id": conversation_id, "title": request.title, "context_limit": request.context_limit}
+        row = conn.execute("select * from conversations where id = ?", (conversation_id,)).fetchone()
+    return serialize_conversation_row(row)
 
 
 @app.get("/api/conversations")
@@ -2156,7 +2829,7 @@ def list_conversations() -> dict[str, Any]:
             order by c.updated_at desc
             """
         ).fetchall()
-    return {"items": [db.row_to_dict(row) for row in rows]}
+    return {"items": [serialize_conversation_row(row, latest_task_mode=row["latest_task_mode"]) for row in rows]}
 
 
 @app.put("/api/conversations/{conversation_id}")
@@ -2183,7 +2856,7 @@ def update_conversation(conversation_id: int, request: ConversationUpdate) -> di
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="conversation not found")
         row = conn.execute("select * from conversations where id = ?", (conversation_id,)).fetchone()
-    return db.row_to_dict(row)
+    return serialize_conversation_row(row)
 
 
 @app.delete("/api/conversations/{conversation_id}")
@@ -2282,7 +2955,8 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
         task = task_map.get(int(image["task_id"])) if image.get("task_id") else None
         if task:
             enrich_images_with_prompt([image], task)
-    return {"conversation": db.row_to_dict(conversation), "messages": messages, "images": images, "tasks": tasks}
+    latest_task_mode = tasks[-1]["mode"] if tasks else None
+    return {"conversation": serialize_conversation_row(conversation, latest_task_mode=latest_task_mode), "messages": messages, "images": images, "tasks": tasks}
 
 
 @app.put("/api/messages/{message_id}")
@@ -2314,6 +2988,11 @@ async def storyboard_message(
     params = StoryboardRequest(**normalize_text_fields(parse_params(params_json)))
     if len(images or []) > 3:
         raise HTTPException(status_code=400, detail="分镜模式最多上传 3 张参考图")
+    with db.connect() as conn:
+        conversation = ensure_conversation_message_allowed(conn, conversation_id, "storyboard")
+        previous_response_id = conversation["previous_response_id"]
+        conversation_title = conversation["title"]
+        context_limit = max(0, min(int(params.context_limit), 50))
     uploaded = [await save_upload(upload) for upload in images or []]
     selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)), conversation_id=conversation_id)
     selected_reference_uploads = [
@@ -2331,15 +3010,6 @@ async def storyboard_message(
     db.add_prompt(params.prompt, source="auto", mode="storyboard")
 
     with db.connect() as conn:
-        conversation = conn.execute(
-            "select * from conversations where id = ?",
-            (conversation_id,),
-        ).fetchone()
-        if not conversation:
-            raise HTTPException(status_code=404, detail="conversation not found")
-        previous_response_id = conversation["previous_response_id"]
-        conversation_title = conversation["title"]
-        context_limit = max(0, min(int(params.context_limit), 50))
         recent_messages = [
             db.row_to_dict(row)
             for row in conn.execute(
@@ -2564,117 +3234,123 @@ async def run_storyboard_task(
         previous_image: tuple[Path, str] | None = None
         saved_images: list[dict[str, Any]] = []
         shot_results: list[dict[str, Any]] = []
-
-        for index, shot in enumerate(shots, start=1):
-            shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
-            shot["name"] = shot_name
-            shot["status"] = "running"
-            update_storyboard_task_state(task_id, task_payload, storyboard_state)
-            progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
-            db.update_task(task_id, progress=progress, stage=f"正在生成镜头 {index}/{total}：{shot_name}")
-            continuity_prompt = "\n".join(
-                part
-                for part in [
-                    f"人物一致性概述：{plan.get('character_summary')}",
-                    f"场景一致性概述：{plan.get('scene_summary')}",
-                    f"镜头顺序：第 {index}/{total} 镜头，文件名/标题：{shot_name}",
-                    f"连续性要求：{shot.get('continuity')}",
-                    "必须保持人物身份、服装、发型、道具、空间方位、光线方向和画面质感连续。",
-                    "每次只输出这一镜头的一张首帧画面，不要拼图，不要多格漫画。",
-                    str(shot.get("planner_prompt") or shot.get("prompt") or ""),
-                ]
-                if str(part or "").strip()
-            )
-            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, image_candidates)
-            action = "edit" if edit_inputs else "generate"
-            try:
-                response = await call_responses_image_generation(
-                    model=params.model,
-                    prompt=continuity_prompt,
-                    image_model=params.image_model,
-                    size=params.size,
-                    quality=params.quality,
-                    output_format=output_format,
-                    background=params.background,
-                    output_compression=params.output_compression,
-                    moderation=params.moderation,
-                    action=action,
-                    partial_images=params.partial_images,
-                    config=params.config,
-                    uploaded=edit_inputs,
-                    input_fidelity=params.input_fidelity,
-                    input_image_notes=input_image_notes,
-                    previous_response_id=None,
-                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                    on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
+        lease = await acquire_image_provider_slot(task_id)
+        provider = lease["provider"]
+        provider_config = provider_client_config(provider)
+        raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
+        try:
+            for index, shot in enumerate(shots, start=1):
+                shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
+                shot["name"] = shot_name
+                shot["status"] = "running"
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
+                db.update_task(task_id, progress=progress, stage=f"正在使用 {provider['name']} 生成镜头 {index}/{total}：{shot_name}")
+                continuity_prompt = "\n".join(
+                    part
+                    for part in [
+                        f"人物一致性概述：{plan.get('character_summary')}",
+                        f"场景一致性概述：{plan.get('scene_summary')}",
+                        f"镜头顺序：第 {index}/{total} 镜头，文件名/标题：{shot_name}",
+                        f"连续性要求：{shot.get('continuity')}",
+                        "必须保持人物身份、服装、发型、道具、空间方位、光线方向和画面质感连续。",
+                        "每次只输出这一镜头的一张首帧画面，不要拼图，不要多格漫画。",
+                        str(shot.get("planner_prompt") or shot.get("prompt") or ""),
+                    ]
+                    if str(part or "").strip()
                 )
-                image_items = extract_images_from_responses(response, output_format, folder=bucket)
-                if not image_items:
-                    raise HTTPException(
-                        status_code=502,
-                        detail={
-                            "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                            "endpoint": "responses",
-                            "upstream": sanitize_response(response),
-                            "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                        },
+                edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, image_candidates)
+                action = "edit" if edit_inputs else "generate"
+                try:
+                    response = await call_responses_image_generation(
+                        model=params.model,
+                        prompt=continuity_prompt,
+                        image_model=params.image_model,
+                        size=params.size,
+                        quality=params.quality,
+                        output_format=output_format,
+                        background=params.background,
+                        output_compression=params.output_compression,
+                        moderation=params.moderation,
+                        action=action,
+                        partial_images=params.partial_images,
+                        config=provider_config,
+                        uploaded=edit_inputs,
+                        input_fidelity=params.input_fidelity,
+                        input_image_notes=input_image_notes,
+                        previous_response_id=None,
+                        on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                        on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
                     )
-                renamed = rename_output_image(image_items[0], shot_name)
-                image_record = public_task_image(
-                    renamed,
-                    conversation_id=conversation_id,
-                    message_id=assistant_message_id,
-                    task_id=task_id,
-                    title=shot_name,
-                    bucket=bucket,
-                )
-                saved_images.append(image_record)
-                previous_image = (renamed[0], renamed[2])
-                shot["status"] = "done"
-                shot["image_id"] = image_record["id"]
-                shot["url"] = image_record["url"]
-                shot["execution_prompt"] = continuity_prompt
-                image_record["prompt_text"] = continuity_prompt
-                shot_results.append(
-                    {
-                        "shot": shot,
-                        "action": action,
-                        "response": sanitize_response(response),
-                        "image": image_record,
-                    }
-                )
-                db.add_prompt(continuity_prompt, source="auto", mode="storyboard")
-                update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                db.update_task(
-                    task_id,
-                    progress=min(32 + int(index / max(total, 1) * 60), 92),
-                    stage=f"已保存镜头 {index}/{total}：{shot_name}",
-                )
-                publish_storyboard_image_saved(
-                    task_id,
-                    conversation_id=conversation_id,
-                    message_id=assistant_message_id,
-                    image=image_record,
-                    shot=shot,
-                    index=index,
-                    total=total,
-                )
-            except HTTPException as exc:
-                shot["status"] = "failed"
-                shot["error"] = exc.detail
-                update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                raw_for_meta["image_status"] = "failed"
-                raw_for_meta["image_error"] = exc.detail
-                update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
-                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-            except Exception as exc:
-                shot["status"] = "failed"
-                shot["error"] = str(exc)
-                update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                raw_for_meta["image_status"] = "failed"
-                raw_for_meta["image_error"] = str(exc)
-                update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
-                raise
+                    image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                    if not image_items:
+                        raise HTTPException(
+                            status_code=502,
+                            detail={
+                                "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                                "endpoint": "responses",
+                                "upstream": sanitize_response(response),
+                                "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                            },
+                        )
+                    renamed = rename_output_image(image_items[0], shot_name)
+                    image_record = public_task_image(
+                        renamed,
+                        conversation_id=conversation_id,
+                        message_id=assistant_message_id,
+                        task_id=task_id,
+                        title=shot_name,
+                        bucket=bucket,
+                    )
+                    saved_images.append(image_record)
+                    previous_image = (renamed[0], renamed[2])
+                    shot["status"] = "done"
+                    shot["image_id"] = image_record["id"]
+                    shot["url"] = image_record["url"]
+                    shot["execution_prompt"] = continuity_prompt
+                    image_record["prompt_text"] = continuity_prompt
+                    shot_results.append(
+                        {
+                            "shot": shot,
+                            "action": action,
+                            "response": sanitize_response(response),
+                            "image": image_record,
+                        }
+                    )
+                    db.add_prompt(continuity_prompt, source="auto", mode="storyboard")
+                    update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                    db.update_task(
+                        task_id,
+                        progress=min(32 + int(index / max(total, 1) * 60), 92),
+                        stage=f"已通过 {provider['name']} 保存镜头 {index}/{total}：{shot_name}",
+                    )
+                    publish_storyboard_image_saved(
+                        task_id,
+                        conversation_id=conversation_id,
+                        message_id=assistant_message_id,
+                        image=image_record,
+                        shot=shot,
+                        index=index,
+                        total=total,
+                    )
+                except HTTPException as exc:
+                    shot["status"] = "failed"
+                    shot["error"] = exc.detail
+                    update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                    raw_for_meta["image_status"] = "failed"
+                    raw_for_meta["image_error"] = exc.detail
+                    update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+                except Exception as exc:
+                    shot["status"] = "failed"
+                    shot["error"] = str(exc)
+                    update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                    raw_for_meta["image_status"] = "failed"
+                    raw_for_meta["image_error"] = str(exc)
+                    update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                    raise
+        finally:
+            await release_image_provider_slot(task_id, lease)
 
         raw_for_meta["image_status"] = "done"
         raw_for_meta["storyboard"] = storyboard_state
@@ -2700,8 +3376,82 @@ async def run_storyboard_task(
 async def retry_task(task_id: int) -> dict[str, Any]:
     ensure_task_slot()
     old_task = task_with_images(task_id)
-    if old_task.get("mode") != "storyboard":
-        raise HTTPException(status_code=400, detail="当前仅支持重试分镜连续生图任务")
+    if old_task.get("status") not in {"failed", "canceled"}:
+        raise HTTPException(status_code=400, detail="当前仅支持重试失败或已停止的任务")
+    conversation_id = old_task.get("conversation_id")
+    if conversation_id:
+        with db.connect() as conn:
+            ensure_conversation_task_retry_allowed(conn, int(conversation_id), int(old_task["id"]))
+    mode = str(old_task.get("mode") or "")
+    if mode == "generate":
+        params = copy.deepcopy(old_task.get("params") or {})
+        request = GenerateRequest(**normalize_text_fields(params))
+        retry_payload = compact_params({**params, "retry_of": task_id})
+        retry_id = db.create_task(
+            "generate",
+            f"重试：{old_task.get('prompt') or '普通生图任务'}",
+            retry_payload,
+            conversation_id=old_task.get("conversation_id"),
+            user_message_id=old_task.get("user_message_id"),
+        )
+        schedule_task(
+            retry_id,
+            run_generate_task(
+                retry_id,
+                request,
+                retry_payload,
+                conversation_id=old_task.get("conversation_id"),
+                user_message_id=old_task.get("user_message_id"),
+            ),
+        )
+        return {"task": db.get_task(retry_id)}
+    if mode == "edit":
+        params = copy.deepcopy(old_task.get("params") or {})
+        prompt = str(params.get("prompt") or old_task.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="该编辑任务缺少可重试的原始提示词")
+        input_images: list[tuple[Path, str]] = []
+        saved_mask: tuple[Path, str] | None = None
+        for image in old_task.get("images", []):
+            if image.get("source") not in {"input", "mask"}:
+                continue
+            path = Path(str(image.get("file_path") or ""))
+            if not path.exists():
+                continue
+            item = (path, str(image.get("mime_type") or "image/png"))
+            if image.get("source") == "mask":
+                saved_mask = item
+            else:
+                input_images.append(item)
+        if not input_images:
+            raise HTTPException(status_code=400, detail="该编辑任务缺少可重试的原始输入图")
+        retry_payload = compact_params({**params, "retry_of": task_id})
+        retry_id = db.create_task(
+            "edit",
+            f"重试：{prompt}",
+            retry_payload,
+            conversation_id=old_task.get("conversation_id"),
+            user_message_id=old_task.get("user_message_id"),
+        )
+        for item in input_images:
+            public_input_image(item, source="input", title=prompt, task_id=retry_id, conversation_id=old_task.get("conversation_id"), message_id=old_task.get("user_message_id"))
+        if saved_mask:
+            public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=retry_id, conversation_id=old_task.get("conversation_id"), message_id=old_task.get("user_message_id"))
+        schedule_task(
+            retry_id,
+            run_edit_task(
+                retry_id,
+                params,
+                prompt,
+                input_images,
+                saved_mask,
+                conversation_id=old_task.get("conversation_id"),
+                user_message_id=old_task.get("user_message_id"),
+            ),
+        )
+        return {"task": db.get_task(retry_id)}
+    if mode != "storyboard":
+        raise HTTPException(status_code=400, detail="当前仅支持重试普通生图、编辑和分镜连续生图任务")
     params = copy.deepcopy(old_task.get("params") or {})
     storyboard = params.get("storyboard") if isinstance(params.get("storyboard"), dict) else {}
     shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
@@ -2787,85 +3537,101 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
         bucket = task_image_folder(task_id, f"重试分镜-{old_task.get('prompt') or task_id}")
         db.update_task(task_id, progress=12, stage=f"准备从第 {done_count + 1}/{total} 个镜头继续")
         update_storyboard_task_state(task_id, payload, storyboard)
-        for index, shot in enumerate(shots, start=1):
-            if not isinstance(shot, dict) or shot.get("status") == "done":
-                continue
-            shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
-            shot["name"] = shot_name
-            shot["status"] = "running"
-            update_storyboard_task_state(task_id, payload, storyboard)
-            db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"重试生成镜头 {index}/{total}：{shot_name}")
-            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
-            action = "edit" if edit_inputs else "generate"
-            try:
-                if previous_image is None and index > 1:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "message": "无法继续分镜：没有找到上一镜头输出图作为 edit 输入。",
-                            "suggestion": "请从原对话重新提交分镜需求，或选择一张参考图后重试。",
-                        },
+        lease = await acquire_image_provider_slot(task_id)
+        provider = lease["provider"]
+        client_config = provider_client_config(provider)
+        try:
+            for index, shot in enumerate(shots, start=1):
+                if not isinstance(shot, dict) or shot.get("status") == "done":
+                    continue
+                shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
+                shot["name"] = shot_name
+                shot["status"] = "running"
+                update_storyboard_task_state(task_id, payload, storyboard)
+                db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"正在使用 {provider['name']} 重试镜头 {index}/{total}：{shot_name}")
+                edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
+                action = "edit" if edit_inputs else "generate"
+                try:
+                    if previous_image is None and index > 1:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "message": "无法继续分镜：没有找到上一镜头输出图作为 edit 输入。",
+                                "suggestion": "请从原对话重新提交分镜需求，或选择一张参考图后重试。",
+                            },
+                        )
+                    response = await call_responses_image_generation(
+                        model=str(payload.get("model", "gpt-5.4")),
+                        prompt=str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or ""),
+                        image_model=str(payload.get("image_model", "gpt-image-2")),
+                        size=str(payload.get("size", "2560x1440")),
+                        quality=str(payload.get("quality", "high")),
+                        output_format=output_format,
+                        background=payload.get("background", "auto"),
+                        output_compression=payload.get("output_compression"),
+                        moderation=payload.get("moderation", "auto"),
+                        action=action,
+                        partial_images=payload.get("partial_images"),
+                        config=client_config,
+                        uploaded=edit_inputs,
+                        input_fidelity=str(payload.get("input_fidelity", "high")),
+                        input_image_notes=input_image_notes,
+                        previous_response_id=None,
+                        on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                        on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
                     )
-                response = await call_responses_image_generation(
-                    model=str(payload.get("model", "gpt-5.4")),
-                    prompt=str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or ""),
-                    image_model=str(payload.get("image_model", "gpt-image-2")),
-                    size=str(payload.get("size", "2560x1440")),
-                    quality=str(payload.get("quality", "high")),
-                    output_format=output_format,
-                    background=payload.get("background", "auto"),
-                    output_compression=payload.get("output_compression"),
-                    moderation=payload.get("moderation", "auto"),
-                    action=action,
-                    partial_images=payload.get("partial_images"),
-                    config=client_config,
-                    uploaded=edit_inputs,
-                    input_fidelity=str(payload.get("input_fidelity", "high")),
-                    input_image_notes=input_image_notes,
-                    previous_response_id=None,
-                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                    on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
-                )
-                image_items = extract_images_from_responses(response, output_format, folder=bucket)
-                if not image_items:
-                    raise HTTPException(status_code=502, detail="Responses API 已返回，但没有找到 image_generation_call.result 图片数据。")
-                renamed = rename_output_image(image_items[0], shot_name)
-                image_record = public_task_image(
-                    renamed,
-                    conversation_id=old_task.get("conversation_id"),
-                    message_id=old_task.get("assistant_message_id"),
-                    task_id=task_id,
-                    title=shot_name,
-                    bucket=bucket,
-                )
-                saved_images.append(image_record)
-                previous_image = (renamed[0], renamed[2])
-                shot["status"] = "done"
-                shot["image_id"] = image_record["id"]
-                shot["url"] = image_record["url"]
-                image_record["prompt_text"] = str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or "")
-                update_storyboard_task_state(task_id, payload, storyboard)
-                db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已重试保存镜头 {index}/{total}：{shot_name}")
-                publish_storyboard_image_saved(
-                    task_id,
-                    conversation_id=old_task.get("conversation_id"),
-                    message_id=old_task.get("assistant_message_id"),
-                    image=image_record,
-                    shot=shot,
-                    index=index,
-                    total=total,
-                )
-            except HTTPException as exc:
-                shot["status"] = "failed"
-                shot["error"] = exc.detail
-                update_storyboard_task_state(task_id, payload, storyboard)
-                raise
-            except Exception as exc:
-                shot["status"] = "failed"
-                shot["error"] = str(exc)
-                update_storyboard_task_state(task_id, payload, storyboard)
-                raise
-        db.finish_task(task_id, {"retry_of": old_task.get("id"), "images": saved_images, "raw": {"storyboard": storyboard}})
+                    image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                    if not image_items:
+                        raise HTTPException(status_code=502, detail="Responses API 已返回，但没有找到 image_generation_call.result 图片数据。")
+                    renamed = rename_output_image(image_items[0], shot_name)
+                    image_record = public_task_image(
+                        renamed,
+                        conversation_id=old_task.get("conversation_id"),
+                        message_id=old_task.get("assistant_message_id"),
+                        task_id=task_id,
+                        title=shot_name,
+                        bucket=bucket,
+                    )
+                    saved_images.append(image_record)
+                    previous_image = (renamed[0], renamed[2])
+                    shot["status"] = "done"
+                    shot["image_id"] = image_record["id"]
+                    shot["url"] = image_record["url"]
+                    image_record["prompt_text"] = str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or "")
+                    update_storyboard_task_state(task_id, payload, storyboard)
+                    db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已通过 {provider['name']} 重试保存镜头 {index}/{total}：{shot_name}")
+                    publish_storyboard_image_saved(
+                        task_id,
+                        conversation_id=old_task.get("conversation_id"),
+                        message_id=old_task.get("assistant_message_id"),
+                        image=image_record,
+                        shot=shot,
+                        index=index,
+                        total=total,
+                    )
+                except HTTPException as exc:
+                    shot["status"] = "failed"
+                    shot["error"] = exc.detail
+                    update_storyboard_task_state(task_id, payload, storyboard)
+                    raise
+                except Exception as exc:
+                    shot["status"] = "failed"
+                    shot["error"] = str(exc)
+                    update_storyboard_task_state(task_id, payload, storyboard)
+                    raise
+            db.finish_task(
+                task_id,
+                {
+                    "retry_of": old_task.get("id"),
+                    "images": saved_images,
+                    "raw": {
+                        "storyboard": storyboard,
+                        "image_provider": {"id": provider["id"], "name": provider["name"]},
+                    },
+                },
+            )
+        finally:
+            await release_image_provider_slot(task_id, lease)
 
     await run_with_slot(task_id, worker)
 
@@ -2885,8 +3651,8 @@ def gallery(limit: int = 200) -> dict[str, Any]:
             left join conversations c on c.id = i.conversation_id
             left join messages m on m.id = i.message_id
             left join tasks t on t.id = i.task_id
-            where i.source = 'api'
-            order by i.id desc
+            where i.source != 'mask'
+            order by datetime(i.created_at) desc, i.id desc
             limit ?
             """,
             (limit,),
@@ -2916,6 +3682,12 @@ async def chat_message(
     params = ChatRequest(**normalize_text_fields(parse_params(params_json)))
     if len(images or []) > 3:
         raise HTTPException(status_code=400, detail="对话模式最多上传 3 张参考图")
+    with db.connect() as conn:
+        conversation = ensure_conversation_message_allowed(conn, conversation_id, "chat")
+        previous_response_id = conversation["previous_response_id"]
+        conversation_title = conversation["title"]
+        context_limit = params.context_limit if params.context_limit is not None else conversation["context_limit"]
+        context_limit = max(0, min(int(context_limit), 50))
     uploaded = [await save_upload(upload) for upload in images or []]
     selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)), conversation_id=conversation_id)
     selected_reference_uploads = [
@@ -2933,16 +3705,6 @@ async def chat_message(
     db.add_prompt(params.prompt, source="auto", mode="chat")
 
     with db.connect() as conn:
-        conversation = conn.execute(
-            "select * from conversations where id = ?",
-            (conversation_id,),
-        ).fetchone()
-        if not conversation:
-            raise HTTPException(status_code=404, detail="conversation not found")
-        previous_response_id = conversation["previous_response_id"]
-        conversation_title = conversation["title"]
-        context_limit = params.context_limit if params.context_limit is not None else conversation["context_limit"]
-        context_limit = max(0, min(int(context_limit), 50))
         recent_messages = [
             db.row_to_dict(row)
             for row in conn.execute(
@@ -3168,15 +3930,23 @@ async def run_chat_task(
         raw_for_meta["selected_reference_image_refs"] = [item.get("ref") for item in image_candidates]
         raw_for_meta["selected_reference_image_ids"] = [item.get("id") for item in image_candidates if item.get("id")]
         raw_for_meta["resolved_action"] = action
-        db.update_task(task_id, progress=48, stage=f"AI 决定执行 {action}，正在生成图片")
         raw_for_meta["tool"] = "image_generation"
         raw_for_meta["image_prompt"] = image_prompt
+        update_message_meta(assistant_message_id, {**raw_for_meta, "image_status": "waiting"}, planner_response_id)
+        lease = await acquire_image_provider_slot(
+            task_id,
+            waiting_stage=f"AI 决定执行 {action}，已分配生图提供商，等待空闲通道",
+            running_stage=f"AI 决定执行 {action}，正在使用生图提供商生成图片",
+        )
+        provider = lease["provider"]
+        provider_config = provider_client_config(provider)
+        raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
         update_message_meta(
             assistant_message_id,
             {
                 **raw_for_meta,
                 "image_status": "running",
-                "image_stage": f"AI 决定执行 {action}，正在生成图片",
+                "image_stage": f"AI 决定执行 {action}，正在使用 {provider['name']} 生成图片",
             },
             planner_response_id,
         )
@@ -3193,7 +3963,7 @@ async def run_chat_task(
                 moderation=params.moderation,
                 action=action,
                 partial_images=params.partial_images,
-                config=params.config,
+                config=provider_config,
                 uploaded=edit_inputs,
                 input_fidelity=params.input_fidelity,
                 input_image_notes=input_image_notes if edit_inputs else None,
@@ -3201,7 +3971,7 @@ async def run_chat_task(
                 on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                 on_stream_event=lambda event: handle_image_stream_event(task_id, event),
             )
-            db.update_task(task_id, progress=84, stage="正在提取和保存图片")
+            db.update_task(task_id, progress=84, stage=f"正在通过 {provider['name']} 提取和保存图片")
             bucket = task_image_folder(task_id, conversation_title)
             image_items = extract_images_from_responses(image_response, params.output_format, folder=bucket)
             raw_for_meta["image_response"] = sanitize_response(image_response)
@@ -3229,6 +3999,8 @@ async def run_chat_task(
                     (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
                 )
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        finally:
+            await release_image_provider_slot(task_id, lease)
 
         images_out = [
             public_task_image(
