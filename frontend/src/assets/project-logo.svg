@@ -1,0 +1,6 @@
+<svg width="480" height="150" viewBox="0 0 480 150" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M84 22C48.6538 22 20 50.6538 20 86C20 121.346 48.6538 150 84 150H96V108H153C153 131.748 133.748 151 110 151H84C45.3401 151 14 119.66 14 81C14 42.3401 45.3401 11 84 11H157C157 28.6731 142.673 43 125 43H84C62.4609 43 45 60.4609 45 82V86C45 107.539 62.4609 125 84 125H110C128.225 125 143 110.225 143 92H96C92.6863 92 90 89.3137 90 86V61C90 57.6863 92.6863 55 96 55H168C171.314 55 174 57.6863 174 61C174 93.0325 148.033 119 116 119H90V150H84"
+        stroke="#040404" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="215" y="66" fill="#040404" font-size="60" font-weight="700" font-family="Arial, Helvetica, sans-serif" letter-spacing="2">GPT</text>
+  <text x="215" y="130" fill="#040404" font-size="60" font-weight="700" font-family="Arial, Helvetica, sans-serif" letter-spacing="2">IMAGE</text>
+</svg>

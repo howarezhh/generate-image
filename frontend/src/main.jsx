@@ -33,6 +33,7 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import projectLogo from "./assets/project-logo.svg";
 
 const API = "";
 const APP_SETTINGS_VERSION = 5;
@@ -1616,9 +1617,8 @@ function App() {
     <main className="app">
       <header className="topbar">
         <div className="brand">
-          <div className="brandMark"><Sparkles size={22} /></div>
           <div>
-            <h1>GPT Image Studio</h1>
+            <img className="brandLogo" src={projectLogo} alt="GPT Image Studio" />
             <span>个人生图工作台</span>
           </div>
         </div>

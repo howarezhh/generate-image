@@ -58,6 +58,11 @@ button {
   gap: 12px;
 }
 
+.brand > div:last-child {
+  display: grid;
+  gap: 6px;
+}
+
 .brandMark,
 .avatar {
   width: 40px;
@@ -69,6 +74,22 @@ button {
   color: #11130f;
   border-radius: 8px;
   font-weight: 800;
+}
+
+.brandLogo {
+  display: block;
+  width: min(320px, 62vw);
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: rgba(255, 251, 243, 0.98);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+}
+
+.brand span {
+  color: rgba(245, 243, 234, 0.72);
+  font-size: 12px;
+  letter-spacing: 0.04em;
 }
 
 h1,
