@@ -127,6 +127,8 @@ class ChatRequest(BaseModel):
     partial_images: int = Field(default=0, ge=0, le=3)
     context_limit: int = Field(default=10, ge=0, le=50)
     reference_image_ids: list[int] = Field(default_factory=list)
+    reference_image_roles: dict[str, str] = Field(default_factory=dict)
+    upload_reference_roles: list[str] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
     planner_config: ClientConfig | None = None
 
@@ -148,8 +150,20 @@ class StoryboardRequest(BaseModel):
     context_limit: int = Field(default=10, ge=0, le=50)
     shot_limit: int = Field(default=6, ge=1, le=12)
     reference_image_ids: list[int] = Field(default_factory=list)
+    reference_image_roles: dict[str, str] = Field(default_factory=dict)
+    upload_reference_roles: list[str] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
     planner_config: ClientConfig | None = None
+
+
+REFERENCE_ROLE_LABELS = {
+    "character": "角色锚点",
+    "scene": "场景锚点",
+    "wardrobe_prop": "服装道具锚点",
+    "style": "风格锚点",
+}
+DEFAULT_REFERENCE_ROLE_ORDER = ("character", "scene", "wardrobe_prop")
+REFERENCE_ROLE_PRIORITY = {role: index for index, role in enumerate(("character", "scene", "wardrobe_prop", "style"))}
 
 
 def public_task_image(
@@ -248,6 +262,67 @@ def compact_params(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_reference_role(value: Any, ordinal: int = 1) -> str:
+    role = str(value or "").strip().lower()
+    if role in REFERENCE_ROLE_LABELS:
+        return role
+    if ordinal <= len(DEFAULT_REFERENCE_ROLE_ORDER):
+        return DEFAULT_REFERENCE_ROLE_ORDER[ordinal - 1]
+    return "style"
+
+
+def reference_role_label(role: str) -> str:
+    return REFERENCE_ROLE_LABELS.get(role, REFERENCE_ROLE_LABELS["style"])
+
+
+def reference_candidate_hint(candidate: dict[str, Any]) -> str:
+    hint = str(candidate.get("hint") or "").strip()
+    if hint:
+        return hint
+    return "无额外说明"
+
+
+def build_reference_input_note(candidate: dict[str, Any], index: int) -> str:
+    role = str(candidate.get("role") or "style")
+    role_label = reference_role_label(role)
+    hint = reference_candidate_hint(candidate)
+    source = "用户本轮上传" if candidate.get("source") == "upload" else "用户显式选择的历史参考"
+    return (
+        f"Input image {index}: {role_label}. "
+        f"把这张图当作固定锚点，优先保留与该角色对应的身份/场景/服装/风格信息；"
+        f"来源={source}；已知说明={hint}。"
+    )
+
+
+def serialize_seed_images(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for candidate in candidates:
+        path = candidate.get("path")
+        if not isinstance(path, Path):
+            continue
+        items.append(
+            {
+                "ref": candidate.get("ref"),
+                "source": candidate.get("source"),
+                "id": candidate.get("id"),
+                "message_id": candidate.get("message_id"),
+                "task_id": candidate.get("task_id"),
+                "file_path": str(path),
+                "mime_type": candidate.get("mime_type") or "image/png",
+                "hint": candidate.get("hint") or "",
+                "role": candidate.get("role") or "style",
+            }
+        )
+    return items
+
+
+def sanitize_reference_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in candidate.items() if key not in {"path"}}
+        for candidate in candidates
+    ]
+
+
 def clamp_image_count(value: Any) -> int:
     try:
         count = int(value)
@@ -336,8 +411,10 @@ def enrich_images_with_prompt(images: list[dict[str, Any]], task: dict[str, Any]
         if not isinstance(storyboard_shots, list):
             storyboard_shots = []
         for shot in storyboard_shots:
-            if isinstance(shot, dict) and shot.get("name") and shot.get("prompt"):
-                storyboard_prompts[str(shot["name"])] = str(shot["prompt"])
+            if isinstance(shot, dict) and shot.get("name"):
+                shot_prompt = str(shot.get("execution_prompt") or shot.get("prompt") or "").strip()
+                if shot_prompt:
+                    storyboard_prompts[str(shot["name"])] = shot_prompt
     for image in images:
         if image.get("source") == "api" and storyboard_prompts.get(str(image.get("title") or "")):
             image["prompt_text"] = storyboard_prompts[str(image.get("title") or "")]
@@ -510,7 +587,7 @@ def image_prompts_from_message_meta(meta: dict[str, Any]) -> list[str]:
         if not isinstance(shot, dict):
             continue
         name = str(shot.get("name") or "").strip()
-        shot_prompt = str(shot.get("prompt") or "").strip()
+        shot_prompt = str(shot.get("planner_prompt") or shot.get("prompt") or "").strip()
         if shot_prompt:
             prompts.append(f"{name}：{shot_prompt}" if name else shot_prompt)
     return list(dict.fromkeys(prompts))
@@ -561,6 +638,7 @@ def build_chat_planner_prompt(
                 prompt_part = f"该参考图对应的一张图片生图提示词/说明={prompt_hint or '无'}"
             lines.append(
                 f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
+                f"role={reference_role_label(str(image.get('role') or 'style'))}, "
                 f"image_id={image.get('id')}, message_id={image.get('message_id')}, "
                 f"task_id={image.get('task_id')}, {prompt_part}"
             )
@@ -644,15 +722,26 @@ def parse_planner_json(text: str) -> dict[str, Any]:
 def build_storyboard_planner_prompt(
     history: list[dict[str, Any]],
     prompt: str,
-    has_images: bool,
+    image_candidates: list[dict[str, Any]] | None,
     shot_limit: int,
     attach_reference_images: bool = True,
 ) -> str:
     context = build_context_prompt(history, prompt)
-    if has_images and attach_reference_images:
-        image_note = "用户本轮已经提供了角色/场景参考图，可作为第一镜头的 edit 输入，参考图图片已随请求提供。"
-    elif has_images:
-        image_note = "用户本轮已经指定角色/场景参考图，但当前 planner 使用 chat/completions 兼容模式，只提供参考图文字说明和已知生图提示词，不附带参考图片本体；第一镜头执行生图时仍会使用这些参考图。"
+    image_candidates = image_candidates or []
+    if image_candidates:
+        lines = ["用户本轮已经明确指定了以下角色/场景参考图；第一镜头必须优先使用这些锚点规划。"]
+        for index, image in enumerate(image_candidates, start=1):
+            lines.append(
+                f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
+                f"role={reference_role_label(str(image.get('role') or 'style'))}, "
+                f"image_id={image.get('id')}, task_id={image.get('task_id')}, "
+                f"说明={reference_candidate_hint(image)}"
+            )
+        if attach_reference_images:
+            lines.append("候选顺序与随请求附带给你的参考图片顺序一致。")
+        else:
+            lines.append("当前 planner 使用 chat/completions 兼容模式，只提供参考图文字说明和已知生图提示词，不附带图片本体；不要声称你已经直接看到了图片内容。")
+        image_note = "\n".join(lines)
     else:
         image_note = "用户本轮没有提供参考图，第一镜头可从文本生成开始。"
     return f"""
@@ -734,6 +823,8 @@ def parse_storyboard_plan(text: str, shot_limit: int) -> dict[str, Any]:
                 "order": int(item.get("order") or index),
                 "name": normalize_shot_name(name, index),
                 "prompt": prompt,
+                "planner_prompt": prompt,
+                "execution_prompt": "",
                 "continuity": str(item.get("continuity") or "").strip(),
                 "status": "pending",
             }
@@ -805,9 +896,16 @@ def publish_storyboard_image_saved(
     )
 
 
-def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[dict[str, Any]]:
+def build_uploaded_image_candidates(
+    uploaded: list[tuple[Path, str]],
+    upload_roles: list[str] | None = None,
+    *,
+    start_order: int = 1,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for index, (path, mime_type) in enumerate(uploaded, start=1):
+        ordinal = start_order + index - 1
+        role = normalize_reference_role(upload_roles[index - 1] if upload_roles and index - 1 < len(upload_roles) else None, ordinal)
         candidates.append(
             {
                 "ref": f"upload:{index}",
@@ -817,18 +915,27 @@ def build_uploaded_image_candidates(uploaded: list[tuple[Path, str]]) -> list[di
                 "task_id": None,
                 "path": path,
                 "mime_type": mime_type,
+                "role": role,
+                "role_label": reference_role_label(role),
                 "hint": f"本轮用户上传的第 {index} 张图片，没有历史生图提示词",
             }
         )
     return candidates
 
 
-def build_selected_image_candidates(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_selected_image_candidates(
+    selected: list[dict[str, Any]],
+    reference_roles: dict[str, str] | None = None,
+    *,
+    start_order: int = 1,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    for item in selected:
+    for index, item in enumerate(selected, start=1):
         path = Path(item["file_path"])
         if not path.exists():
             continue
+        ordinal = start_order + index - 1
+        role = normalize_reference_role((reference_roles or {}).get(str(item["id"])), ordinal)
         candidates.append(
             {
                 "ref": f"image:{item['id']}",
@@ -838,6 +945,8 @@ def build_selected_image_candidates(selected: list[dict[str, Any]]) -> list[dict
                 "task_id": item.get("task_id"),
                 "path": path,
                 "mime_type": item.get("mime_type") or "image/png",
+                "role": role,
+                "role_label": reference_role_label(role),
                 "hint": item.get("task_prompt") or item.get("message_content") or item.get("title") or "用户指定的历史图片",
             }
         )
@@ -927,6 +1036,104 @@ def selected_candidate_uploads(
     return selected
 
 
+def storyboard_anchor_candidates(candidates: list[dict[str, Any]], limit: int = 2) -> list[dict[str, Any]]:
+    anchors = [item for item in candidates if isinstance(item.get("path"), Path)]
+    anchors.sort(
+        key=lambda item: (
+            REFERENCE_ROLE_PRIORITY.get(str(item.get("role") or "style"), len(REFERENCE_ROLE_PRIORITY)),
+            str(item.get("ref") or ""),
+        )
+    )
+    return anchors[: max(0, limit)]
+
+
+def build_storyboard_generation_inputs(
+    previous_image: tuple[Path, str] | None,
+    seed_candidates: list[dict[str, Any]],
+) -> tuple[list[tuple[Path, str]], list[str]]:
+    uploads: list[tuple[Path, str]] = []
+    notes: list[str] = []
+    seen_paths: set[str] = set()
+    if previous_image is not None:
+        previous_path, previous_mime = previous_image
+        uploads.append((previous_path, previous_mime))
+        notes.append(
+            "Input image 1: 上一镜头输出画面。必须把它作为连续编辑基底，优先保留人物身份、构图关系、空间方位、光线方向和镜头语义连续性。"
+        )
+        seen_paths.add(str(previous_path.resolve()))
+    for candidate in storyboard_anchor_candidates(seed_candidates):
+        path = candidate.get("path")
+        if not isinstance(path, Path):
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen_paths:
+            continue
+        uploads.append((path, candidate.get("mime_type") or "image/png"))
+        notes.append(build_reference_input_note(candidate, len(uploads)))
+        seen_paths.add(resolved)
+    return uploads, notes
+
+
+def load_seed_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_items = payload.get("seed_images") if isinstance(payload.get("seed_images"), list) else []
+    candidates: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        path_value = str(item.get("file_path") or "").strip()
+        if not path_value:
+            continue
+        path = Path(path_value)
+        if not path.exists():
+            continue
+        role = normalize_reference_role(item.get("role"), index)
+        candidates.append(
+            {
+                "ref": item.get("ref") or f"seed:{index}",
+                "source": item.get("source") or "seed",
+                "id": item.get("id"),
+                "message_id": item.get("message_id"),
+                "task_id": item.get("task_id"),
+                "path": path,
+                "file_path": str(path),
+                "mime_type": item.get("mime_type") or "image/png",
+                "hint": item.get("hint") or "",
+                "role": role,
+                "role_label": reference_role_label(role),
+            }
+        )
+    return candidates
+
+
+def load_seed_images_from_task_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seed_rows = [image for image in images if image.get("source") in {"input", "input_reference"}]
+    for index, item in enumerate(seed_rows, start=1):
+        path_value = str(item.get("file_path") or "").strip()
+        if not path_value:
+            continue
+        path = Path(path_value)
+        if not path.exists():
+            continue
+        role = normalize_reference_role(None, index)
+        candidates.append(
+            {
+                "ref": f"task-image:{item.get('id') or index}",
+                "source": item.get("source") or "seed",
+                "id": item.get("id"),
+                "message_id": item.get("message_id"),
+                "task_id": item.get("task_id"),
+                "path": path,
+                "file_path": str(path),
+                "mime_type": item.get("mime_type") or "image/png",
+                "hint": item.get("title") or "",
+                "role": role,
+                "role_label": reference_role_label(role),
+            }
+        )
+    return candidates
+
+
 def build_image_generation_tool(
     *,
     image_model: str,
@@ -984,6 +1191,7 @@ def build_responses_input(
     uploaded: list[tuple[Path, str]] | None = None,
     mask: tuple[Path, str] | None = None,
     input_fidelity: str | None = None,
+    input_image_notes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     if input_fidelity and input_fidelity != "auto":
@@ -1002,10 +1210,11 @@ def build_responses_input(
                 }
             )
     for idx, (path, mime_type) in enumerate(uploaded or [], start=1):
+        note = input_image_notes[idx - 1] if input_image_notes and idx - 1 < len(input_image_notes) else None
         content.append(
             {
                 "type": "input_text",
-                "text": f"Input image {idx}: primary reference image. Preserve its identity/layout unless the prompt explicitly changes it.",
+                "text": note or f"Input image {idx}: primary reference image. Preserve its identity/layout unless the prompt explicitly changes it.",
             }
         )
         content.append({"type": "input_image", "image_url": data_url_for_file(path, mime_type)})
@@ -1038,6 +1247,7 @@ async def call_responses_image_generation(
     uploaded: list[tuple[Path, str]] | None = None,
     mask: tuple[Path, str] | None = None,
     input_fidelity: str | None = None,
+    input_image_notes: list[str] | None = None,
     previous_response_id: str | None = None,
     on_stable_retry: Callable[[str], None] | None = None,
     on_stream_event: Callable[[dict[str, Any]], None] | None = None,
@@ -1050,6 +1260,7 @@ async def call_responses_image_generation(
                 uploaded=uploaded,
                 mask=mask,
                 input_fidelity=input_fidelity,
+                input_image_notes=input_image_notes,
             ),
             "tools": [
                 build_image_generation_tool(
@@ -2109,6 +2320,14 @@ async def storyboard_message(
         (Path(item["file_path"]), item.get("mime_type") or "image/png")
         for item in selected_reference_images
     ]
+    image_candidates = [
+        *build_uploaded_image_candidates(uploaded, params.upload_reference_roles),
+        *build_selected_image_candidates(
+            selected_reference_images,
+            params.reference_image_roles,
+            start_order=len(uploaded) + 1,
+        ),
+    ]
     db.add_prompt(params.prompt, source="auto", mode="storyboard")
 
     with db.connect() as conn:
@@ -2148,6 +2367,8 @@ async def storyboard_message(
                     {
                         "uploads": [str(path) for path, _ in uploaded],
                         "reference_image_ids": [item["id"] for item in selected_reference_images],
+                        "reference_image_roles": params.reference_image_roles,
+                        "upload_reference_roles": params.upload_reference_roles,
                         "context_limit": context_limit,
                         "mode": "storyboard",
                     }
@@ -2181,6 +2402,9 @@ async def storyboard_message(
             "context_limit": context_limit,
             "shot_limit": params.shot_limit,
             "reference_image_ids": [item["id"] for item in selected_reference_images],
+            "reference_image_roles": params.reference_image_roles,
+            "upload_reference_roles": params.upload_reference_roles,
+            "seed_images": serialize_seed_images(image_candidates),
             "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
     )
@@ -2202,8 +2426,7 @@ async def storyboard_message(
             conversation_id,
             user_message_id,
             params,
-            uploaded,
-            selected_reference_images,
+            image_candidates,
             previous_response_id,
             conversation_title,
             recent_messages,
@@ -2219,8 +2442,7 @@ async def run_storyboard_task(
     conversation_id: int,
     user_message_id: int,
     params: StoryboardRequest,
-    uploaded: list[tuple[Path, str]],
-    selected_reference_images: list[dict[str, Any]],
+    image_candidates: list[dict[str, Any]],
     previous_response_id: str | None,
     conversation_title: str,
     recent_messages: list[dict[str, Any]],
@@ -2229,10 +2451,6 @@ async def run_storyboard_task(
 ) -> None:
     async def worker() -> None:
         db.update_task(task_id, progress=12, stage="AI 正在规划连续分镜")
-        image_candidates = [
-            *build_uploaded_image_candidates(uploaded),
-            *build_selected_image_candidates(selected_reference_images),
-        ]
         planner_reference_images = [
             (item["path"], item.get("mime_type") or "image/png")
             for item in image_candidates
@@ -2240,7 +2458,7 @@ async def run_storyboard_task(
         planner_prompt = build_storyboard_planner_prompt(
             recent_messages,
             params.prompt,
-            bool(image_candidates),
+            image_candidates,
             params.shot_limit,
             attach_reference_images=params.planner_endpoint != "chat_completions",
         )
@@ -2308,14 +2526,7 @@ async def run_storyboard_task(
             "planner": sanitize_response(planner_response),
             "plan": plan,
             "context_limit": context_limit,
-            "image_candidates": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"path"}
-                }
-                for item in image_candidates
-            ],
+            "image_candidates": sanitize_reference_candidates(image_candidates),
         }
 
         with db.connect() as conn:
@@ -2347,10 +2558,6 @@ async def run_storyboard_task(
             return
 
         shots = plan["shots"]
-        seed_inputs = [
-            (item["path"], item.get("mime_type") or "image/png")
-            for item in image_candidates
-        ]
         total = len(shots)
         bucket = task_image_folder(task_id, f"分镜-{conversation_title}")
         output_format = params.output_format
@@ -2374,11 +2581,11 @@ async def run_storyboard_task(
                     f"连续性要求：{shot.get('continuity')}",
                     "必须保持人物身份、服装、发型、道具、空间方位、光线方向和画面质感连续。",
                     "每次只输出这一镜头的一张首帧画面，不要拼图，不要多格漫画。",
-                    str(shot.get("prompt") or ""),
+                    str(shot.get("planner_prompt") or shot.get("prompt") or ""),
                 ]
                 if str(part or "").strip()
             )
-            edit_inputs = [previous_image] if previous_image else seed_inputs
+            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, image_candidates)
             action = "edit" if edit_inputs else "generate"
             try:
                 response = await call_responses_image_generation(
@@ -2396,6 +2603,7 @@ async def run_storyboard_task(
                     config=params.config,
                     uploaded=edit_inputs,
                     input_fidelity=params.input_fidelity,
+                    input_image_notes=input_image_notes,
                     previous_response_id=None,
                     on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                     on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
@@ -2425,7 +2633,7 @@ async def run_storyboard_task(
                 shot["status"] = "done"
                 shot["image_id"] = image_record["id"]
                 shot["url"] = image_record["url"]
-                shot["prompt"] = continuity_prompt
+                shot["execution_prompt"] = continuity_prompt
                 image_record["prompt_text"] = continuity_prompt
                 shot_results.append(
                     {
@@ -2523,6 +2731,9 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
         total = len(shots)
         output_format = str(payload.get("output_format", "png"))
         client_config = ClientConfig(**payload.get("config", {})) if isinstance(payload.get("config"), dict) else ClientConfig()
+        seed_candidates = load_seed_images_from_payload(payload)
+        if not seed_candidates:
+            seed_candidates = load_seed_images_from_task_images(old_task.get("images", []))
         old_images = [image for image in old_task.get("images", []) if image.get("source") == "api"]
         by_id = {int(image["id"]): image for image in old_images if image.get("id")}
         by_title = {str(image.get("title") or ""): image for image in old_images}
@@ -2584,7 +2795,8 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
             shot["status"] = "running"
             update_storyboard_task_state(task_id, payload, storyboard)
             db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"重试生成镜头 {index}/{total}：{shot_name}")
-            action = "edit" if previous_image else "generate"
+            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
+            action = "edit" if edit_inputs else "generate"
             try:
                 if previous_image is None and index > 1:
                     raise HTTPException(
@@ -2596,7 +2808,7 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                     )
                 response = await call_responses_image_generation(
                     model=str(payload.get("model", "gpt-5.4")),
-                    prompt=str(shot.get("prompt") or old_task.get("prompt") or ""),
+                    prompt=str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or ""),
                     image_model=str(payload.get("image_model", "gpt-image-2")),
                     size=str(payload.get("size", "2560x1440")),
                     quality=str(payload.get("quality", "high")),
@@ -2607,8 +2819,9 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                     action=action,
                     partial_images=payload.get("partial_images"),
                     config=client_config,
-                    uploaded=[previous_image] if previous_image else None,
+                    uploaded=edit_inputs,
                     input_fidelity=str(payload.get("input_fidelity", "high")),
+                    input_image_notes=input_image_notes,
                     previous_response_id=None,
                     on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                     on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
@@ -2630,7 +2843,7 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                 shot["status"] = "done"
                 shot["image_id"] = image_record["id"]
                 shot["url"] = image_record["url"]
-                image_record["prompt_text"] = str(shot.get("prompt") or old_task.get("prompt") or "")
+                image_record["prompt_text"] = str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or "")
                 update_storyboard_task_state(task_id, payload, storyboard)
                 db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已重试保存镜头 {index}/{total}：{shot_name}")
                 publish_storyboard_image_saved(
@@ -2709,6 +2922,14 @@ async def chat_message(
         (Path(item["file_path"]), item.get("mime_type") or "image/png")
         for item in selected_reference_images
     ]
+    image_candidates = [
+        *build_uploaded_image_candidates(uploaded, params.upload_reference_roles),
+        *build_selected_image_candidates(
+            selected_reference_images,
+            params.reference_image_roles,
+            start_order=len(uploaded) + 1,
+        ),
+    ]
     db.add_prompt(params.prompt, source="auto", mode="chat")
 
     with db.connect() as conn:
@@ -2749,6 +2970,8 @@ async def chat_message(
                     {
                         "uploads": [str(path) for path, _ in uploaded],
                         "reference_image_ids": [item["id"] for item in selected_reference_images],
+                        "reference_image_roles": params.reference_image_roles,
+                        "upload_reference_roles": params.upload_reference_roles,
                         "context_limit": context_limit,
                     }
                 ),
@@ -2780,6 +3003,9 @@ async def chat_message(
             "partial_images": params.partial_images,
             "context_limit": context_limit,
             "reference_image_ids": [item["id"] for item in selected_reference_images],
+            "reference_image_roles": params.reference_image_roles,
+            "upload_reference_roles": params.upload_reference_roles,
+            "seed_images": serialize_seed_images(image_candidates),
             "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
     )
@@ -2801,8 +3027,7 @@ async def chat_message(
             conversation_id,
             user_message_id,
             params,
-            uploaded,
-            selected_reference_images,
+            image_candidates,
             previous_response_id,
             conversation_title,
             recent_messages,
@@ -2817,8 +3042,7 @@ async def run_chat_task(
     conversation_id: int,
     user_message_id: int,
     params: ChatRequest,
-    uploaded: list[tuple[Path, str]],
-    selected_reference_images: list[dict[str, Any]],
+    image_candidates: list[dict[str, Any]],
     previous_response_id: str | None,
     conversation_title: str,
     recent_messages: list[dict[str, Any]],
@@ -2826,10 +3050,6 @@ async def run_chat_task(
 ) -> None:
     async def worker() -> None:
         db.update_task(task_id, progress=12, stage="AI 正在理解意图")
-        image_candidates = [
-            *build_uploaded_image_candidates(uploaded),
-            *build_selected_image_candidates(selected_reference_images),
-        ]
         planner_reference_images = [
             (item["path"], item.get("mime_type") or "image/png")
             for item in image_candidates
@@ -2906,14 +3126,7 @@ async def run_chat_task(
             "planner": sanitize_response(planner_response),
             "plan": plan,
             "context_limit": context_limit,
-            "image_candidates": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"path"}
-                }
-                for item in image_candidates
-            ],
+            "image_candidates": sanitize_reference_candidates(image_candidates),
         }
 
         with db.connect() as conn:
@@ -2951,6 +3164,7 @@ async def run_chat_task(
         if reference_uploads:
             action = "edit"
         edit_inputs = reference_uploads
+        input_image_notes = [build_reference_input_note(item, index) for index, item in enumerate(image_candidates, start=1)]
         raw_for_meta["selected_reference_image_refs"] = [item.get("ref") for item in image_candidates]
         raw_for_meta["selected_reference_image_ids"] = [item.get("id") for item in image_candidates if item.get("id")]
         raw_for_meta["resolved_action"] = action
@@ -2982,6 +3196,7 @@ async def run_chat_task(
                 config=params.config,
                 uploaded=edit_inputs,
                 input_fidelity=params.input_fidelity,
+                input_image_notes=input_image_notes if edit_inputs else None,
                 previous_response_id=None,
                 on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                 on_stream_event=lambda event: handle_image_stream_event(task_id, event),

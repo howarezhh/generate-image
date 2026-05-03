@@ -102,6 +102,13 @@ const plannerEndpointOptions = [
   { value: "chat_completions", label: "Chat Completions" },
 ];
 
+const referenceRoleOptions = [
+  { value: "character", label: "角色" },
+  { value: "scene", label: "场景" },
+  { value: "wardrobe_prop", label: "服装道具" },
+  { value: "style", label: "风格" },
+];
+
 const modeOptions = [
   { value: "chat", icon: MessageCircle, label: "对话", help: "对话生图：像聊天一样描述、追问和完善想法，AI 会在合适时机生成或编辑图片。" },
   { value: "storyboard", icon: Clapperboard, label: "分镜", help: "分镜连续生图：为视频镜头逐张生成首帧，并用上一镜头画面保持人物、场景和逻辑连续。" },
@@ -170,6 +177,18 @@ function modeLabel(mode) {
   return { chat: "对话", storyboard: "分镜", generate: "生图", edit: "编辑" }[mode] || mode;
 }
 
+function defaultReferenceRole(index) {
+  return ["character", "scene", "wardrobe_prop"][index] || "style";
+}
+
+function referenceRoleLabel(role) {
+  return referenceRoleOptions.find((option) => option.value === role)?.label || "风格";
+}
+
+function uploadFileRoleKey(file) {
+  return `${file.name}-${file.size}-${file.lastModified}`;
+}
+
 function statusLabel(status) {
   return {
     queued: "排队中",
@@ -216,6 +235,8 @@ function App() {
   const [editMask, setEditMask] = useState(null);
   const [chatImages, setChatImages] = useState([]);
   const [chatReferenceImages, setChatReferenceImages] = useState([]);
+  const [chatUploadRoles, setChatUploadRoles] = useState({});
+  const [chatReferenceRoles, setChatReferenceRoles] = useState({});
   const [previewState, setPreviewState] = useState(null);
   const [copied, setCopied] = useState("");
   const [runningPanelOpen, setRunningPanelOpen] = useState(false);
@@ -229,13 +250,18 @@ function App() {
   const selectedTaskRef = useRef(selectedTask);
   const conversationLoadSeqRef = useRef(0);
   const taskEventSourcesRef = useRef(new Map());
+  const taskEventRetryTimersRef = useRef(new Map());
+  const taskEventAttemptsRef = useRef(new Map());
+  const taskEventConversationIdsRef = useRef(new Map());
+  const tasksRef = useRef(tasks);
 
   useEffect(() => {
     activeViewRef.current = activeView;
     formModeRef.current = form.mode;
     conversationRef.current = conversation;
     selectedTaskRef.current = selectedTask;
-  }, [activeView, form.mode, conversation, selectedTask]);
+    tasksRef.current = tasks;
+  }, [activeView, form.mode, conversation, selectedTask, tasks]);
 
   useEffect(() => {
     initializeSettings();
@@ -243,6 +269,10 @@ function App() {
     return () => {
       taskEventSourcesRef.current.forEach((source) => source.close());
       taskEventSourcesRef.current.clear();
+      taskEventRetryTimersRef.current.forEach((timer) => clearTimeout(timer));
+      taskEventRetryTimersRef.current.clear();
+      taskEventAttemptsRef.current.clear();
+      taskEventConversationIdsRef.current.clear();
     };
   }, []);
 
@@ -271,6 +301,28 @@ function App() {
     }, 1800);
     return () => clearInterval(timer);
   }, [selectedTask?.id, conversation?.id, activeView]);
+
+  useEffect(() => {
+    const liveTaskIds = new Set(tasks.filter((task) => ["queued", "running"].includes(task.status)).map((task) => Number(task.id)));
+    tasks
+      .filter((task) => ["queued", "running"].includes(task.status))
+      .forEach((task) => {
+        const taskId = Number(task.id);
+        if (!taskEventSourcesRef.current.has(taskId) && !taskEventRetryTimersRef.current.has(taskId)) {
+          startTaskEventStream(taskId, task.conversation_id || null);
+        }
+      });
+    taskEventSourcesRef.current.forEach((_source, taskId) => {
+      if (!liveTaskIds.has(Number(taskId))) {
+        closeTaskEventStream(taskId);
+      }
+    });
+    taskEventRetryTimersRef.current.forEach((_timer, taskId) => {
+      if (!liveTaskIds.has(Number(taskId))) {
+        closeTaskEventStream(taskId);
+      }
+    });
+  }, [tasks]);
 
   useEffect(() => {
     if (activeView === "prompts") {
@@ -398,28 +450,73 @@ function App() {
     return (nextUploads?.length || 0) + (nextReferences?.length || 0);
   }
 
+  function uploadRoleFor(file, index, roles = chatUploadRoles) {
+    const key = uploadFileRoleKey(file, index);
+    return roles[key] || defaultReferenceRole(index);
+  }
+
+  function selectedReferenceRoleFor(image, index, roles = chatReferenceRoles, uploadCount = chatImages.length) {
+    return roles[String(image.id)] || defaultReferenceRole(uploadCount + index);
+  }
+
+  function normalizeUploadRoles(files, currentRoles = chatUploadRoles) {
+    const next = {};
+    files.forEach((file, index) => {
+      const key = uploadFileRoleKey(file, index);
+      next[key] = uploadRoleFor(file, index, currentRoles);
+    });
+    return next;
+  }
+
   function updateChatUploads(files) {
     const room = Math.max(0, 3 - chatReferenceImages.length);
-    setChatImages(files.slice(0, room));
+    const trimmed = files.slice(0, room);
+    setChatImages(trimmed);
+    setChatUploadRoles((current) => normalizeUploadRoles(trimmed, current));
     if (files.length > room) {
       setError(describeError({ detail: { message: "对话模式最多同时指定 3 张参考图。" } }));
     }
   }
 
+  function updateChatUploadRole(file, index, role) {
+    const key = uploadFileRoleKey(file, index);
+    setChatUploadRoles((current) => ({ ...current, [key]: role }));
+  }
+
+  function updateSelectedReferenceRole(imageId, role) {
+    setChatReferenceRoles((current) => ({ ...current, [String(imageId)]: role }));
+  }
+
   function toggleChatReferenceImage(image) {
     setChatReferenceImages((items) => {
       const exists = items.some((item) => Number(item.id) === Number(image.id));
-      if (exists) return items.filter((item) => Number(item.id) !== Number(image.id));
+      if (exists) {
+        setChatReferenceRoles((current) => {
+          const next = { ...current };
+          delete next[String(image.id)];
+          return next;
+        });
+        return items.filter((item) => Number(item.id) !== Number(image.id));
+      }
       if (selectedReferenceCount(chatImages, items) >= 3) {
         setError(describeError({ detail: { message: "最多选择 3 张参考图，请先移除一张。" } }));
         return items;
       }
+      setChatReferenceRoles((current) => ({
+        ...current,
+        [String(image.id)]: current[String(image.id)] || defaultReferenceRole(chatImages.length + items.length),
+      }));
       return [...items, image];
     });
   }
 
   function removeChatReferenceImage(imageId) {
     setChatReferenceImages((items) => items.filter((item) => Number(item.id) !== Number(imageId)));
+    setChatReferenceRoles((current) => {
+      const next = { ...current };
+      delete next[String(imageId)];
+      return next;
+    });
   }
 
   async function startTask() {
@@ -577,6 +674,8 @@ function App() {
       partial_images: Number(form.partial_images),
       context_limit: Number(form.context_limit),
       reference_image_ids: chatReferenceImages.map((image) => image.id),
+      reference_image_roles: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceRoleFor(image, index)])),
+      upload_reference_roles: chatImages.map((file, index) => uploadRoleFor(file, index)),
       config: runConfig,
       planner_config: plannerConfigForMode("chat"),
     };
@@ -591,6 +690,7 @@ function App() {
     mergeTask(result.task);
     startTaskEventStream(result.task?.id, active.id);
     setChatImages([]);
+    setChatUploadRoles({});
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
@@ -627,6 +727,8 @@ function App() {
       context_limit: Number(form.context_limit),
       shot_limit: Number(form.shot_limit),
       reference_image_ids: chatReferenceImages.map((image) => image.id),
+      reference_image_roles: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceRoleFor(image, index)])),
+      upload_reference_roles: chatImages.map((file, index) => uploadRoleFor(file, index)),
       config: runConfig,
       planner_config: plannerConfigForMode("storyboard"),
     };
@@ -641,6 +743,7 @@ function App() {
     mergeTask(result.task);
     startTaskEventStream(result.task?.id, active.id);
     setChatImages([]);
+    setChatUploadRoles({});
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
@@ -716,12 +819,27 @@ function App() {
     setSelectedTask((current) => (current && Number(current.id) === Number(task.id) ? { ...current, ...task } : current));
   }
 
-  function closeTaskEventStream(taskId) {
+  function closeTaskEventSource(taskId) {
     const source = taskEventSourcesRef.current.get(Number(taskId));
     if (source) {
       source.close();
       taskEventSourcesRef.current.delete(Number(taskId));
     }
+  }
+
+  function clearTaskEventRetry(taskId) {
+    const timer = taskEventRetryTimersRef.current.get(Number(taskId));
+    if (timer) {
+      clearTimeout(timer);
+      taskEventRetryTimersRef.current.delete(Number(taskId));
+    }
+  }
+
+  function closeTaskEventStream(taskId) {
+    closeTaskEventSource(taskId);
+    clearTaskEventRetry(taskId);
+    taskEventAttemptsRef.current.delete(Number(taskId));
+    taskEventConversationIdsRef.current.delete(Number(taskId));
   }
 
   function parseEventData(event) {
@@ -765,19 +883,48 @@ function App() {
     }));
   }
 
+  function taskIsLive(taskId) {
+    return tasksRef.current.some((task) => Number(task.id) === Number(taskId) && ["queued", "running"].includes(task.status));
+  }
+
+  function scheduleTaskEventReconnect(taskId, conversationId) {
+    if (!taskId || !taskIsLive(taskId) || taskEventRetryTimersRef.current.has(Number(taskId))) return;
+    const attempt = (taskEventAttemptsRef.current.get(Number(taskId)) || 0) + 1;
+    taskEventAttemptsRef.current.set(Number(taskId), attempt);
+    const delay = Math.min(1000 * (2 ** (attempt - 1)), 10000);
+    const timer = setTimeout(() => {
+      taskEventRetryTimersRef.current.delete(Number(taskId));
+      if (!taskIsLive(taskId)) {
+        closeTaskEventStream(taskId);
+        return;
+      }
+      startTaskEventStream(taskId, conversationId);
+    }, delay);
+    taskEventRetryTimersRef.current.set(Number(taskId), timer);
+  }
+
   function startTaskEventStream(taskId, conversationId) {
     if (!taskId || typeof EventSource === "undefined") return;
-    closeTaskEventStream(taskId);
+    const normalizedTaskId = Number(taskId);
+    const normalizedConversationId = conversationId ?? taskEventConversationIdsRef.current.get(normalizedTaskId) ?? null;
+    taskEventConversationIdsRef.current.set(normalizedTaskId, normalizedConversationId);
+    clearTaskEventRetry(normalizedTaskId);
+    closeTaskEventSource(normalizedTaskId);
     const source = new EventSource(`${API}/api/tasks/${taskId}/events`);
-    taskEventSourcesRef.current.set(Number(taskId), source);
+    taskEventSourcesRef.current.set(normalizedTaskId, source);
+
+    source.onopen = () => {
+      clearTaskEventRetry(normalizedTaskId);
+      taskEventAttemptsRef.current.set(normalizedTaskId, 0);
+    };
 
     source.addEventListener("assistant_start", (event) => {
       const data = parseEventData(event);
-      upsertStreamingMessage(data.message, conversationId);
+      upsertStreamingMessage(data.message, normalizedConversationId);
     });
     source.addEventListener("assistant_reply", (event) => {
       const data = parseEventData(event);
-      updateStreamingMessageContent(data.message_id, data.content || "", conversationId);
+      updateStreamingMessageContent(data.message_id, data.content || "", normalizedConversationId);
     });
     source.addEventListener("task_update", (event) => {
       const data = parseEventData(event);
@@ -789,14 +936,15 @@ function App() {
     });
     for (const eventName of ["done", "failed", "canceled"]) {
       source.addEventListener(eventName, async () => {
-        closeTaskEventStream(taskId);
+        closeTaskEventStream(normalizedTaskId);
         await refreshTasks();
         await refreshHistory();
         await refreshPrompts();
       });
     }
     source.onerror = () => {
-      closeTaskEventStream(taskId);
+      closeTaskEventSource(normalizedTaskId);
+      scheduleTaskEventReconnect(normalizedTaskId, normalizedConversationId);
     };
   }
 
@@ -876,6 +1024,8 @@ function App() {
         setMessages([]);
         setChatImages([]);
         setChatReferenceImages([]);
+        setChatUploadRoles({});
+        setChatReferenceRoles({});
       }
       await refreshHistory();
       await refreshTasks();
@@ -984,6 +1134,8 @@ function App() {
     setMessages([]);
     setChatImages([]);
     setChatReferenceImages([]);
+    setChatUploadRoles({});
+    setChatReferenceRoles({});
     setActiveView("studio");
   }
 
@@ -1164,8 +1316,13 @@ function App() {
       if (switchingConversation) {
         setChatImages([]);
         setChatReferenceImages([]);
+        setChatUploadRoles({});
+        setChatReferenceRoles({});
       } else {
         setChatReferenceImages((items) => items.filter((image) => Number(image.conversation_id) === Number(data.conversation.id)));
+        setChatReferenceRoles((current) => Object.fromEntries(
+          Object.entries(current).filter(([imageId]) => (data.images || []).some((image) => String(image.id) === String(imageId)))
+        ));
       }
       setActiveView("studio");
     }
@@ -1218,13 +1375,20 @@ function App() {
       setForm((value) => ({ ...value, mode: targetMode }));
     }
     if (image.id) {
-      setChatReferenceImages([normalizeImageForClient(image)]);
+      const normalized = normalizeImageForClient(image);
+      setChatReferenceImages([normalized]);
+      setChatReferenceRoles({ [String(normalized.id)]: "character" });
+      setChatImages([]);
+      setChatUploadRoles({});
     } else {
       const response = await fetch(image.public_url || image.url);
       const blob = await response.blob();
       const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
       const file = new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
       setChatImages([file]);
+      setChatUploadRoles({ [uploadFileRoleKey(file, 0)]: "character" });
+      setChatReferenceImages([]);
+      setChatReferenceRoles({});
     }
     setForm((value) => ({ ...value, prompt: "", mode: targetMode, action: targetMode === "chat" ? "edit" : value.action }));
   }
@@ -1627,14 +1791,23 @@ function App() {
                   selected={chatReferenceImages}
                   onToggle={toggleChatReferenceImage}
                   onRemove={removeChatReferenceImage}
+                  roles={chatReferenceRoles}
+                  onRoleChange={updateSelectedReferenceRole}
+                  uploadCount={chatImages.length}
                 />
                 <UploadRow
                   label={form.mode === "storyboard" ? "上传角色/场景参考" : "上传参考"}
                   files={chatImages}
                   onChange={updateChatUploads}
-                  onRemove={(index) => setChatImages((items) => items.filter((_, i) => i !== index))}
+                  onRemove={(index) => {
+                    const next = chatImages.filter((_, i) => i !== index);
+                    setChatImages(next);
+                    setChatUploadRoles((current) => normalizeUploadRoles(next, current));
+                  }}
                   multiple
                   hint={`已指定 ${selectedReferenceCount()}/3 张`}
+                  roles={chatUploadRoles}
+                  onRoleChange={updateChatUploadRole}
                 />
               </>
             )}
@@ -2306,30 +2479,40 @@ function ChatTaskProgress({ task }) {
   );
 }
 
-function ChatReferencePicker({ images, selected, onToggle }) {
+function ChatReferencePicker({ images, selected, onToggle, roles = {}, onRoleChange, uploadCount = 0 }) {
   const selectedIds = new Set((selected || []).map((image) => Number(image.id)));
   return (
     <section className="referencePicker">
       <div className="referencePickerHead">
         <strong>指定参考图</strong>
-        <small>{selected.length}/3，AI 只会使用你指定的图作为 edit 输入</small>
+        <small>{selected.length}/3，建议明确区分角色、场景和道具锚点</small>
       </div>
       {images.length > 0 ? (
         <div className="referenceStrip">
-          {images.map((image) => {
+          {images.map((image, index) => {
             const isSelected = selectedIds.has(Number(image.id));
+            const role = roles[String(image.id)] || defaultReferenceRole(uploadCount + index);
             return (
-              <button
-                key={image.id}
-                type="button"
-                className={isSelected ? "active" : ""}
-                onClick={() => onToggle(image)}
-                title={isSelected ? "取消选择" : "选择为本轮参考图"}
-              >
-                <img src={image.public_url || image.url} alt="" />
-                <span>{isSelected ? "已选" : "选择"}</span>
-                {isSelected && <em>取消</em>}
-              </button>
+              <div className={`referenceChoice ${isSelected ? "active" : ""}`} key={image.id}>
+                <button
+                  type="button"
+                  className={isSelected ? "active" : ""}
+                  onClick={() => onToggle(image)}
+                  title={isSelected ? "取消选择" : "选择为本轮参考图"}
+                >
+                  <img src={image.public_url || image.url} alt="" />
+                  <span>{isSelected ? "已选" : "选择"}</span>
+                  {isSelected && <em>取消</em>}
+                </button>
+                {isSelected && (
+                  <label className="referenceRoleSelect">
+                    <small>作为{referenceRoleLabel(role)}使用</small>
+                    <select value={role} onChange={(event) => onRoleChange?.(image.id, event.target.value)}>
+                      {referenceRoleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </label>
+                )}
+              </div>
             );
           })}
         </div>
@@ -2609,7 +2792,7 @@ function Select({ label, value, onChange, options, help = "" }) {
   );
 }
 
-function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = "" }) {
+function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = "", roles = {}, onRoleChange }) {
   const [previews, setPreviews] = useState([]);
 
   useEffect(() => {
@@ -2635,6 +2818,17 @@ function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = 
           <div className="uploadPreview" key={`${item.file.name}-${index}`}>
             <img src={item.url} alt={item.file.name} />
             <small>{item.file.name}</small>
+            {onRoleChange && (
+              <label className="referenceRoleSelect compact">
+                <span>{referenceRoleLabel(roles[uploadFileRoleKey(item.file, index)] || defaultReferenceRole(index))}</span>
+                <select
+                  value={roles[uploadFileRoleKey(item.file, index)] || defaultReferenceRole(index)}
+                  onChange={(event) => onRoleChange(item.file, index, event.target.value)}
+                >
+                  {referenceRoleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </label>
+            )}
             <button type="button" onClick={() => onRemove?.(index)} title="删除图片"><X size={14} /></button>
           </div>
         )) : <small className="uploadEmpty">未选择</small>}
