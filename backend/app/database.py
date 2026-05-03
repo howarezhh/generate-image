@@ -5,19 +5,122 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import DATABASE_PATH, ensure_dirs
+from .config import current_database_path, ensure_dirs
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def initialize_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        create table if not exists settings (
+            key text primary key,
+            value text not null,
+            updated_at text not null
+        );
+
+        create table if not exists providers (
+            id integer primary key autoincrement,
+            name text not null,
+            base_url text not null,
+            api_key text not null,
+            created_at text not null,
+            updated_at text not null
+        );
+
+        create table if not exists tasks (
+            id integer primary key autoincrement,
+            mode text not null,
+            prompt text not null,
+            status text not null,
+            progress integer not null default 0,
+            stage text,
+            params_json text not null,
+            response_json text,
+            error text,
+            conversation_id integer,
+            user_message_id integer,
+            assistant_message_id integer,
+            image_provider_id integer,
+            image_provider_name text,
+            cancel_requested integer not null default 0,
+            created_at text not null,
+            updated_at text not null
+        );
+
+        create table if not exists images (
+            id integer primary key autoincrement,
+            task_id integer,
+            conversation_id integer,
+            message_id integer,
+            title text,
+            bucket text,
+            source text not null,
+            file_path text not null,
+            public_url text not null,
+            mime_type text not null,
+            created_at text not null
+        );
+
+        create table if not exists conversations (
+            id integer primary key autoincrement,
+            title text not null,
+            mode text,
+            context_limit integer not null default 10,
+            previous_response_id text,
+            created_at text not null,
+            updated_at text not null
+        );
+
+        create table if not exists messages (
+            id integer primary key autoincrement,
+            conversation_id integer not null,
+            role text not null,
+            content text not null,
+            response_id text,
+            meta_json text not null,
+            created_at text not null,
+            updated_at text
+        );
+
+        create table if not exists prompts (
+            id integer primary key autoincrement,
+            content text not null,
+            source text not null default 'manual',
+            mode text,
+            favorite integer not null default 0,
+            created_at text not null,
+            updated_at text not null
+        );
+        """
+    )
+    ensure_column(conn, "conversations", "mode", "text")
+    ensure_column(conn, "images", "title", "text")
+    ensure_column(conn, "images", "bucket", "text")
+    ensure_column(conn, "conversations", "context_limit", "integer not null default 10")
+    ensure_column(conn, "messages", "updated_at", "text")
+    ensure_column(conn, "tasks", "progress", "integer not null default 0")
+    ensure_column(conn, "tasks", "stage", "text")
+    ensure_column(conn, "tasks", "conversation_id", "integer")
+    ensure_column(conn, "tasks", "user_message_id", "integer")
+    ensure_column(conn, "tasks", "assistant_message_id", "integer")
+    ensure_column(conn, "tasks", "image_provider_id", "integer")
+    ensure_column(conn, "tasks", "image_provider_name", "text")
+    ensure_column(conn, "tasks", "cancel_requested", "integer not null default 0")
+    ensure_column(conn, "prompts", "source", "text not null default 'manual'")
+    ensure_column(conn, "prompts", "mode", "text")
+    ensure_column(conn, "prompts", "favorite", "integer not null default 0")
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     ensure_dirs()
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(current_database_path())
     conn.row_factory = sqlite3.Row
     try:
+        initialize_schema(conn)
         yield conn
         conn.commit()
     finally:
@@ -26,105 +129,7 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 def init_db() -> None:
     with connect() as conn:
-        conn.executescript(
-            """
-            create table if not exists settings (
-                key text primary key,
-                value text not null,
-                updated_at text not null
-            );
-
-            create table if not exists providers (
-                id integer primary key autoincrement,
-                name text not null,
-                base_url text not null,
-                api_key text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists tasks (
-                id integer primary key autoincrement,
-                mode text not null,
-                prompt text not null,
-                status text not null,
-                progress integer not null default 0,
-                stage text,
-                params_json text not null,
-                response_json text,
-                error text,
-                conversation_id integer,
-                user_message_id integer,
-                assistant_message_id integer,
-                image_provider_id integer,
-                image_provider_name text,
-                cancel_requested integer not null default 0,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists images (
-                id integer primary key autoincrement,
-                task_id integer,
-                conversation_id integer,
-                message_id integer,
-                title text,
-                bucket text,
-                source text not null,
-                file_path text not null,
-                public_url text not null,
-                mime_type text not null,
-                created_at text not null
-            );
-
-            create table if not exists conversations (
-                id integer primary key autoincrement,
-                title text not null,
-                mode text,
-                context_limit integer not null default 10,
-                previous_response_id text,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists messages (
-                id integer primary key autoincrement,
-                conversation_id integer not null,
-                role text not null,
-                content text not null,
-                response_id text,
-                meta_json text not null,
-                created_at text not null,
-                updated_at text
-            );
-
-            create table if not exists prompts (
-                id integer primary key autoincrement,
-                content text not null,
-                source text not null default 'manual',
-                mode text,
-                favorite integer not null default 0,
-                created_at text not null,
-                updated_at text not null
-            );
-            """
-        )
-        ensure_column(conn, "conversations", "mode", "text")
-        ensure_column(conn, "images", "title", "text")
-        ensure_column(conn, "images", "bucket", "text")
-        ensure_column(conn, "conversations", "context_limit", "integer not null default 10")
-        ensure_column(conn, "messages", "updated_at", "text")
-        ensure_column(conn, "tasks", "progress", "integer not null default 0")
-        ensure_column(conn, "tasks", "stage", "text")
-        ensure_column(conn, "tasks", "conversation_id", "integer")
-        ensure_column(conn, "tasks", "user_message_id", "integer")
-        ensure_column(conn, "tasks", "assistant_message_id", "integer")
-        ensure_column(conn, "tasks", "image_provider_id", "integer")
-        ensure_column(conn, "tasks", "image_provider_name", "text")
-        ensure_column(conn, "tasks", "cancel_requested", "integer not null default 0")
-        ensure_column(conn, "prompts", "source", "text not null default 'manual'")
-        ensure_column(conn, "prompts", "mode", "text")
-        ensure_column(conn, "prompts", "favorite", "integer not null default 0")
+        initialize_schema(conn)
 
 
 def add_prompt(content: str, *, source: str = "manual", mode: str | None = None, favorite: int = 0) -> int | None:

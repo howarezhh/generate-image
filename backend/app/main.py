@@ -23,22 +23,28 @@ from .config import (
     DEFAULT_API_KEY,
     CHAT_PLANNER_MAX_ATTEMPTS,
     CHAT_PLANNER_TIMEOUT_SECONDS,
+    current_output_dir,
+    current_storage_scope,
+    current_upload_dir,
     ENABLE_IMAGE_STABLE_RETRY,
     FRONTEND_DIST,
+    get_env,
     IMAGE_REQUEST_MAX_ATTEMPTS,
     IMAGE_REQUEST_TIMEOUT_SECONDS,
     IMAGE_STABLE_RETRY_QUALITY,
     MAX_CONCURRENT_TASKS,
-    OUTPUT_DIR,
     ROOT_DIR,
-    UPLOAD_DIR,
+    TENANT_STORAGE_ROOT,
     ensure_dirs,
+    reset_storage_scope,
+    set_storage_scope,
 )
 from .openai_compat import (
     data_url_for_file,
     extract_images_from_responses,
     extract_text_from_responses,
     guess_mime,
+    is_retryable_http_exception,
     post_chat_completions,
     post_json,
     post_json_stream,
@@ -57,18 +63,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RUNNING_TASKS: dict[int, asyncio.Task[Any]] = {}
-TASK_EVENT_SUBSCRIBERS: dict[int, set[asyncio.Queue[dict[str, Any]]]] = {}
-TASK_EVENT_SNAPSHOTS: dict[int, dict[str, dict[str, Any]]] = {}
+RUNNING_TASKS: dict[str, asyncio.Task[Any]] = {}
+TASK_EVENT_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
+TASK_EVENT_SNAPSHOTS: dict[str, dict[str, dict[str, Any]]] = {}
 IMAGE_PROVIDER_POOL_LOCK: asyncio.Lock | None = None
-IMAGE_PROVIDER_POOL_STATE: dict[int, dict[str, Any]] = {}
+IMAGE_PROVIDER_POOL_STATE: dict[str, dict[str, Any]] = {}
 ACCESS_COOKIE_NAME = "studio_access"
 ACCESS_PASSWORD = "hhs54666"
 ACCESS_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9]{8}$")
 ACCESS_ERROR_MESSAGE = "密码错误，请联系管理员，管理员QQ为3286385052。"
 ACCESS_LOGIN_PATH = "/auth/login"
-ACCESS_ALLOWED_PATHS = {ACCESS_LOGIN_PATH, "/favicon.ico"}
-ACCESS_COOKIE_TOKEN = hashlib.sha256(f"gpt-image-studio:{ACCESS_PASSWORD.lower()}".encode("utf-8")).hexdigest()
+ACCESS_ALLOWED_PATHS = {ACCESS_LOGIN_PATH, "/favicon.ico", "/favicon.svg"}
+DEFAULT_ACCESS_PASSWORD = ACCESS_PASSWORD.lower()
+
+
+def normalize_access_password(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def access_storage_scope(value: str) -> str:
+    normalized = normalize_access_password(value)
+    if not normalized or normalized == DEFAULT_ACCESS_PASSWORD:
+        return ""
+    return hashlib.sha256(f"gpt-image-studio:tenant:{normalized}".encode("utf-8")).hexdigest()[:24]
+
+
+def access_cookie_token(value: str) -> str:
+    normalized = normalize_access_password(value)
+    return hashlib.sha256(f"gpt-image-studio:access:{normalized}".encode("utf-8")).hexdigest()
+
+
+raw_access_passwords = [normalize_access_password(part) for part in get_env("ACCESS_PASSWORDS", ACCESS_PASSWORD).split(",")]
+ACCESS_PASSWORDS = tuple(
+    dict.fromkeys(
+        value
+        for value in [*raw_access_passwords, DEFAULT_ACCESS_PASSWORD]
+        if value and ACCESS_PASSWORD_PATTERN.fullmatch(value)
+    )
+)
+ACCESS_COOKIE_TO_SCOPE = {access_cookie_token(value): access_storage_scope(value) for value in ACCESS_PASSWORDS}
+
+
+def all_known_storage_scopes() -> list[str]:
+    scopes = [""]
+    for password in ACCESS_PASSWORDS:
+        scope = access_storage_scope(password)
+        if scope not in scopes:
+            scopes.append(scope)
+    if TENANT_STORAGE_ROOT.exists():
+        for child in sorted(TENANT_STORAGE_ROOT.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                normalized = child.name.strip().lower()
+            except Exception:
+                continue
+            if normalized and normalized not in scopes:
+                scopes.append(normalized)
+    return scopes
 
 
 class ClientConfig(BaseModel):
@@ -95,6 +147,7 @@ class PromptRequest(BaseModel):
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
+    image_title: str | None = None
     conversation_id: int | None = None
     model: str = "gpt-5.4"
     image_model: str = "gpt-image-2"
@@ -181,22 +234,43 @@ DEFAULT_REFERENCE_ROLE_ORDER = ("character", "scene", "wardrobe_prop")
 REFERENCE_ROLE_PRIORITY = {role: index for index, role in enumerate(("character", "scene", "wardrobe_prop", "style"))}
 CONVERSATION_MODES = {"chat", "storyboard", "generate", "edit"}
 MAX_STORYBOARD_SHOTS = 100
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+PROVIDER_UNAVAILABLE_RETRY_COUNT = 1
+PROVIDER_UNAVAILABLE_COOLDOWN_SECONDS = 90.0
 
 
-def normalize_access_password(value: str) -> str:
-    return str(value or "").strip().lower()
+def resolve_access_password(value: str) -> str | None:
+    normalized = normalize_access_password(value)
+    if not ACCESS_PASSWORD_PATTERN.fullmatch(normalized):
+        return None
+    return normalized if normalized in ACCESS_PASSWORDS else None
 
 
 def validate_access_password(value: str) -> bool:
-    normalized = normalize_access_password(value)
-    if not ACCESS_PASSWORD_PATTERN.fullmatch(normalized):
-        return False
-    return hmac.compare_digest(normalized, ACCESS_PASSWORD.lower())
+    return resolve_access_password(value) is not None
 
 
 def access_cookie_valid(request: Request) -> bool:
     token = str(request.cookies.get(ACCESS_COOKIE_NAME) or "")
-    return hmac.compare_digest(token, ACCESS_COOKIE_TOKEN)
+    return token in ACCESS_COOKIE_TO_SCOPE
+
+
+def request_storage_scope(request: Request) -> str | None:
+    token = str(request.cookies.get(ACCESS_COOKIE_NAME) or "")
+    return ACCESS_COOKIE_TO_SCOPE.get(token)
+
+
+def runtime_scope_key(scope: str | None = None) -> str:
+    normalized = scope if scope is not None else current_storage_scope()
+    return normalized or "__default__"
+
+
+def task_runtime_key(task_id: int, scope: str | None = None) -> str:
+    return f"{runtime_scope_key(scope)}:{task_id}"
+
+
+def provider_runtime_key(provider_id: int, scope: str | None = None) -> str:
+    return f"{runtime_scope_key(scope)}:provider:{provider_id}"
 
 
 def sanitized_next_path(value: str | None) -> str:
@@ -221,6 +295,7 @@ def login_page_html(next_path: str = "/", error_message: str = "") -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <title>访问验证 - GPT Image Studio</title>
   <style>
     :root {{
@@ -361,8 +436,14 @@ async def require_project_password(request: Request, call_next: Callable[..., An
     path = request.url.path or "/"
     if request.method == "OPTIONS" or path in ACCESS_ALLOWED_PATHS:
         return await call_next(request)
-    if access_cookie_valid(request):
-        return await call_next(request)
+    scope = request_storage_scope(request)
+    if scope is not None:
+        token = set_storage_scope(scope)
+        request.state.storage_scope = scope
+        try:
+            return await call_next(request)
+        finally:
+            reset_storage_scope(token)
     if path.startswith("/api/"):
         return JSONResponse(
             status_code=401,
@@ -424,13 +505,15 @@ def public_upload_image(path_value: str) -> dict[str, Any] | None:
     path = Path(path_value)
     if not path.exists():
         return None
+    upload_root = current_upload_dir()
+    output_root = current_output_dir()
     public_url = None
     try:
-        relative = path.relative_to(UPLOAD_DIR)
+        relative = path.relative_to(upload_root)
         public_url = f"/media/uploads/{relative.as_posix()}"
     except ValueError:
         try:
-            relative = path.relative_to(OUTPUT_DIR)
+            relative = path.relative_to(output_root)
             public_url = f"/media/outputs/{relative.as_posix()}"
         except ValueError:
             public_url = f"/media/uploads/{path.name}"
@@ -469,6 +552,25 @@ def public_input_image(
     public["id"] = image_id
     public["source"] = source
     public["title"] = title
+    return public
+
+
+def public_message_upload_image(image: dict[str, Any]) -> dict[str, Any] | None:
+    file_path = str(image.get("file_path") or "").strip()
+    if not file_path:
+        return None
+    public = public_upload_image(file_path)
+    if not public:
+        return None
+    public.update(
+        {
+            "id": image.get("id"),
+            "source": image.get("source") or "input",
+            "title": image.get("title"),
+            "task_mode": image.get("task_mode"),
+            "prompt_text": image.get("task_prompt") or image.get("message_content") or image.get("title"),
+        }
+    )
     return public
 
 
@@ -587,7 +689,8 @@ def ensure_provider_pool_lock() -> asyncio.Lock:
 
 def ensure_provider_pool_state(provider: dict[str, Any], order_index: int) -> dict[str, Any]:
     provider_id = int(provider["id"])
-    state = IMAGE_PROVIDER_POOL_STATE.get(provider_id)
+    state_key = provider_runtime_key(provider_id)
+    state = IMAGE_PROVIDER_POOL_STATE.get(state_key)
     if state is None:
         state = {
             "provider": dict(provider),
@@ -595,21 +698,130 @@ def ensure_provider_pool_state(provider: dict[str, Any], order_index: int) -> di
             "semaphore": asyncio.Semaphore(MAX_CONCURRENT_TASKS),
             "assigned_count": 0,
             "running_count": 0,
+            "unavailable_until": 0.0,
+            "last_unavailable_error": None,
         }
-        IMAGE_PROVIDER_POOL_STATE[provider_id] = state
+        IMAGE_PROVIDER_POOL_STATE[state_key] = state
         return state
     state["provider"] = dict(provider)
     state["order"] = order_index
     return state
 
 
+def provider_unavailable_seconds(state: dict[str, Any], now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    remaining = float(state.get("unavailable_until") or 0.0) - current
+    if remaining <= 0:
+        return 0
+    return int(remaining) if remaining.is_integer() else int(remaining) + 1
+
+
+def provider_is_temporarily_unavailable(state: dict[str, Any], now: float | None = None) -> bool:
+    return provider_unavailable_seconds(state, now) > 0
+
+
+def clear_provider_unavailable_state(state: dict[str, Any]) -> None:
+    state["unavailable_until"] = 0.0
+    state["last_unavailable_error"] = None
+
+
+def mark_provider_unavailable(state: dict[str, Any], detail: Any) -> None:
+    state["unavailable_until"] = time.time() + PROVIDER_UNAVAILABLE_COOLDOWN_SECONDS
+    state["last_unavailable_error"] = copy.deepcopy(detail)
+
+
+def provider_error_message(detail: Any) -> str:
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("detail") or detail.get("error") or "提供商请求失败").strip() or "提供商请求失败"
+    return str(detail or "提供商请求失败").strip() or "提供商请求失败"
+
+
+def provider_attempt_entry(provider: dict[str, Any], detail: Any, *, action: str, attempt: int) -> dict[str, Any]:
+    return {
+        "provider_id": int(provider["id"]),
+        "provider_name": str(provider["name"]),
+        "action": action,
+        "attempt": attempt,
+        "error": copy.deepcopy(detail),
+        "message": provider_error_message(detail),
+    }
+
+
+def provider_failure_error_detail(
+    *,
+    message: str,
+    attempts: list[dict[str, Any]],
+    current_provider: dict[str, Any] | None = None,
+    suggestion: str | None = None,
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "message": message,
+        "provider_attempts": copy.deepcopy(attempts),
+    }
+    if current_provider:
+        detail["image_provider"] = {"id": current_provider["id"], "name": current_provider["name"]}
+    if suggestion:
+        detail["suggestion"] = suggestion
+    return detail
+
+
+def is_provider_unavailable_error(exc: HTTPException) -> bool:
+    detail_text = json.dumps(exc.detail, ensure_ascii=False).lower() if not isinstance(exc.detail, str) else exc.detail.lower()
+    if any(marker in detail_text for marker in ("moderation_blocked", "content_policy", "safety_violations")):
+        return False
+    if is_retryable_http_exception(exc):
+        return True
+    if int(exc.status_code or 0) in {401, 403, 404}:
+        return True
+    return any(
+        marker in detail_text
+        for marker in (
+            "authentication",
+            "unauthorized",
+            "forbidden",
+            "api key",
+            "model_not_found",
+            "not found",
+            "connection refused",
+            "name or service not known",
+        )
+    )
+
+
+def all_providers_unavailable_detail(states: list[dict[str, Any]], attempted: list[dict[str, Any]]) -> dict[str, Any]:
+    now = time.time()
+    providers: list[dict[str, Any]] = []
+    for state in states:
+        provider = state["provider"]
+        unavailable_seconds = provider_unavailable_seconds(state, now)
+        providers.append(
+            {
+                "id": int(provider["id"]),
+                "name": str(provider["name"]),
+                "running_tasks": int(state["running_count"]),
+                "assigned_tasks": int(state["assigned_count"]),
+                "unavailable_seconds": unavailable_seconds,
+                "last_error": copy.deepcopy(state.get("last_unavailable_error")),
+            }
+        )
+    return {
+        "message": "当前生图池中的所有提供商都暂时不可用，无法继续自动切换生图线路。",
+        "providers": providers,
+        "provider_attempts": copy.deepcopy(attempted),
+        "suggestion": "请检查提供商接口地址、密钥和模型兼容性，或等待线路恢复后重试。",
+    }
+
+
 def image_provider_pool_snapshot() -> dict[str, Any]:
     pool = load_image_provider_pool()
+    now = time.time()
     providers: list[dict[str, Any]] = []
     for index, provider in enumerate(pool):
-        state = IMAGE_PROVIDER_POOL_STATE.get(int(provider["id"]))
+        state = ensure_provider_pool_state(provider, index)
         assigned = int(state["assigned_count"]) if state else 0
         running = int(state["running_count"]) if state else 0
+        unavailable_seconds = provider_unavailable_seconds(state, now) if state else 0
+        available = unavailable_seconds <= 0
         providers.append(
             {
                 "id": provider["id"],
@@ -617,16 +829,24 @@ def image_provider_pool_snapshot() -> dict[str, Any]:
                 "base_url": provider["base_url"],
                 "assigned_tasks": assigned,
                 "running_tasks": running,
-                "idle_slots": max(0, MAX_CONCURRENT_TASKS - running),
+                "idle_slots": max(0, MAX_CONCURRENT_TASKS - running) if available else 0,
                 "order": index,
+                "available": available,
+                "status": "unavailable" if not available else ("busy" if assigned > 0 else "idle"),
+                "unavailable_seconds": unavailable_seconds,
+                "last_error": copy.deepcopy(state.get("last_unavailable_error")) if state else None,
             }
         )
     total = len(providers)
     used = sum(1 for provider in providers if provider["assigned_tasks"] > 0)
+    unavailable = sum(1 for provider in providers if not provider["available"])
+    idle = sum(1 for provider in providers if provider["available"] and provider["assigned_tasks"] <= 0)
     return {
         "total_providers": total,
         "used_providers": used,
-        "idle_providers": max(0, total - used),
+        "idle_providers": idle,
+        "available_providers": max(0, total - unavailable),
+        "unavailable_providers": unavailable,
         "limit_per_provider": MAX_CONCURRENT_TASKS,
         "total_capacity": max(1, total) * MAX_CONCURRENT_TASKS,
         "assigned_tasks": sum(provider["assigned_tasks"] for provider in providers),
@@ -736,6 +956,63 @@ def normalize_text_fields(data: dict[str, Any], keys: tuple[str, ...] = ("prompt
     return data
 
 
+def normalize_image_title(value: Any, fallback: str = "") -> str:
+    text = fix_mojibake(str(value or "")).replace("\u3000", " ").strip()
+    text = INVALID_FILENAME_CHARS.sub("-", text)
+    text = re.sub(r"\s+", " ", text).strip(" .-_")
+    return text[:80] or fallback
+
+
+def normalize_filename_stem(value: Any, fallback: str = "image") -> str:
+    stem = normalize_image_title(value, fallback=fallback)
+    stem = stem.rstrip(". ").strip()
+    return stem or fallback
+
+
+def build_sequenced_title(base_title: str, index: int, total: int) -> str:
+    title = normalize_image_title(base_title)
+    if not title:
+        title = "图片"
+    if total > 1:
+        return f"{title}-{index:02d}"
+    return title
+
+
+def build_timestamp_label(value: str | None = None) -> str:
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            stamp = datetime.now(timezone.utc)
+    else:
+        stamp = datetime.now(timezone.utc)
+    return stamp.astimezone().strftime("%Y%m%d-%H%M%S")
+
+
+def conversation_title_for_naming(conversation_id: int | None, fallback: str = "") -> str:
+    if conversation_id:
+        with db.connect() as conn:
+            row = conn.execute("select title from conversations where id = ?", (conversation_id,)).fetchone()
+        if row and str(row["title"] or "").strip():
+            return normalize_image_title(row["title"], fallback=fallback)
+    return normalize_image_title(fallback)
+
+
+def build_direct_mode_base_title(
+    preferred_title: str | None,
+    *,
+    conversation_id: int | None,
+    prompt: str,
+    created_at: str | None = None,
+) -> str:
+    explicit = normalize_image_title(preferred_title)
+    if explicit:
+        return explicit
+    conversation_title = conversation_title_for_naming(conversation_id, fallback=prompt[:20] or "图片")
+    return normalize_image_title(f"{build_timestamp_label(created_at)} {conversation_title}", fallback=build_timestamp_label(created_at))
+
+
 def summarize_task(row: Any) -> dict[str, Any]:
     item = db.row_to_dict(row)
     raw_response_json = item.get("response_json")
@@ -823,17 +1100,18 @@ def sse_format(event: str, data: dict[str, Any]) -> str:
 
 
 def publish_task_event(task_id: int, event: str, data: dict[str, Any], *, snapshot: bool = True) -> None:
+    runtime_key = task_runtime_key(task_id)
     payload = {"event": event, "data": data}
     if snapshot:
-        TASK_EVENT_SNAPSHOTS.setdefault(task_id, {})[event] = payload
+        TASK_EVENT_SNAPSHOTS.setdefault(runtime_key, {})[event] = payload
     dead: list[asyncio.Queue[dict[str, Any]]] = []
-    for queue in TASK_EVENT_SUBSCRIBERS.get(task_id, set()):
+    for queue in TASK_EVENT_SUBSCRIBERS.get(runtime_key, set()):
         try:
             queue.put_nowait(payload)
         except asyncio.QueueFull:
             dead.append(queue)
     for queue in dead:
-        TASK_EVENT_SUBSCRIBERS.get(task_id, set()).discard(queue)
+        TASK_EVENT_SUBSCRIBERS.get(runtime_key, set()).discard(queue)
 
 
 def publish_task_snapshot(task_id: int) -> None:
@@ -899,13 +1177,13 @@ def update_message_content(message_id: int, content: str, response_id: str | Non
 
 
 def cancel_running_task(task_id: int) -> None:
-    running = RUNNING_TASKS.get(task_id)
+    running = RUNNING_TASKS.get(task_runtime_key(task_id))
     if running:
         running.cancel()
 
 
 def safe_delete_media_files(paths: list[str]) -> None:
-    roots = [UPLOAD_DIR.resolve(), OUTPUT_DIR.resolve()]
+    roots = [current_upload_dir().resolve(), current_output_dir().resolve()]
     for raw_path in dict.fromkeys(path for path in paths if path):
         path = Path(raw_path)
         try:
@@ -1046,6 +1324,7 @@ def build_chat_planner_prompt(
 6. 若用户想改图但没有提供参考图，或无法判断要改哪张参考图，should_generate=false，请用户上传或选择参考图。
 7. 若使用参考图，reference_image_refs 必须填写使用到的 ref；reference_image_ids 只填写已选历史生成图的 image_id。用户本轮上传的参考图没有 image_id，也没有对应生图提示词，不要编造。
 8. image_prompt 必须把用户意图改写成适合 image_generation 的单张图片提示词，并明确保留不应变化的主体、构图、风格或参考图特征。
+9. 若 should_generate=true，必须顺便给这张图片生成一个简短中文名称 image_name；名称要便于用户识别、适合直接作为图片名，禁止带文件扩展名。
 
 {image_note}
 
@@ -1054,6 +1333,7 @@ def build_chat_planner_prompt(
   "reply": "给用户看的中文回复。若要生图，说明你将如何生成/修改；若不要生图，提出下一步问题或建议。",
   "should_generate": true 或 false,
   "action": "generate" 或 "edit" 或 "auto",
+  "image_name": "should_generate 为 true 时填写这张图片的中文名称；否则为空字符串",
   "image_prompt": "should_generate 为 true 时填写一张图片的最终生图提示词；它只能对应一张图片，不能包含解释、流程、多图列表或其它信息；否则为空字符串",
   "reference_image_refs": [],
   "reference_image_ids": [],
@@ -1082,6 +1362,7 @@ def parse_planner_json(text: str) -> dict[str, Any]:
             "reply": text.strip() or "我还需要更多画面要求，再帮你生成会更稳。",
             "should_generate": False,
             "action": "auto",
+            "image_name": "",
             "image_prompt": "",
             "reference_image_refs": [],
             "reference_image_ids": [],
@@ -1094,13 +1375,14 @@ def parse_planner_json(text: str) -> dict[str, Any]:
     if not isinstance(reference_ids, list):
         reference_ids = []
     return {
-        "reply": str(parsed.get("reply") or "").strip() or "我理解了。",
+        "reply": fix_mojibake(str(parsed.get("reply") or "").strip()) or "我理解了。",
         "should_generate": bool(parsed.get("should_generate")),
         "action": str(parsed.get("action") or "auto").strip(),
-        "image_prompt": str(parsed.get("image_prompt") or "").strip(),
+        "image_name": normalize_image_title(parsed.get("image_name") or ""),
+        "image_prompt": fix_mojibake(str(parsed.get("image_prompt") or "").strip()),
         "reference_image_refs": [str(value).strip() for value in reference_refs if str(value).strip()],
         "reference_image_ids": [int(value) for value in reference_ids if str(value).isdigit()],
-        "reason": str(parsed.get("reason") or "").strip(),
+        "reason": fix_mojibake(str(parsed.get("reason") or "").strip()),
     }
 
 
@@ -1199,8 +1481,8 @@ def parse_storyboard_plan(text: str, shot_limit: int) -> dict[str, Any]:
     for index, item in enumerate(raw_shots[: max(1, min(int(shot_limit), MAX_STORYBOARD_SHOTS))], start=1):
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name") or f"{index:02d}-镜头{index}").strip()
-        prompt = str(item.get("prompt") or "").strip()
+        name = fix_mojibake(str(item.get("name") or f"{index:02d}-镜头{index}").strip())
+        prompt = fix_mojibake(str(item.get("prompt") or "").strip())
         if not prompt:
             continue
         shots.append(
@@ -1210,23 +1492,23 @@ def parse_storyboard_plan(text: str, shot_limit: int) -> dict[str, Any]:
                 "prompt": prompt,
                 "planner_prompt": prompt,
                 "execution_prompt": "",
-                "continuity": str(item.get("continuity") or "").strip(),
+                "continuity": fix_mojibake(str(item.get("continuity") or "").strip()),
                 "status": "pending",
             }
         )
     should_generate = bool(parsed.get("should_generate")) and bool(shots)
     return {
-        "reply": str(parsed.get("reply") or "").strip() or ("我会按分镜顺序生成连续画面。" if should_generate else base["reply"]),
+        "reply": fix_mojibake(str(parsed.get("reply") or "").strip()) or ("我会按分镜顺序生成连续画面。" if should_generate else base["reply"]),
         "should_generate": should_generate,
-        "character_summary": str(parsed.get("character_summary") or "").strip(),
-        "scene_summary": str(parsed.get("scene_summary") or "").strip(),
+        "character_summary": fix_mojibake(str(parsed.get("character_summary") or "").strip()),
+        "scene_summary": fix_mojibake(str(parsed.get("scene_summary") or "").strip()),
         "shots": shots,
-        "reason": str(parsed.get("reason") or "").strip(),
+        "reason": fix_mojibake(str(parsed.get("reason") or "").strip()),
     }
 
 
 def normalize_shot_name(name: str, order: int) -> str:
-    clean = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "-", name.strip()).strip("-")
+    clean = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "-", fix_mojibake(name).strip()).strip("-")
     if not clean:
         clean = f"镜头{order}"
     if not re.match(r"^\d{2}[-_]", clean):
@@ -1234,9 +1516,9 @@ def normalize_shot_name(name: str, order: int) -> str:
     return clean[:48]
 
 
-def rename_output_image(item: tuple[Path, str, str], name: str) -> tuple[Path, str, str]:
+def rename_output_image(item: tuple[Path, str, str], name: str, fallback_stem: str = "image") -> tuple[Path, str, str]:
     path, _public_url, mime_type = item
-    stem = normalize_shot_name(name, 1)
+    stem = normalize_filename_stem(name, fallback=fallback_stem)
     suffix = path.suffix or ".png"
     target = path.with_name(f"{stem}{suffix}")
     counter = 2
@@ -1245,7 +1527,7 @@ def rename_output_image(item: tuple[Path, str, str], name: str) -> tuple[Path, s
         counter += 1
     if target != path:
         path.rename(target)
-    public_url = "/media/outputs/" + target.relative_to(OUTPUT_DIR).as_posix()
+    public_url = "/media/outputs/" + target.relative_to(current_output_dir()).as_posix()
     return target, public_url, mime_type
 
 
@@ -1361,7 +1643,8 @@ def load_selected_reference_images(image_ids: list[int], limit: int = 3, convers
             f"""
             select i.*,
                    m.content as message_content,
-                   t.prompt as task_prompt
+                   t.prompt as task_prompt,
+                   t.mode as task_mode
             from images i
             left join messages m on m.id = i.message_id
             left join tasks t on t.id = i.task_id
@@ -1914,16 +2197,41 @@ def active_task_count() -> int:
     return int(row["count"])
 
 
-async def acquire_image_provider_slot(task_id: int, waiting_stage: str | None = None, running_stage: str | None = None) -> dict[str, Any]:
+def resolve_provider_stage_text(
+    stage: str | Callable[[dict[str, Any]], str] | None,
+    provider: dict[str, Any],
+    fallback: str,
+) -> str:
+    if callable(stage):
+        text = str(stage(provider) or "").strip()
+        return text or fallback
+    text = str(stage or "").strip()
+    return text or fallback
+
+
+async def acquire_image_provider_slot(
+    task_id: int,
+    waiting_stage: str | Callable[[dict[str, Any]], str] | None = None,
+    running_stage: str | Callable[[dict[str, Any]], str] | None = None,
+    exclude_provider_ids: set[int] | None = None,
+) -> dict[str, Any]:
     pool = load_image_provider_pool()
     if not pool:
         raise HTTPException(status_code=400, detail="当前没有可用的生图提供商，请先配置 provider 池。")
 
+    excluded_ids = {int(value) for value in (exclude_provider_ids or set())}
     pool_lock = ensure_provider_pool_lock()
     async with pool_lock:
         states = [ensure_provider_pool_state(provider, index) for index, provider in enumerate(pool)]
+        usable_states = [
+            state
+            for state in states
+            if int(state["provider"]["id"]) not in excluded_ids and not provider_is_temporarily_unavailable(state)
+        ]
+        if not usable_states:
+            raise HTTPException(status_code=503, detail=all_providers_unavailable_detail(states, []))
         state = min(
-            states,
+            usable_states,
             key=lambda item: (
                 int(item["running_count"]),
                 int(item["assigned_count"]),
@@ -1934,12 +2242,12 @@ async def acquire_image_provider_slot(task_id: int, waiting_stage: str | None = 
         waiting = int(state["running_count"]) >= MAX_CONCURRENT_TASKS
         state["assigned_count"] = int(state["assigned_count"]) + 1
 
-    waiting_text = waiting_stage or f"已分配生图提供商：{provider['name']}，等待空闲通道"
+    waiting_text = resolve_provider_stage_text(waiting_stage, provider, f"已分配生图提供商：{provider['name']}，等待空闲通道")
     db.update_task(
         task_id,
         image_provider_id=int(provider["id"]),
         image_provider_name=str(provider["name"]),
-        stage=waiting_text if waiting else str(running_stage or waiting_stage or f"已分配生图提供商：{provider['name']}"),
+        stage=waiting_text if waiting else resolve_provider_stage_text(running_stage or waiting_stage, provider, f"已分配生图提供商：{provider['name']}"),
     )
     publish_task_snapshot(task_id)
 
@@ -1951,7 +2259,7 @@ async def acquire_image_provider_slot(task_id: int, waiting_stage: str | None = 
         task_id,
         image_provider_id=int(provider["id"]),
         image_provider_name=str(provider["name"]),
-        stage=running_stage or f"正在使用生图提供商：{provider['name']}",
+        stage=resolve_provider_stage_text(running_stage, provider, f"正在使用生图提供商：{provider['name']}"),
     )
     publish_task_snapshot(task_id)
     return {"provider": provider, "state": state}
@@ -1970,6 +2278,94 @@ async def release_image_provider_slot(task_id: int, lease: dict[str, Any] | None
         state["running_count"] = max(0, int(state["running_count"]) - 1)
         state["assigned_count"] = max(0, int(state["assigned_count"]) - 1)
     publish_task_snapshot(task_id)
+
+
+def update_task_stage(
+    task_id: int,
+    stage: str,
+    *,
+    provider: dict[str, Any] | None = None,
+    progress: int | None = None,
+) -> None:
+    values: dict[str, Any] = {"stage": stage}
+    if progress is not None:
+        values["progress"] = progress
+    if provider:
+        values["image_provider_id"] = int(provider["id"])
+        values["image_provider_name"] = str(provider["name"])
+    db.update_task(task_id, **values)
+    publish_task_snapshot(task_id)
+
+
+async def execute_with_provider_failover(
+    task_id: int,
+    execute: Callable[[dict[str, Any], ClientConfig], Any],
+    *,
+    waiting_stage: str | Callable[[dict[str, Any]], str] | None = None,
+    running_stage: str | Callable[[dict[str, Any]], str] | None = None,
+    retry_stage: Callable[[dict[str, Any], int], str] | None = None,
+    switch_stage: Callable[[dict[str, Any]], str] | None = None,
+) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
+    attempted_provider_ids: set[int] = set()
+    provider_attempts: list[dict[str, Any]] = []
+
+    while True:
+        try:
+            lease = await acquire_image_provider_slot(
+                task_id,
+                waiting_stage=waiting_stage,
+                running_stage=running_stage,
+                exclude_provider_ids=attempted_provider_ids,
+            )
+        except HTTPException as exc:
+            if int(exc.status_code or 0) == 503:
+                detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+                detail["provider_attempts"] = copy.deepcopy(provider_attempts)
+                raise HTTPException(status_code=503, detail=detail) from exc
+            raise
+
+        provider = lease["provider"]
+        state = lease["state"]
+        provider_config = provider_client_config(provider)
+        same_provider_attempts = PROVIDER_UNAVAILABLE_RETRY_COUNT + 1
+
+        try:
+            for attempt_index in range(1, same_provider_attempts + 1):
+                if attempt_index > 1:
+                    retry_text = retry_stage(provider, attempt_index) if retry_stage else f"{provider['name']} 暂时不可用，正在重试第 {attempt_index}/{same_provider_attempts} 次"
+                    update_task_stage(task_id, retry_text, provider=provider)
+                try:
+                    result = await execute(provider, provider_config)
+                    clear_provider_unavailable_state(state)
+                    if provider_attempts:
+                        provider_attempts.append(
+                            {
+                                "provider_id": int(provider["id"]),
+                                "provider_name": str(provider["name"]),
+                                "action": "success",
+                                "attempt": attempt_index,
+                            }
+                        )
+                    return result, provider, provider_attempts
+                except HTTPException as exc:
+                    if not is_provider_unavailable_error(exc):
+                        if provider_attempts:
+                            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+                            detail["provider_attempts"] = copy.deepcopy(provider_attempts)
+                            detail["image_provider"] = {"id": provider["id"], "name": provider["name"]}
+                            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+                        raise
+                    action = "retrying_same_provider" if attempt_index < same_provider_attempts else "provider_unavailable"
+                    provider_attempts.append(provider_attempt_entry(provider, exc.detail, action=action, attempt=attempt_index))
+                    if attempt_index < same_provider_attempts:
+                        continue
+                    mark_provider_unavailable(state, exc.detail)
+                    attempted_provider_ids.add(int(provider["id"]))
+                    switch_text = switch_stage(provider) if switch_stage else f"生图提供商 {provider['name']} 暂不可用，正在切换下一个最佳提供商"
+                    update_task_stage(task_id, switch_text, provider=provider)
+                    break
+        finally:
+            await release_image_provider_slot(task_id, lease)
 
 
 def ensure_conversation_message_allowed(
@@ -2121,13 +2517,27 @@ def ensure_task_slot() -> None:
 
 
 def schedule_task(task_id: int, coro: Any) -> None:
-    task = asyncio.create_task(coro)
-    RUNNING_TASKS[task_id] = task
+    scope = current_storage_scope()
+    runtime_key = task_runtime_key(task_id, scope)
+
+    async def runner() -> None:
+        token = set_storage_scope(scope)
+        try:
+            await coro
+        finally:
+            reset_storage_scope(token)
+
+    task = asyncio.create_task(runner())
+    RUNNING_TASKS[runtime_key] = task
 
     def cleanup(done: asyncio.Task[Any]) -> None:
-        RUNNING_TASKS.pop(task_id, None)
+        RUNNING_TASKS.pop(runtime_key, None)
         if done.cancelled():
-            db.cancel_task(task_id)
+            token = set_storage_scope(scope)
+            try:
+                db.cancel_task(task_id)
+            finally:
+                reset_storage_scope(token)
 
     task.add_done_callback(cleanup)
 
@@ -2182,18 +2592,23 @@ def ensure_default_provider() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    ensure_dirs()
-    db.init_db()
-    ensure_default_provider()
-    with db.connect() as conn:
-        conn.execute(
-            """
-            update tasks
-            set status = 'failed', stage = '服务重启后任务已中断', error = ?, updated_at = ?
-            where status in ('queued', 'running')
-            """,
-            ("服务重启后，内存中的后台任务已中断，请重新创建任务。", db.now_iso()),
-        )
+    for scope in all_known_storage_scopes():
+        token = set_storage_scope(scope)
+        try:
+            ensure_dirs(scope)
+            db.init_db()
+            ensure_default_provider()
+            with db.connect() as conn:
+                conn.execute(
+                    """
+                    update tasks
+                    set status = 'failed', stage = '服务重启后任务已中断', error = ?, updated_at = ?
+                    where status in ('queued', 'running')
+                    """,
+                    ("服务重启后，内存中的后台任务已中断，请重新创建任务。", db.now_iso()),
+                )
+        finally:
+            reset_storage_scope(token)
 
 
 @app.get(ACCESS_LOGIN_PATH, response_class=HTMLResponse, response_model=None)
@@ -2209,16 +2624,30 @@ async def access_login_submit(
     next: str = Form(default="/"),
 ):
     target = sanitized_next_path(next)
-    if not validate_access_password(password):
+    resolved_password = resolve_access_password(password)
+    if not resolved_password:
         return HTMLResponse(login_page_html(target, ACCESS_ERROR_MESSAGE), status_code=401)
     response = RedirectResponse(url=target, status_code=303)
     response.set_cookie(
         ACCESS_COOKIE_NAME,
-        ACCESS_COOKIE_TOKEN,
+        access_cookie_token(resolved_password),
         httponly=True,
         samesite="lax",
         secure=False,
         path="/",
+    )
+    return response
+
+
+@app.post("/auth/logout")
+def access_logout():
+    response = JSONResponse({"ok": True, "redirect_to": ACCESS_LOGIN_PATH})
+    response.delete_cookie(
+        ACCESS_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=False,
     )
     return response
 
@@ -2294,6 +2723,10 @@ def list_providers() -> dict[str, Any]:
                 "pool_assigned_tasks": pool_by_id.get(int(provider["id"]), {}).get("assigned_tasks", 0),
                 "pool_running_tasks": pool_by_id.get(int(provider["id"]), {}).get("running_tasks", 0),
                 "pool_idle_slots": pool_by_id.get(int(provider["id"]), {}).get("idle_slots", MAX_CONCURRENT_TASKS),
+                "pool_available": pool_by_id.get(int(provider["id"]), {}).get("available", True),
+                "pool_status": pool_by_id.get(int(provider["id"]), {}).get("status", "idle"),
+                "pool_unavailable_seconds": pool_by_id.get(int(provider["id"]), {}).get("unavailable_seconds", 0),
+                "pool_last_error": pool_by_id.get(int(provider["id"]), {}).get("last_error"),
             }
             for provider in items
         ],
@@ -2435,6 +2868,7 @@ async def generate_image(request: GenerateRequest) -> dict[str, Any]:
             "model": request.model,
             "image_model": request.image_model,
             "prompt": request.prompt,
+            "image_title": normalize_image_title(request.image_title or ""),
             "size": request.size,
             "quality": request.quality,
             "n": request.n,
@@ -2454,21 +2888,22 @@ async def generate_image(request: GenerateRequest) -> dict[str, Any]:
 
 async def run_generate_task(task_id: int, request: GenerateRequest, payload: dict[str, Any], *, conversation_id: int | None = None, user_message_id: int | None = None) -> None:
     async def worker() -> None:
-        title = request.prompt[:48] or f"task-{task_id}"
-        bucket = task_image_folder(task_id, title)
+        conversation_title = conversation_title_for_naming(conversation_id, fallback=request.prompt[:20] or f"task-{task_id}")
+        base_title = build_direct_mode_base_title(
+            request.image_title,
+            conversation_id=conversation_id,
+            prompt=request.prompt,
+            created_at=db.now_iso(),
+        )
+        bucket = task_image_folder(task_id, conversation_title or request.prompt[:48] or f"task-{task_id}")
         responses: list[dict[str, Any]] = []
         saved_images: list[dict[str, Any]] = []
-        lease = await acquire_image_provider_slot(task_id)
-        provider = lease["provider"]
-        provider_config = provider_client_config(provider)
-        try:
-            for index in range(request.n):
-                db.update_task(
-                    task_id,
-                    progress=min(15 + int(index / max(request.n, 1) * 70), 85),
-                    stage=f"正在使用 {provider['name']} 生成第 {index + 1}/{request.n} 张",
-                )
-                response = await call_responses_image_generation(
+        provider_attempts: list[dict[str, Any]] = []
+        last_provider: dict[str, Any] | None = None
+        for index in range(request.n):
+            response, provider, attempt_log = await execute_with_provider_failover(
+                task_id,
+                lambda _provider, provider_config: call_responses_image_generation(
                     model=request.model,
                     prompt=request.prompt,
                     image_model=request.image_model,
@@ -2483,39 +2918,57 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                     config=provider_config,
                     on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                     on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                ),
+                waiting_stage=lambda item, index=index: f"第 {index + 1}/{request.n} 张已分配到 {item['name']}，等待空闲通道",
+                running_stage=lambda item, index=index: f"正在使用 {item['name']} 生成第 {index + 1}/{request.n} 张",
+                retry_stage=lambda item, attempt, index=index: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续生成第 {index + 1}/{request.n} 张",
+                switch_stage=lambda item, index=index: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续生成第 {index + 1}/{request.n} 张",
+            )
+            last_provider = provider
+            if attempt_log:
+                provider_attempts.extend(attempt_log)
+            responses.append(sanitize_response(response))
+            image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
+            for item_offset, item in enumerate(image_items, start=1):
+                sequence_index = len(saved_images) + 1
+                resolved_title = build_sequenced_title(base_title, sequence_index, max(int(request.n), 1))
+                renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
+                saved_images.append(
+                    public_task_image(
+                        renamed,
+                        task_id=task_id,
+                        title=resolved_title,
+                        bucket=bucket,
+                        conversation_id=conversation_id,
+                        message_id=user_message_id,
+                    )
                 )
-                responses.append(sanitize_response(response))
-                image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
-                saved_images.extend(
-                    public_task_image(item, task_id=task_id, title=title, bucket=bucket, conversation_id=conversation_id, message_id=user_message_id)
-                    for item in image_items
-                )
-                db.update_task(
-                    task_id,
-                    progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
-                    stage=f"已通过 {provider['name']} 保存第 {index + 1}/{request.n} 张结果",
-                )
-            if not saved_images:
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                        "endpoint": "responses",
-                        "upstream": responses,
-                        "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                    },
-                )
-            db.update_task(task_id, progress=96, stage="正在整理任务结果")
-            raw = {
-                "endpoint": "/v1/responses",
-                "tool": "image_generation",
-                "image_provider": {"id": provider["id"], "name": provider["name"]},
-                "responses": responses,
-                "images": saved_images,
-            }
-            db.finish_task(task_id, raw)
-        finally:
-            await release_image_provider_slot(task_id, lease)
+            db.update_task(
+                task_id,
+                progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
+                stage=f"已通过 {provider['name']} 保存第 {index + 1}/{request.n} 张结果",
+            )
+        if not saved_images:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                    "endpoint": "responses",
+                    "upstream": responses,
+                    "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                    "provider_attempts": provider_attempts,
+                },
+            )
+        db.update_task(task_id, progress=96, stage="正在整理任务结果")
+        raw = {
+            "endpoint": "/v1/responses",
+            "tool": "image_generation",
+            "image_provider": {"id": last_provider["id"], "name": last_provider["name"]} if last_provider else None,
+            "provider_attempts": provider_attempts,
+            "responses": responses,
+            "images": saved_images,
+        }
+        db.finish_task(task_id, raw)
     await run_with_slot(task_id, worker)
 
 
@@ -2526,7 +2979,7 @@ async def edit_image(
     mask: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
     ensure_task_slot()
-    params = normalize_text_fields(parse_params(params_json))
+    params = normalize_text_fields(parse_params(params_json), keys=("prompt", "image_title"))
     prompt = str(params.get("prompt") or "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
@@ -2561,6 +3014,7 @@ async def edit_image(
             "model": params.get("model", "gpt-5.4"),
             "image_model": params.get("image_model", "gpt-image-2"),
             "prompt": prompt,
+            "image_title": normalize_image_title(params.get("image_title") or ""),
             "size": params.get("size", "2560x1440"),
             "quality": params.get("quality", "high"),
             "n": clamp_image_count(params.get("n", 1)),
@@ -2594,23 +3048,24 @@ async def run_edit_task(
     user_message_id: int | None = None,
 ) -> None:
     async def worker() -> None:
-        title = prompt[:48] or f"task-{task_id}"
-        bucket = task_image_folder(task_id, title)
+        conversation_title = conversation_title_for_naming(conversation_id, fallback=prompt[:20] or f"task-{task_id}")
+        base_title = build_direct_mode_base_title(
+            str(params.get("image_title") or ""),
+            conversation_id=conversation_id,
+            prompt=prompt,
+            created_at=db.now_iso(),
+        )
+        bucket = task_image_folder(task_id, conversation_title or prompt[:48] or f"task-{task_id}")
         output_format = str(params.get("output_format", "png"))
         responses: list[dict[str, Any]] = []
         saved_output_images: list[dict[str, Any]] = []
         count = clamp_image_count(params.get("n", 1))
-        lease = await acquire_image_provider_slot(task_id)
-        provider = lease["provider"]
-        client_config = provider_client_config(provider)
-        try:
-            for index in range(count):
-                db.update_task(
-                    task_id,
-                    progress=min(15 + int(index / max(count, 1) * 70), 85),
-                    stage=f"正在使用 {provider['name']} 编辑第 {index + 1}/{count} 张",
-                )
-                response = await call_responses_image_generation(
+        provider_attempts: list[dict[str, Any]] = []
+        last_provider: dict[str, Any] | None = None
+        for index in range(count):
+            response, provider, attempt_log = await execute_with_provider_failover(
+                task_id,
+                lambda _provider, client_config: call_responses_image_generation(
                     model=str(params.get("model", "gpt-5.4")),
                     prompt=prompt,
                     image_model=str(params.get("image_model", "gpt-image-2")),
@@ -2628,39 +3083,57 @@ async def run_edit_task(
                     input_fidelity=str(params.get("input_fidelity", "auto")),
                     on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                     on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                ),
+                waiting_stage=lambda item, index=index: f"第 {index + 1}/{count} 张已分配到 {item['name']}，等待空闲通道",
+                running_stage=lambda item, index=index: f"正在使用 {item['name']} 编辑第 {index + 1}/{count} 张",
+                retry_stage=lambda item, attempt, index=index: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续编辑第 {index + 1}/{count} 张",
+                switch_stage=lambda item, index=index: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续编辑第 {index + 1}/{count} 张",
+            )
+            last_provider = provider
+            if attempt_log:
+                provider_attempts.extend(attempt_log)
+            responses.append(sanitize_response(response))
+            image_items = extract_images_from_responses(response, output_format, folder=bucket)
+            for item in image_items:
+                sequence_index = len(saved_output_images) + 1
+                resolved_title = build_sequenced_title(base_title, sequence_index, max(count, 1))
+                renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
+                saved_output_images.append(
+                    public_task_image(
+                        renamed,
+                        task_id=task_id,
+                        title=resolved_title,
+                        bucket=bucket,
+                        conversation_id=conversation_id,
+                        message_id=user_message_id,
+                    )
                 )
-                responses.append(sanitize_response(response))
-                image_items = extract_images_from_responses(response, output_format, folder=bucket)
-                saved_output_images.extend(
-                    public_task_image(item, task_id=task_id, title=title, bucket=bucket, conversation_id=conversation_id, message_id=user_message_id)
-                    for item in image_items
-                )
-                db.update_task(
-                    task_id,
-                    progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
-                    stage=f"已通过 {provider['name']} 保存第 {index + 1}/{count} 张编辑结果",
-                )
-            if not saved_output_images:
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                        "endpoint": "responses",
-                        "upstream": responses,
-                        "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                    },
-                )
-            db.update_task(task_id, progress=96, stage="正在整理任务结果")
-            raw = {
-                "endpoint": "/v1/responses",
-                "tool": "image_generation",
-                "image_provider": {"id": provider["id"], "name": provider["name"]},
-                "responses": responses,
-                "images": saved_output_images,
-            }
-            db.finish_task(task_id, raw)
-        finally:
-            await release_image_provider_slot(task_id, lease)
+            db.update_task(
+                task_id,
+                progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
+                stage=f"已通过 {provider['name']} 保存第 {index + 1}/{count} 张编辑结果",
+            )
+        if not saved_output_images:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                    "endpoint": "responses",
+                    "upstream": responses,
+                    "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                    "provider_attempts": provider_attempts,
+                },
+            )
+        db.update_task(task_id, progress=96, stage="正在整理任务结果")
+        raw = {
+            "endpoint": "/v1/responses",
+            "tool": "image_generation",
+            "image_provider": {"id": last_provider["id"], "name": last_provider["name"]} if last_provider else None,
+            "provider_attempts": provider_attempts,
+            "responses": responses,
+            "images": saved_output_images,
+        }
+        db.finish_task(task_id, raw)
     await run_with_slot(task_id, worker)
 
 
@@ -2702,13 +3175,14 @@ async def task_events(task_id: int, request: Request) -> StreamingResponse:
     if not db.get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
 
+    runtime_key = task_runtime_key(task_id)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
-    TASK_EVENT_SUBSCRIBERS.setdefault(task_id, set()).add(queue)
+    TASK_EVENT_SUBSCRIBERS.setdefault(runtime_key, set()).add(queue)
 
     async def stream() -> Any:
         try:
             yield sse_format("connected", {"task_id": task_id})
-            for payload in TASK_EVENT_SNAPSHOTS.get(task_id, {}).values():
+            for payload in TASK_EVENT_SNAPSHOTS.get(runtime_key, {}).values():
                 yield sse_format(str(payload["event"]), payload["data"])
             publish_task_snapshot(task_id)
             while True:
@@ -2723,9 +3197,9 @@ async def task_events(task_id: int, request: Request) -> StreamingResponse:
                 if payload["event"] in {"done", "failed", "canceled"}:
                     break
         finally:
-            TASK_EVENT_SUBSCRIBERS.get(task_id, set()).discard(queue)
-            if not TASK_EVENT_SUBSCRIBERS.get(task_id):
-                TASK_EVENT_SUBSCRIBERS.pop(task_id, None)
+            TASK_EVENT_SUBSCRIBERS.get(runtime_key, set()).discard(queue)
+            if not TASK_EVENT_SUBSCRIBERS.get(runtime_key):
+                TASK_EVENT_SUBSCRIBERS.pop(runtime_key, None)
 
     return StreamingResponse(
         stream(),
@@ -2761,7 +3235,7 @@ def cancel_task(task_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="task not found")
     if task["status"] in {"done", "failed", "canceled"}:
         return {"task": task_with_images(task_id)}
-    running = RUNNING_TASKS.get(task_id)
+    running = RUNNING_TASKS.get(task_runtime_key(task_id))
     if running:
         running.cancel()
     db.cancel_task(task_id)
@@ -2918,6 +3392,23 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
                 (conversation_id,),
             ).fetchall()
         ]
+        message_upload_rows = [
+            db.row_to_dict(row)
+            for row in conn.execute(
+                """
+                select i.*,
+                       m.content as message_content,
+                       t.prompt as task_prompt,
+                       t.mode as task_mode
+                from images i
+                left join messages m on m.id = i.message_id
+                left join tasks t on t.id = i.task_id
+                where i.conversation_id = ? and i.source != 'api'
+                order by i.id asc
+                """,
+                (conversation_id,),
+            ).fetchall()
+        ]
         tasks = [
             summarize_task(row)
             for row in conn.execute(
@@ -2925,15 +3416,44 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
                 (conversation_id,),
             ).fetchall()
         ]
+    message_upload_map: dict[tuple[int, str], dict[str, Any]] = {}
+    message_upload_rows_by_message: dict[int, list[dict[str, Any]]] = {}
+    for item in message_upload_rows:
+        message_id = item.get("message_id")
+        file_path = str(item.get("file_path") or "").strip()
+        if not message_id or not file_path:
+            continue
+        message_upload_map[(int(message_id), file_path)] = item
+        message_upload_rows_by_message.setdefault(int(message_id), []).append(item)
     for message in messages:
         uploaded_images = []
         try:
             meta = json.loads(message.get("meta_json") or "{}")
         except json.JSONDecodeError:
             meta = {}
+        message_id = int(message.get("id") or 0)
+        seen_upload_paths: set[str] = set()
         for path_value in meta.get("uploads", []) if isinstance(meta, dict) else []:
-            item = public_upload_image(str(path_value))
+            normalized_path = str(path_value or "").strip()
+            item = public_message_upload_image(message_upload_map.get((message_id, normalized_path), {}))
             if item:
+                seen_upload_paths.add(str(item.get("file_path") or "").strip())
+                uploaded_images.append(item)
+                continue
+            fallback = public_upload_image(normalized_path)
+            if fallback:
+                fallback["source"] = "input"
+                seen_upload_paths.add(str(fallback.get("file_path") or "").strip())
+                uploaded_images.append(fallback)
+        for row in message_upload_rows_by_message.get(message_id, []):
+            if row.get("source") == "input_reference":
+                continue
+            file_path = str(row.get("file_path") or "").strip()
+            if not file_path or file_path in seen_upload_paths:
+                continue
+            item = public_message_upload_image(row)
+            if item:
+                seen_upload_paths.add(file_path)
                 uploaded_images.append(item)
         reference_ids = meta.get("reference_image_ids", []) if isinstance(meta, dict) else []
         for image in load_selected_reference_images(reference_ids, limit=3, conversation_id=conversation_id):
@@ -2946,6 +3466,9 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
                     "filename": Path(image["file_path"]).name,
                     "mime_type": image["mime_type"],
                     "source": "input_reference",
+                    "origin_source": image.get("source") or "api",
+                    "title": image.get("title"),
+                    "task_mode": image.get("task_mode"),
                     "prompt_text": image.get("task_prompt") or image.get("message_content") or image.get("title"),
                 }
             )
@@ -3248,36 +3771,35 @@ async def run_storyboard_task(
         previous_image: tuple[Path, str] | None = None
         saved_images: list[dict[str, Any]] = []
         shot_results: list[dict[str, Any]] = []
-        lease = await acquire_image_provider_slot(task_id)
-        provider = lease["provider"]
-        provider_config = provider_client_config(provider)
-        raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
-        try:
-            for index, shot in enumerate(shots, start=1):
-                shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
-                shot["name"] = shot_name
-                shot["status"] = "running"
-                update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
-                db.update_task(task_id, progress=progress, stage=f"正在使用 {provider['name']} 生成镜头 {index}/{total}：{shot_name}")
-                publish_task_snapshot(task_id)
-                continuity_prompt = "\n".join(
-                    part
-                    for part in [
-                        f"人物一致性概述：{plan.get('character_summary')}",
-                        f"场景一致性概述：{plan.get('scene_summary')}",
-                        f"镜头顺序：第 {index}/{total} 镜头，文件名/标题：{shot_name}",
-                        f"连续性要求：{shot.get('continuity')}",
-                        "必须保持人物身份、服装、发型、道具、空间方位、光线方向和画面质感连续。",
-                        "每次只输出这一镜头的一张首帧画面，不要拼图，不要多格漫画。",
-                        str(shot.get("planner_prompt") or shot.get("prompt") or ""),
-                    ]
-                    if str(part or "").strip()
-                )
-                edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, image_candidates)
-                action = "edit" if edit_inputs else "generate"
-                try:
-                    response = await call_responses_image_generation(
+        provider_attempts: list[dict[str, Any]] = []
+        last_provider: dict[str, Any] | None = None
+        for index, shot in enumerate(shots, start=1):
+            shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
+            shot["name"] = shot_name
+            shot["status"] = "running"
+            update_storyboard_task_state(task_id, task_payload, storyboard_state)
+            progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
+            db.update_task(task_id, progress=progress, stage=f"准备生成镜头 {index}/{total}：{shot_name}")
+            publish_task_snapshot(task_id)
+            continuity_prompt = "\n".join(
+                part
+                for part in [
+                    f"人物一致性概述：{plan.get('character_summary')}",
+                    f"场景一致性概述：{plan.get('scene_summary')}",
+                    f"镜头顺序：第 {index}/{total} 镜头，文件名/标题：{shot_name}",
+                    f"连续性要求：{shot.get('continuity')}",
+                    "必须保持人物身份、服装、发型、道具、空间方位、光线方向和画面质感连续。",
+                    "每次只输出这一镜头的一张首帧画面，不要拼图，不要多格漫画。",
+                    str(shot.get("planner_prompt") or shot.get("prompt") or ""),
+                ]
+                if str(part or "").strip()
+            )
+            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, image_candidates)
+            action = "edit" if edit_inputs else "generate"
+            try:
+                response, provider, attempt_log = await execute_with_provider_failover(
+                    task_id,
+                    lambda _provider, provider_config: call_responses_image_generation(
                         model=params.model,
                         prompt=continuity_prompt,
                         image_model=params.image_model,
@@ -3296,82 +3818,97 @@ async def run_storyboard_task(
                         previous_response_id=None,
                         on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                         on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
+                    ),
+                    waiting_stage=lambda item, index=index, total=total, shot_name=shot_name: f"镜头 {index}/{total} 已分配到 {item['name']}，等待空闲通道：{shot_name}",
+                    running_stage=lambda item, index=index, total=total, shot_name=shot_name: f"正在使用 {item['name']} 生成镜头 {index}/{total}：{shot_name}",
+                    retry_stage=lambda item, attempt, index=index, total=total, shot_name=shot_name: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次：镜头 {index}/{total} {shot_name}",
+                    switch_stage=lambda item, index=index, total=total, shot_name=shot_name: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续生成镜头 {index}/{total}：{shot_name}",
+                )
+                last_provider = provider
+                if attempt_log:
+                    provider_attempts.extend(attempt_log)
+                image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                if not image_items:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                            "endpoint": "responses",
+                            "upstream": sanitize_response(response),
+                            "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                            "provider_attempts": provider_attempts,
+                        },
                     )
-                    image_items = extract_images_from_responses(response, output_format, folder=bucket)
-                    if not image_items:
-                        raise HTTPException(
-                            status_code=502,
-                            detail={
-                                "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
-                                "endpoint": "responses",
-                                "upstream": sanitize_response(response),
-                                "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
-                            },
-                        )
-                    renamed = rename_output_image(image_items[0], shot_name)
-                    image_record = public_task_image(
-                        renamed,
-                        conversation_id=conversation_id,
-                        message_id=assistant_message_id,
-                        task_id=task_id,
-                        title=shot_name,
-                        bucket=bucket,
-                    )
-                    saved_images.append(image_record)
-                    previous_image = (renamed[0], renamed[2])
-                    shot["status"] = "done"
-                    shot["image_id"] = image_record["id"]
-                    shot["url"] = image_record["url"]
-                    shot["execution_prompt"] = continuity_prompt
-                    image_record["prompt_text"] = continuity_prompt
-                    shot_results.append(
-                        {
-                            "shot": shot,
-                            "action": action,
-                            "response": sanitize_response(response),
-                            "image": image_record,
-                        }
-                    )
-                    db.add_prompt(continuity_prompt, source="auto", mode="storyboard")
-                    update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                    db.update_task(
-                        task_id,
-                        progress=min(32 + int(index / max(total, 1) * 60), 92),
-                        stage=f"已通过 {provider['name']} 保存镜头 {index}/{total}：{shot_name}",
-                    )
-                    publish_storyboard_image_saved(
-                        task_id,
-                        conversation_id=conversation_id,
-                        message_id=assistant_message_id,
-                        image=image_record,
-                        shot=shot,
-                        index=index,
-                        total=total,
-                    )
-                except HTTPException as exc:
-                    shot["status"] = "failed"
-                    shot["error"] = exc.detail
-                    update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                    publish_task_snapshot(task_id)
-                    raw_for_meta["image_status"] = "failed"
-                    raw_for_meta["image_error"] = exc.detail
-                    update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
-                    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-                except Exception as exc:
-                    shot["status"] = "failed"
-                    shot["error"] = str(exc)
-                    update_storyboard_task_state(task_id, task_payload, storyboard_state)
-                    publish_task_snapshot(task_id)
-                    raw_for_meta["image_status"] = "failed"
-                    raw_for_meta["image_error"] = str(exc)
-                    update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
-                    raise
-        finally:
-            await release_image_provider_slot(task_id, lease)
+                renamed = rename_output_image(image_items[0], shot_name)
+                image_record = public_task_image(
+                    renamed,
+                    conversation_id=conversation_id,
+                    message_id=assistant_message_id,
+                    task_id=task_id,
+                    title=shot_name,
+                    bucket=bucket,
+                )
+                raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
+                raw_for_meta["provider_attempts"] = provider_attempts
+                saved_images.append(image_record)
+                previous_image = (renamed[0], renamed[2])
+                shot["status"] = "done"
+                shot["image_id"] = image_record["id"]
+                shot["url"] = image_record["url"]
+                shot["execution_prompt"] = continuity_prompt
+                image_record["prompt_text"] = continuity_prompt
+                shot_results.append(
+                    {
+                        "shot": shot,
+                        "action": action,
+                        "response": sanitize_response(response),
+                        "image": image_record,
+                        "provider": {"id": provider["id"], "name": provider["name"]},
+                    }
+                )
+                db.add_prompt(continuity_prompt, source="auto", mode="storyboard")
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                db.update_task(
+                    task_id,
+                    progress=min(32 + int(index / max(total, 1) * 60), 92),
+                    stage=f"已通过 {provider['name']} 保存镜头 {index}/{total}：{shot_name}",
+                )
+                publish_storyboard_image_saved(
+                    task_id,
+                    conversation_id=conversation_id,
+                    message_id=assistant_message_id,
+                    image=image_record,
+                    shot=shot,
+                    index=index,
+                    total=total,
+                )
+            except HTTPException as exc:
+                shot["status"] = "failed"
+                shot["error"] = exc.detail
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                publish_task_snapshot(task_id)
+                raw_for_meta["image_status"] = "failed"
+                raw_for_meta["image_error"] = exc.detail
+                raw_for_meta["provider_attempts"] = provider_attempts
+                update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            except Exception as exc:
+                shot["status"] = "failed"
+                shot["error"] = str(exc)
+                update_storyboard_task_state(task_id, task_payload, storyboard_state)
+                publish_task_snapshot(task_id)
+                raw_for_meta["image_status"] = "failed"
+                raw_for_meta["image_error"] = str(exc)
+                raw_for_meta["provider_attempts"] = provider_attempts
+                update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                raise
 
         raw_for_meta["image_status"] = "done"
         raw_for_meta["storyboard"] = storyboard_state
+        raw_for_meta["provider_attempts"] = provider_attempts
         raw_for_meta["shot_results"] = shot_results
+        if last_provider:
+            raw_for_meta["image_provider"] = {"id": last_provider["id"], "name": last_provider["name"]}
         update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
         db.update_task(task_id, progress=96, stage="正在整理分镜结果")
         db.finish_task(
@@ -3555,31 +4092,31 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
         db.update_task(task_id, progress=12, stage=f"准备从第 {done_count + 1}/{total} 个镜头继续")
         update_storyboard_task_state(task_id, payload, storyboard)
         publish_task_snapshot(task_id)
-        lease = await acquire_image_provider_slot(task_id)
-        provider = lease["provider"]
-        client_config = provider_client_config(provider)
-        try:
-            for index, shot in enumerate(shots, start=1):
-                if not isinstance(shot, dict) or shot.get("status") == "done":
-                    continue
-                shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
-                shot["name"] = shot_name
-                shot["status"] = "running"
-                update_storyboard_task_state(task_id, payload, storyboard)
-                db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"正在使用 {provider['name']} 重试镜头 {index}/{total}：{shot_name}")
-                publish_task_snapshot(task_id)
-                edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
-                action = "edit" if edit_inputs else "generate"
-                try:
-                    if previous_image is None and index > 1:
-                        raise HTTPException(
-                            status_code=400,
-                            detail={
-                                "message": "无法继续分镜：没有找到上一镜头输出图作为 edit 输入。",
-                                "suggestion": "请从原对话重新提交分镜需求，或选择一张参考图后重试。",
-                            },
-                        )
-                    response = await call_responses_image_generation(
+        provider_attempts: list[dict[str, Any]] = []
+        last_provider: dict[str, Any] | None = None
+        for index, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict) or shot.get("status") == "done":
+                continue
+            shot_name = normalize_shot_name(str(shot.get("name") or f"镜头{index}"), index)
+            shot["name"] = shot_name
+            shot["status"] = "running"
+            update_storyboard_task_state(task_id, payload, storyboard)
+            db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"准备重试镜头 {index}/{total}：{shot_name}")
+            publish_task_snapshot(task_id)
+            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
+            action = "edit" if edit_inputs else "generate"
+            try:
+                if previous_image is None and index > 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": "无法继续分镜：没有找到上一镜头输出图作为 edit 输入。",
+                            "suggestion": "请从原对话重新提交分镜需求，或选择一张参考图后重试。",
+                        },
+                    )
+                response, provider, attempt_log = await execute_with_provider_failover(
+                    task_id,
+                    lambda _provider, client_config: call_responses_image_generation(
                         model=str(payload.get("model", "gpt-5.4")),
                         prompt=str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or ""),
                         image_model=str(payload.get("image_model", "gpt-image-2")),
@@ -3598,61 +4135,74 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                         previous_response_id=None,
                         on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                         on_stream_event=lambda event, shot_index=index, name=shot_name: handle_storyboard_stream_event(task_id, shot_index, total, name, event),
+                    ),
+                    waiting_stage=lambda item, index=index, total=total, shot_name=shot_name: f"重试镜头 {index}/{total} 已分配到 {item['name']}，等待空闲通道：{shot_name}",
+                    running_stage=lambda item, index=index, total=total, shot_name=shot_name: f"正在使用 {item['name']} 重试镜头 {index}/{total}：{shot_name}",
+                    retry_stage=lambda item, attempt, index=index, total=total, shot_name=shot_name: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次：镜头 {index}/{total} {shot_name}",
+                    switch_stage=lambda item, index=index, total=total, shot_name=shot_name: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续重试镜头 {index}/{total}：{shot_name}",
+                )
+                last_provider = provider
+                if attempt_log:
+                    provider_attempts.extend(attempt_log)
+                image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                if not image_items:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                            "provider_attempts": provider_attempts,
+                        },
                     )
-                    image_items = extract_images_from_responses(response, output_format, folder=bucket)
-                    if not image_items:
-                        raise HTTPException(status_code=502, detail="Responses API 已返回，但没有找到 image_generation_call.result 图片数据。")
-                    renamed = rename_output_image(image_items[0], shot_name)
-                    image_record = public_task_image(
-                        renamed,
-                        conversation_id=old_task.get("conversation_id"),
-                        message_id=old_task.get("assistant_message_id"),
-                        task_id=task_id,
-                        title=shot_name,
-                        bucket=bucket,
-                    )
-                    saved_images.append(image_record)
-                    previous_image = (renamed[0], renamed[2])
-                    shot["status"] = "done"
-                    shot["image_id"] = image_record["id"]
-                    shot["url"] = image_record["url"]
-                    image_record["prompt_text"] = str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or "")
-                    update_storyboard_task_state(task_id, payload, storyboard)
-                    db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已通过 {provider['name']} 重试保存镜头 {index}/{total}：{shot_name}")
-                    publish_storyboard_image_saved(
-                        task_id,
-                        conversation_id=old_task.get("conversation_id"),
-                        message_id=old_task.get("assistant_message_id"),
-                        image=image_record,
-                        shot=shot,
-                        index=index,
-                        total=total,
-                    )
-                except HTTPException as exc:
-                    shot["status"] = "failed"
-                    shot["error"] = exc.detail
-                    update_storyboard_task_state(task_id, payload, storyboard)
-                    publish_task_snapshot(task_id)
-                    raise
-                except Exception as exc:
-                    shot["status"] = "failed"
-                    shot["error"] = str(exc)
-                    update_storyboard_task_state(task_id, payload, storyboard)
-                    publish_task_snapshot(task_id)
-                    raise
-            db.finish_task(
-                task_id,
-                {
-                    "retry_of": old_task.get("id"),
-                    "images": saved_images,
-                    "raw": {
-                        "storyboard": storyboard,
-                        "image_provider": {"id": provider["id"], "name": provider["name"]},
-                    },
+                renamed = rename_output_image(image_items[0], shot_name)
+                image_record = public_task_image(
+                    renamed,
+                    conversation_id=old_task.get("conversation_id"),
+                    message_id=old_task.get("assistant_message_id"),
+                    task_id=task_id,
+                    title=shot_name,
+                    bucket=bucket,
+                )
+                saved_images.append(image_record)
+                previous_image = (renamed[0], renamed[2])
+                shot["status"] = "done"
+                shot["image_id"] = image_record["id"]
+                shot["url"] = image_record["url"]
+                image_record["prompt_text"] = str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or "")
+                update_storyboard_task_state(task_id, payload, storyboard)
+                db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已通过 {provider['name']} 重试保存镜头 {index}/{total}：{shot_name}")
+                publish_storyboard_image_saved(
+                    task_id,
+                    conversation_id=old_task.get("conversation_id"),
+                    message_id=old_task.get("assistant_message_id"),
+                    image=image_record,
+                    shot=shot,
+                    index=index,
+                    total=total,
+                )
+            except HTTPException as exc:
+                shot["status"] = "failed"
+                shot["error"] = exc.detail
+                update_storyboard_task_state(task_id, payload, storyboard)
+                publish_task_snapshot(task_id)
+                raise
+            except Exception as exc:
+                shot["status"] = "failed"
+                shot["error"] = str(exc)
+                update_storyboard_task_state(task_id, payload, storyboard)
+                publish_task_snapshot(task_id)
+                raise
+        db.finish_task(
+            task_id,
+            {
+                "retry_of": old_task.get("id"),
+                "images": saved_images,
+                "raw": {
+                    "storyboard": storyboard,
+                    "image_provider": {"id": last_provider["id"], "name": last_provider["name"]} if last_provider else None,
+                    "provider_attempts": provider_attempts,
                 },
-            )
-        finally:
-            await release_image_provider_slot(task_id, lease)
+            },
+        )
 
     await run_with_slot(task_id, worker)
 
@@ -3672,7 +4222,7 @@ def gallery(limit: int = 200) -> dict[str, Any]:
             left join conversations c on c.id = i.conversation_id
             left join messages m on m.id = i.message_id
             left join tasks t on t.id = i.task_id
-            where i.source != 'mask'
+            where i.source not in ('mask', 'input_reference')
             order by datetime(i.created_at) desc, i.id desc
             limit ?
             """,
@@ -3952,45 +4502,58 @@ async def run_chat_task(
         raw_for_meta["selected_reference_image_ids"] = [item.get("id") for item in image_candidates if item.get("id")]
         raw_for_meta["resolved_action"] = action
         raw_for_meta["tool"] = "image_generation"
+        image_name = normalize_image_title(plan.get("image_name") or "")
+        if not image_name:
+            image_name = build_direct_mode_base_title(
+                "",
+                conversation_id=conversation_id,
+                prompt=image_prompt,
+                created_at=db.now_iso(),
+            )
+        raw_for_meta["image_name"] = image_name
         raw_for_meta["image_prompt"] = image_prompt
         update_message_meta(assistant_message_id, {**raw_for_meta, "image_status": "waiting"}, planner_response_id)
-        lease = await acquire_image_provider_slot(
-            task_id,
-            waiting_stage=f"AI 决定执行 {action}，已分配生图提供商，等待空闲通道",
-            running_stage=f"AI 决定执行 {action}，正在使用生图提供商生成图片",
-        )
-        provider = lease["provider"]
-        provider_config = provider_client_config(provider)
-        raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
-        update_message_meta(
-            assistant_message_id,
-            {
-                **raw_for_meta,
-                "image_status": "running",
-                "image_stage": f"AI 决定执行 {action}，正在使用 {provider['name']} 生成图片",
-            },
-            planner_response_id,
-        )
+        provider_attempts: list[dict[str, Any]] = []
         try:
-            image_response = await call_responses_image_generation(
-                model=params.model,
-                prompt=image_prompt,
-                image_model=params.image_model,
-                size=params.size,
-                quality=params.quality,
-                output_format=params.output_format,
-                background=params.background,
-                output_compression=params.output_compression,
-                moderation=params.moderation,
-                action=action,
-                partial_images=params.partial_images,
-                config=provider_config,
-                uploaded=edit_inputs,
-                input_fidelity=params.input_fidelity,
-                input_image_notes=input_image_notes if edit_inputs else None,
-                previous_response_id=None,
-                on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+            image_response, provider, attempt_log = await execute_with_provider_failover(
+                task_id,
+                lambda _provider, provider_config: call_responses_image_generation(
+                    model=params.model,
+                    prompt=image_prompt,
+                    image_model=params.image_model,
+                    size=params.size,
+                    quality=params.quality,
+                    output_format=params.output_format,
+                    background=params.background,
+                    output_compression=params.output_compression,
+                    moderation=params.moderation,
+                    action=action,
+                    partial_images=params.partial_images,
+                    config=provider_config,
+                    uploaded=edit_inputs,
+                    input_fidelity=params.input_fidelity,
+                    input_image_notes=input_image_notes if edit_inputs else None,
+                    previous_response_id=None,
+                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                    on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                ),
+                waiting_stage=lambda item: f"AI 决定执行 {action}，已分配 {item['name']}，等待空闲通道",
+                running_stage=lambda item: f"AI 决定执行 {action}，正在使用 {item['name']} 生成图片",
+                retry_stage=lambda item, attempt: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续生成图片",
+                switch_stage=lambda item: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续生成图片",
+            )
+            if attempt_log:
+                provider_attempts.extend(attempt_log)
+            raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
+            raw_for_meta["provider_attempts"] = provider_attempts
+            update_message_meta(
+                assistant_message_id,
+                {
+                    **raw_for_meta,
+                    "image_status": "running",
+                    "image_stage": f"AI 决定执行 {action}，正在使用 {provider['name']} 生成图片",
+                },
+                planner_response_id,
             )
             db.update_task(task_id, progress=84, stage=f"正在通过 {provider['name']} 提取和保存图片")
             bucket = task_image_folder(task_id, conversation_title)
@@ -4004,11 +4567,13 @@ async def run_chat_task(
                         "endpoint": "responses",
                         "upstream": sanitize_response(image_response),
                         "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                        "provider_attempts": provider_attempts,
                     },
                 )
         except HTTPException as exc:
             raw_for_meta["image_status"] = "failed"
             raw_for_meta["image_error"] = exc.detail
+            raw_for_meta["provider_attempts"] = provider_attempts
             update_message_meta(
                 assistant_message_id,
                 raw_for_meta,
@@ -4020,20 +4585,22 @@ async def run_chat_task(
                     (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
                 )
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-        finally:
-            await release_image_provider_slot(task_id, lease)
 
-        images_out = [
-            public_task_image(
-                item,
-                conversation_id=conversation_id,
-                message_id=assistant_message_id,
-                task_id=task_id,
-                title=conversation_title,
-                bucket=bucket,
+        images_out: list[dict[str, Any]] = []
+        total_images = max(len(image_items), 1)
+        for index, item in enumerate(image_items, start=1):
+            resolved_title = build_sequenced_title(image_name, index, total_images)
+            renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
+            images_out.append(
+                public_task_image(
+                    renamed,
+                    conversation_id=conversation_id,
+                    message_id=assistant_message_id,
+                    task_id=task_id,
+                    title=resolved_title,
+                    bucket=bucket,
+                )
             )
-            for item in image_items
-        ]
         raw_for_meta["image_status"] = "done"
         with db.connect() as conn:
             conn.execute(
@@ -4064,8 +4631,41 @@ async def run_chat_task(
 
 
 
-app.mount("/media/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-app.mount("/media/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+def resolve_tenant_media_file(kind: str, relative_path: str) -> Path:
+    if kind == "uploads":
+        root = current_upload_dir()
+    elif kind == "outputs":
+        root = current_output_dir()
+    else:
+        raise HTTPException(status_code=404, detail="media not found")
+    resolved_root = root.resolve()
+    target = (root / relative_path).resolve()
+    if target != resolved_root and resolved_root not in target.parents:
+        raise HTTPException(status_code=404, detail="media not found")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="media not found")
+    return target
+
+
+@app.get("/media/{kind}/{relative_path:path}")
+def serve_media(kind: str, relative_path: str):
+    return FileResponse(resolve_tenant_media_file(kind, relative_path))
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def serve_favicon_svg():
+    icon_path = FRONTEND_DIST / "favicon.svg"
+    if icon_path.exists():
+        return FileResponse(icon_path, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail="favicon not found")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def serve_favicon_ico():
+    icon_path = FRONTEND_DIST / "favicon.ico"
+    if icon_path.exists():
+        return FileResponse(icon_path, media_type="image/x-icon")
+    return serve_favicon_svg()
 
 
 if FRONTEND_DIST.exists():

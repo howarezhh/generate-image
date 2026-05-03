@@ -39,8 +39,8 @@ button {
 }
 
 .topbar {
-  height: 74px;
-  padding: 14px 22px;
+  height: 62px;
+  padding: 10px 18px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -56,6 +56,13 @@ button {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.topbarActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .brand > div:last-child {
@@ -78,12 +85,33 @@ button {
 
 .brandLogo {
   display: block;
-  width: min(320px, 62vw);
+  width: min(108px, 30vw);
   max-width: 100%;
-  padding: 8px 12px;
-  border-radius: 12px;
+  padding: 4px 6px;
+  border-radius: 10px;
   background: rgba(255, 251, 243, 0.98);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.16);
+}
+
+.topbarLogoutButton {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid rgba(245, 243, 234, 0.16);
+  border-radius: 999px;
+  background: rgba(245, 243, 234, 0.08);
+  color: rgba(245, 243, 234, 0.86);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+
+.topbarLogoutButton:hover {
+  background: rgba(214, 76, 57, 0.16);
+  border-color: rgba(214, 76, 57, 0.4);
+  color: #ffd7cf;
 }
 
 .brand span {
@@ -106,7 +134,7 @@ p {
 
 .brand span {
   color: rgba(245, 243, 234, 0.64);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .sendButton,
@@ -207,7 +235,9 @@ p {
   gap: 3px;
 }
 
-.settingsGroupHead strong {
+.settingsGroupHead strong,
+.settingsGroupLabel,
+.settingsGroupHead .hoverHelpText {
   font-size: 14px;
   font-weight: 700;
 }
@@ -380,17 +410,56 @@ p {
   margin-bottom: 12px;
 }
 
-.field span {
+.field > .fieldLabel,
+.field > .hoverHelp {
   display: block;
   color: rgba(245, 243, 234, 0.62);
   font-size: 12px;
   margin-bottom: 6px;
 }
 
-.fieldLabel[title] {
+.hoverHelp {
+  position: relative;
+  display: inline-flex;
+  max-width: 100%;
   cursor: help;
+  outline: none;
+}
+
+.hoverHelpText {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
   text-decoration: underline dotted rgba(245, 243, 234, 0.35);
   text-underline-offset: 3px;
+}
+
+.hoverHelpBubble {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 36;
+  width: min(320px, calc(100vw - 48px));
+  border: 1px solid rgba(238, 203, 112, 0.32);
+  border-radius: 10px;
+  background: #11130f;
+  color: #f5f3ea;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.45);
+  padding: 10px 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-4px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.hoverHelp:hover .hoverHelpBubble,
+.hoverHelp:focus-visible .hoverHelpBubble,
+.hoverHelp:focus-within .hoverHelpBubble {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .field input,
@@ -924,6 +993,30 @@ textarea {
   border-radius: 8px;
 }
 
+.imageMeta {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.imageMeta strong {
+  display: inline-block;
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(17, 19, 15, 0.72);
+  color: #f5f3ea;
+  font-size: 12px;
+  line-height: 1.35;
+  backdrop-filter: blur(10px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .imageActions {
   position: absolute;
   right: 8px;
@@ -1190,6 +1283,22 @@ textarea {
 
 .referenceChoice {
   flex: 0 0 104px;
+}
+
+.referenceChoiceMeta {
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.referenceChoiceMeta strong {
+  display: block;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: rgba(245, 243, 234, 0.84);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .referenceStrip button {
@@ -2205,6 +2314,10 @@ textarea {
     gap: 10px;
   }
 
+  .topbarActions {
+    align-self: center;
+  }
+
   .brand > div:last-child {
     min-width: 0;
   }
@@ -2611,6 +2724,12 @@ textarea {
 @media (max-width: 560px) {
   .topbar {
     padding: 10px;
+  }
+
+  .topbarLogoutButton {
+    min-height: 34px;
+    padding: 0 10px;
+    font-size: 13px;
   }
 
   .brandMark,

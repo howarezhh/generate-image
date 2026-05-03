@@ -12,7 +12,7 @@ import httpx
 from fastapi import HTTPException, UploadFile
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
-from .config import DEFAULT_API_BASE_URL, DEFAULT_API_KEY, OUTPUT_DIR, UPLOAD_DIR
+from .config import DEFAULT_API_BASE_URL, DEFAULT_API_KEY, current_output_dir, current_upload_dir
 
 
 def normalize_base_url(base_url: str | None) -> str:
@@ -645,7 +645,9 @@ async def save_upload(upload: UploadFile) -> tuple[Path, str]:
     suffix = Path(upload.filename or "upload.bin").suffix
     if not suffix:
         suffix = mimetypes.guess_extension(upload.content_type or "") or ".bin"
-    target = UPLOAD_DIR / f"{unique_name()}{suffix}"
+    upload_root = current_upload_dir()
+    upload_root.mkdir(parents=True, exist_ok=True)
+    target = upload_root / f"{unique_name()}{suffix}"
     content = await upload.read()
     target.write_bytes(content)
     return target, upload.content_type or guess_mime(target)
@@ -690,11 +692,12 @@ def decode_and_save_image(
         "png": "image/png",
     }.get(fmt, "image/png")
     suffix = extension_for_mime(mime_type)
-    base = OUTPUT_DIR / folder if folder else OUTPUT_DIR
+    output_root = current_output_dir()
+    base = output_root / folder if folder else output_root
     base.mkdir(parents=True, exist_ok=True)
     target = base / f"{unique_name()}{suffix}"
     target.write_bytes(raw)
-    public_url = "/media/outputs/" + target.relative_to(OUTPUT_DIR).as_posix()
+    public_url = "/media/outputs/" + target.relative_to(output_root).as_posix()
     return target, public_url, mime_type
 
 

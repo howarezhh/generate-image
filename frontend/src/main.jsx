@@ -21,6 +21,7 @@ import {
   Images,
   KeyRound,
   Loader2,
+  LogOut,
   MessageCircle,
   Plus,
   RefreshCw,
@@ -36,7 +37,8 @@ import "./styles.css";
 import projectLogo from "./assets/project-logo.svg";
 
 const API = "";
-const APP_SETTINGS_VERSION = 5;
+const ACCESS_LOGIN_PATH = "/auth/login";
+const APP_SETTINGS_VERSION = 6;
 
 const defaultConfig = {
   base_url: "https://api.asxs.top/v1",
@@ -136,10 +138,42 @@ const defaults = {
   partial_images: 0,
   context_limit: 10,
   shot_limit: 20,
+  image_title: "",
+};
+
+const SETTING_HELP = {
+  groupProviders: "作用：管理规划提供商、最终生图提供商池，以及每条上游线路的接口信息。\n建议：把文本理解更稳的线路分给规划，把可并发、限流更宽松的 GPT 生图线路加入生图池。",
+  groupModels: "作用：决定当前模式使用哪一套规划模型和生图模型。\n建议：先保证规划模型能稳定理解中文需求，再根据出图质量和速度选择最终生图模型。",
+  groupImage: "作用：控制生成图片的基础规格，包括比例、清晰度、背景和导出格式。\n建议：先固定比例和分辨率，再微调背景与格式，避免频繁同时改动太多变量。",
+  groupAdvanced: "作用：控制任务执行策略、上下文长度、审核和局部编辑等高级行为。\n建议：只有在默认结果不理想时再调整；每次只改 1-2 项，便于判断哪项真正生效。",
+  plannerChatProvider: "作用：指定对话模式里负责理解用户、判断是否需要生图并撰写单张提示词的提供商线路。\n建议：优先选文本理解稳定、回复速度快的线路；它不直接负责最终生图。",
+  plannerStoryboardProvider: "作用：指定分镜模式里负责规划人物/场景概述、镜头列表和逐镜头提示词的提供商线路。\n建议：优先选长文本组织能力更稳的线路，确保长分镜时镜头规划不漂移。",
+  providerName: "作用：给当前提供商起一个便于识别的名称，用于前端列表、任务记录和运行状态展示。\n建议：写清来源或用途，例如“OpenAI 主线”“备用线路 A”。",
+  providerBaseUrl: "作用：填写该提供商兼容 OpenAI 接口的根地址。\n建议：通常以 /v1 结尾，保存前确认地址能正常访问对应的 Responses 接口。",
+  providerApiKey: "作用：填写该提供商对应的 API 密钥，后端会用它发起规划或生图请求。\n建议：使用有效且有额度的密钥；更换线路后记得重新保存。",
+  plannerModel: "作用：填写对话/分镜规划阶段使用的文本模型名称，不是最终生图模型。\n建议：优先选择中文理解强、指令跟随稳定的模型，例如 qwen-plus、deepseek-chat、gpt-5.4。",
+  plannerEndpoint: "作用：指定规划模型走 Responses 还是 Chat Completions。\n建议：默认保持 Responses；只有上游明确不支持时，才切到 Chat Completions。",
+  responsesModel: "作用：指定最终发起 Responses 请求的外层模型。\n建议：通常保持项目默认值；若某条上游对特定模型兼容更好，再按提供商文档调整。",
+  imageToolModel: "作用：指定 image_generation 实际使用的图片工具模型。\n建议：优先选择当前提供商最稳定的 GPT 图片模型，并与外层 Responses 模型保持兼容。",
+  size: "作用：控制输出图片的画面比例和尺寸预设。\n建议：先按用途选比例：壁纸优先横向，高竖图适合人物海报，稳定出图可选 3:2。",
+  quality: "作用：控制输出清晰度与细节预算。\n建议：需要更稳定、更快时用 medium；追求细节时再切 high。",
+  background: "作用：控制背景处理方式，例如自动、透明或纯色倾向。\n建议：常规场景保持 auto；只有确实需要抠图或透明素材时再改。",
+  format: "作用：控制输出图片文件格式。\n建议：通用预览优先 PNG；对体积更敏感时可结合 JPG/WebP 使用。",
+  imageCount: "作用：设置一次任务要返回的图片张数。\n建议：先用 1-2 张快速试方向，确认满意后再增加数量，减少不必要的并发消耗。",
+  action: "作用：控制对话模式最终按生成新图还是编辑参考图执行。\n建议：已有明确参考图时选编辑；纯文本创作或不确定时保持自动。",
+  inputFidelity: "作用：控制编辑时对输入参考图的保留强度。\n建议：想更像原图就选更高保真；想允许构图和细节变化更大，就选更灵活的档位。",
+  partialImages: "作用：控制是否允许局部编辑/局部重绘相关能力参与执行。\n建议：整体改图保持 0；只有明确需要局部调整时再提高。",
+  contextLimit: "作用：限制 planner 回看当前会话历史消息的条数。\n建议：短任务保持较小值以减少污染；长对话或长分镜再适当增加。",
+  outputCompression: "作用：控制输出图片压缩强度，数值越高通常体积越小。\n建议：留空即可使用默认行为；需要压缩体积时，再从中等数值开始试。",
+  moderation: "作用：控制上游审核策略。\n建议：默认保持 auto；只有明确知道上游允许的策略时再手动修改。",
+  shotLimit: "作用：控制单次分镜任务最多生成多少张镜头图。\n建议：先按视频段落估算数量；长任务建议分批生成，减少中途返工成本。",
+  imageTitle: "作用：为本次生成或编辑的结果指定图片名称。\n建议：需要归档或下载时填写明确中文名；不填则系统按时间和会话标题自动命名。",
+  historyTitle: "作用：修改当前历史会话的标题，便于后续在历史和图库中检索。\n建议：写成能概括主题或人物的短标题，避免只写“测试”“1”。",
+  historyContextLimit: "作用：修改当前会话后续继续对话时允许带入的上下文条数。\n建议：越大越完整，但也更容易把旧内容带回；只在确实需要更长上下文时提高。",
 };
 
 function persistableForm(form) {
-  const { prompt, ...settings } = form;
+  const { prompt, image_title, ...settings } = form;
   return settings;
 }
 
@@ -201,6 +235,20 @@ function taskProviderName(task) {
     task?.response?.image_provider?.name ||
     ""
   );
+}
+
+function providerAvailabilityLabel(provider) {
+  if (!provider) return "未知";
+  const available = provider.pool_available ?? provider.available;
+  if (available === false) {
+    const seconds = Number((provider.pool_unavailable_seconds ?? provider.unavailable_seconds) || 0);
+    return seconds > 0 ? `暂不可用，约 ${seconds} 秒后再试` : "暂不可用";
+  }
+  const runningTasks = Number((provider.pool_running_tasks ?? provider.running_tasks) || 0);
+  const assignedTasks = Number((provider.pool_assigned_tasks ?? provider.assigned_tasks) || 0);
+  if (runningTasks >= 3) return "通道已满，等待空闲";
+  if (assignedTasks > 0) return "可用，正在处理任务";
+  return "可用，当前空闲";
 }
 
 function isConversationalMode(mode) {
@@ -275,6 +323,8 @@ function App() {
       total_providers: 0,
       used_providers: 0,
       idle_providers: 0,
+      available_providers: 0,
+      unavailable_providers: 0,
       limit_per_provider: 3,
       total_capacity: 3,
       providers: [],
@@ -381,10 +431,17 @@ function App() {
   const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
   const activeConversationMode = resolveConversationMode(conversation);
   const activePlannerProvider = ["chat", "storyboard"].includes(form.mode) ? providerForPlannerMode(form.mode) : null;
-  const imageProviderPoolMeta = taskMeta.image_provider_pool || { total_providers: 0, used_providers: 0, idle_providers: 0, limit_per_provider: 3, total_capacity: 3, providers: [] };
+  const imageProviderPoolMeta = taskMeta.image_provider_pool || { total_providers: 0, used_providers: 0, idle_providers: 0, available_providers: 0, unavailable_providers: 0, limit_per_provider: 3, total_capacity: 3, providers: [] };
   const chatGeneratedImages = useMemo(() => uniqueImages(
     messages.flatMap((msg) => msg.images || [])
   ), [messages]);
+  const editCandidateImages = useMemo(() => uniqueImages(
+    messages.flatMap((msg) => [...(msg.images || []), ...(msg.uploaded_images || [])]).filter((image) => image?.source !== "mask")
+  ), [messages]);
+  const selectedEditCandidateKeys = useMemo(
+    () => new Set(editImages.map((file) => String(file.sourceImageKey || "")).filter(Boolean)),
+    [editImages],
+  );
   const liveConversationTasks = useMemo(() => {
     if (!conversation) return [];
     return tasks.filter((task) => Number(task.conversation_id) === Number(conversation.id) && ["queued", "running"].includes(task.status));
@@ -583,7 +640,7 @@ function App() {
       } else {
         await runChat();
       }
-      setForm((value) => ({ ...value, prompt: "" }));
+      setForm((value) => ({ ...value, prompt: "", image_title: "" }));
     } catch (err) {
       setError(describeError(err));
     } finally {
@@ -640,6 +697,7 @@ function App() {
     const runConfig = configForMode("generate");
     const body = {
       prompt: form.prompt,
+      image_title: form.image_title.trim(),
       conversation_id: active.id,
       model: form.model,
       image_model: form.imageModel,
@@ -698,6 +756,7 @@ function App() {
     const runConfig = configForMode("edit");
     const params = {
       prompt: form.prompt,
+      image_title: form.image_title.trim(),
       conversation_id: active.id,
       model: form.model,
       image_model: form.imageModel,
@@ -848,6 +907,9 @@ function App() {
         const savedForm = { ...value.form };
         if (!value.settings_version && savedForm.size === "1536x1024") {
           savedForm.size = defaults.size;
+        }
+        if (Number(value.settings_version || 0) < 6 && Number(savedForm.shot_limit || 0) === 6) {
+          savedForm.shot_limit = defaults.shot_limit;
         }
         setForm({ ...normalizeFormSettings({ ...defaults, ...savedForm }), prompt: "" });
       }
@@ -1186,6 +1248,19 @@ function App() {
       setSettingsFeedback(section, "success", successMessage);
     } catch {
       setSettingsFeedback(section, "failed", "保存失败");
+    }
+  }
+
+  async function logout() {
+    try {
+      await fetch(`${API}/auth/logout`, {
+        method: "POST",
+        credentials: "same-origin",
+      });
+    } catch {
+      // Even if the network request fails, still let the user return to the login page.
+    } finally {
+      window.location.assign(ACCESS_LOGIN_PATH);
     }
   }
 
@@ -1552,18 +1627,40 @@ function App() {
   async function historyImageToFile(image) {
     const response = await fetch(image.public_url || image.url);
     const blob = await response.blob();
-    const filename = image.file_path?.split(/[\\/]/).pop() || image.filename || "history-image.png";
+    const filename = imageDownloadName(image);
     return new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
   }
 
+  async function toggleEditReferenceImage(image) {
+    const key = imageReferenceKey(image);
+    if (!key) return;
+    if (selectedEditCandidateKeys.has(key)) {
+      setEditImages((items) => items.filter((file) => String(file.sourceImageKey || "") !== key));
+      return;
+    }
+    try {
+      const file = await historyImageToFile(image);
+      file.sourceImageKey = key;
+      file.sourceImageLabel = imageSourceLabel(image);
+      setEditImages((items) => [...items, file]);
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
   async function useImageAsReference(image) {
-    const targetMode = image.task_mode === "storyboard" ? "storyboard" : "chat";
+    const taskMode = String(image?.task_mode || "").trim().toLowerCase();
+    const targetMode = taskMode === "storyboard"
+      ? "storyboard"
+      : taskMode === "chat"
+        ? "chat"
+        : "edit";
     let useConversationReference = false;
     if (image.conversation_id) {
       await loadConversation(image.conversation_id, { openStudio: true });
       if (resolveConversationMode(conversationRef.current) !== targetMode) {
         await newChat(targetMode);
-      } else if (image.id && image.source === "api") {
+      } else if (targetMode !== "edit" && image.id && image.source === "api") {
         useConversationReference = true;
       }
     } else {
@@ -1576,15 +1673,33 @@ function App() {
       setChatReferenceRoles({ [String(normalized.id)]: "character" });
       setChatImages([]);
       setChatUploadRoles({});
+      setEditImages([]);
+      setEditMask(null);
     } else {
       const file = await historyImageToFile(image);
-      setChatImages([file]);
-      setChatUploadRoles({ [uploadFileRoleKey(file, 0)]: "character" });
-      setChatReferenceImages([]);
-      setChatReferenceRoles({});
+      if (targetMode === "edit") {
+        setEditImages([file]);
+        setEditMask(null);
+        setChatImages([]);
+        setChatUploadRoles({});
+        setChatReferenceImages([]);
+        setChatReferenceRoles({});
+      } else {
+        setChatImages([file]);
+        setChatUploadRoles({ [uploadFileRoleKey(file, 0)]: "character" });
+        setChatReferenceImages([]);
+        setChatReferenceRoles({});
+        setEditImages([]);
+        setEditMask(null);
+      }
     }
     setActiveView("studio");
-    setForm((value) => ({ ...value, prompt: "", mode: targetMode, action: targetMode === "chat" ? "edit" : value.action }));
+    setForm((value) => ({
+      ...value,
+      prompt: "",
+      mode: targetMode,
+      action: targetMode === "chat" ? "edit" : value.action,
+    }));
   }
 
   async function downloadImage(image) {
@@ -1593,7 +1708,7 @@ function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = image.filename || image.file_path?.split(/[\\/]/).pop() || "generated-image.png";
+    link.download = imageDownloadName(image);
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1619,8 +1734,13 @@ function App() {
         <div className="brand">
           <div>
             <img className="brandLogo" src={projectLogo} alt="GPT Image Studio" />
-            <span>个人生图工作台</span>
           </div>
+        </div>
+        <div className="topbarActions">
+          <button type="button" className="topbarLogoutButton" onClick={logout} aria-label="退出当前账号并返回登录页">
+            <LogOut size={16} />
+            退出
+          </button>
         </div>
       </header>
 
@@ -1650,7 +1770,8 @@ function App() {
 
           <SettingsGroup
             title="提供商管理"
-            summary={`生图池 ${imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length} 个 / 已用 ${imageProviderPoolMeta.used_providers || 0} / 空闲 ${imageProviderPoolMeta.idle_providers || 0}${activePlannerProvider ? ` / 当前规划：${activePlannerProvider.name}` : ""}`}
+            help={SETTING_HELP.groupProviders}
+            summary={`生图池 ${imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length} 个 / 已用 ${imageProviderPoolMeta.used_providers || 0} / 空闲 ${imageProviderPoolMeta.idle_providers || 0} / 不可用 ${imageProviderPoolMeta.unavailable_providers || 0}${activePlannerProvider ? ` / 当前规划：${activePlannerProvider.name}` : ""}`}
             open={!!openGroups.providers}
             onToggle={() => toggleGroup("providers")}
           >
@@ -1658,7 +1779,7 @@ function App() {
               <Select
                 className="fieldCompact"
                 label="对话规划"
-                help="负责理解对话、判断是否生图、撰写单张图片提示词的模型线路。"
+                help={SETTING_HELP.plannerChatProvider}
                 value={plannerProviders.chat}
                 onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
                 options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
@@ -1666,7 +1787,7 @@ function App() {
               <Select
                 className="fieldCompact"
                 label="分镜规划"
-                help="负责规划人物场景概述、镜头列表和每张首帧提示词的模型线路。"
+                help={SETTING_HELP.plannerStoryboardProvider}
                 value={plannerProviders.storyboard}
                 onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
                 options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
@@ -1675,19 +1796,21 @@ function App() {
             <div className="providerPoolStats">
               <span>池中总数 {imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length}</span>
               <span>已使用 {imageProviderPoolMeta.used_providers || 0}</span>
+              <span>可用 {imageProviderPoolMeta.available_providers || 0}</span>
               <span>空闲 {imageProviderPoolMeta.idle_providers || 0}</span>
+              <span>不可用 {imageProviderPoolMeta.unavailable_providers || 0}</span>
               <span>单提供商上限 {imageProviderPoolMeta.limit_per_provider || 3}</span>
             </div>
 
             <div className="providerEditor">
               <div className="providerEditorGrid">
-              <Field className="fieldCompact" label="提供商名称">
+              <Field className="fieldCompact" label="提供商名称" help={SETTING_HELP.providerName}>
                 <input value={providerDraft.name} onChange={(e) => setProviderDraft({ ...providerDraft, name: e.target.value })} placeholder="例如 asxs / OpenAI / 备用线路" />
               </Field>
-              <Field className="fieldCompact" label="接口地址">
+              <Field className="fieldCompact" label="接口地址" help={SETTING_HELP.providerBaseUrl}>
                 <input value={providerDraft.base_url} onChange={(e) => setProviderDraft({ ...providerDraft, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
               </Field>
-              <Field className="fieldFull" label="密钥">
+              <Field className="fieldFull" label="密钥" help={SETTING_HELP.providerApiKey}>
                 <input type="password" value={providerDraft.api_key} onChange={(e) => setProviderDraft({ ...providerDraft, api_key: e.target.value })} placeholder="sk-..." />
               </Field>
               </div>
@@ -1720,6 +1843,7 @@ function App() {
                     <strong>{provider.name}</strong>
                     <small>{provider.base_url}</small>
                     <small>当前任务 {provider.pool_assigned_tasks || 0} / 运行中 {provider.pool_running_tasks || 0} / 空闲槽位 {provider.pool_idle_slots ?? (imageProviderPoolMeta.limit_per_provider || 3)}</small>
+                    <small>{providerAvailabilityLabel(provider)}</small>
                   </div>
                   <div>
                     <button type="button" onClick={() => editProvider(provider)} title="编辑"><Edit3 size={15} /></button>
@@ -1737,29 +1861,30 @@ function App() {
 
           <SettingsGroup
             title="模型设置"
+            help={SETTING_HELP.groupModels}
             summary={["chat", "storyboard"].includes(form.mode) ? `规划 ${form.chatModel} · ${optionLabel(plannerEndpointOptions, form.plannerEndpoint)} / 生图 ${form.model} + ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
             open={!!openGroups.models}
             onToggle={() => toggleGroup("models")}
           >
             {["chat", "storyboard"].includes(form.mode) ? (
               <>
-                <Field label="规划模型">
+                <Field label="规划模型" help={SETTING_HELP.plannerModel}>
                   <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} placeholder="例如 qwen-plus / deepseek-chat / gpt-5.4" />
                 </Field>
                 <Select
                   label="规划接口格式"
-                  help="默认用 Responses；只有规划模型不支持 Responses 时，才显式切到 Chat Completions。生图执行始终走 Responses。"
+                  help={SETTING_HELP.plannerEndpoint}
                   value={form.plannerEndpoint}
                   onChange={(v) => setForm({ ...form, plannerEndpoint: v })}
                   options={plannerEndpointOptions}
                 />
-                <Select label="生图 Responses 模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
-                <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
+                <Select label="生图 Responses 模型" help={SETTING_HELP.responsesModel} value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
+                <Select label="图片工具模型" help={SETTING_HELP.imageToolModel} value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
             ) : (
               <>
-                <Select label="Responses 模型" value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
-                <Select label="图片工具模型" value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
+                <Select label="Responses 模型" help={SETTING_HELP.responsesModel} value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
+                <Select label="图片工具模型" help={SETTING_HELP.imageToolModel} value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
               </>
             )}
             <SettingsSaveAction
@@ -1771,16 +1896,17 @@ function App() {
 
           <SettingsGroup
             title="图片参数"
+            help={SETTING_HELP.groupImage}
             summary={`${optionLabel(sizeOptions, form.size)} / ${optionLabel(qualityOptions, form.quality)} / ${optionLabel(formatOptions, form.output_format)}`}
             open={!!openGroups.image}
             onToggle={() => toggleGroup("image")}
           >
-            <Select label="画面比例" value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={sizeOptions} />
-            <Select label="分辨率" value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={qualityOptions} />
-            <Select label="背景" value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={backgroundOptions} />
-            <Select label="格式" value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={formatOptions} />
+            <Select label="画面比例" help={SETTING_HELP.size} value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={sizeOptions} />
+            <Select label="分辨率" help={SETTING_HELP.quality} value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={qualityOptions} />
+            <Select label="背景" help={SETTING_HELP.background} value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={backgroundOptions} />
+            <Select label="格式" help={SETTING_HELP.format} value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={formatOptions} />
             {!["chat", "storyboard"].includes(form.mode) && (
-              <Field label="数量">
+              <Field label="数量" help={SETTING_HELP.imageCount}>
                 <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
               </Field>
             )}
@@ -1793,53 +1919,60 @@ function App() {
 
           <SettingsGroup
             title="高级选项"
+            help={SETTING_HELP.groupAdvanced}
             summary={["chat", "storyboard"].includes(form.mode) ? `${form.mode === "storyboard" ? `${form.shot_limit} 镜头 / ` : `${optionLabel(actionOptions, form.action)} / `}${optionLabel(fidelityOptions, form.input_fidelity)}` : optionLabel(moderationOptions, form.moderation)}
             open={!!openGroups.advanced}
             onToggle={() => toggleGroup("advanced")}
           >
             {form.mode === "chat" ? (
               <>
-                <Select label="动作" value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={actionOptions} />
-                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
-                <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-                <Field label="上下文条数">
+                <Select label="动作" help={SETTING_HELP.action} value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={actionOptions} />
+                <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
+                <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+                <Field label="上下文条数" help={SETTING_HELP.contextLimit}>
                   <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
                 </Field>
-                <Field label="压缩 0-100">
+                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
                 </Field>
-                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             ) : form.mode === "storyboard" ? (
               <>
-                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
-                <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-                <Field label="上下文条数">
+                <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
+                <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+                <Field label="上下文条数" help={SETTING_HELP.contextLimit}>
                   <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
                 </Field>
-                <Field label="最多镜头">
+                <Field label="最多镜头" help={SETTING_HELP.shotLimit}>
                   <input type="number" min="1" max="100" value={form.shot_limit} onChange={(e) => setForm({ ...form, shot_limit: e.target.value })} />
                 </Field>
-                <Field label="压缩 0-100">
+                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
                 </Field>
-                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             ) : form.mode === "edit" ? (
               <>
-                <Select label="输入保真" value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
-                <Select label="局部图" value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-                <Field label="压缩 0-100">
+                <Field label="图片名称" help={SETTING_HELP.imageTitle}>
+                  <input value={form.image_title} onChange={(e) => setForm({ ...form, image_title: e.target.value })} placeholder="可选，不填则自动按时间和会话标题命名" />
+                </Field>
+                <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
+                <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
+                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
                 </Field>
-                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             ) : (
               <>
-                <Field label="压缩 0-100">
+                <Field label="图片名称" help={SETTING_HELP.imageTitle}>
+                  <input value={form.image_title} onChange={(e) => setForm({ ...form, image_title: e.target.value })} placeholder="可选，不填则自动按时间和会话标题命名" />
+                </Field>
+                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
                   <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
                 </Field>
-                <Select label="审核" value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
               </>
             )}
             <SettingsSaveAction
@@ -1989,9 +2122,16 @@ function App() {
               <UploadRow
                 label="编辑图片"
                 files={editImages}
-                onChange={setEditImages}
+                onChange={(files) => setEditImages((items) => mergeSelectedFiles(items, files))}
                 onRemove={(index) => setEditImages((items) => items.filter((_, i) => i !== index))}
                 multiple
+              />
+            )}
+            {form.mode === "edit" && (
+              <EditReferencePicker
+                images={editCandidateImages}
+                selectedKeys={selectedEditCandidateKeys}
+                onToggle={toggleEditReferenceImage}
               />
             )}
             {form.mode === "edit" && (
@@ -2059,12 +2199,12 @@ function App() {
   );
 }
 
-function SettingsGroup({ title, summary, open, onToggle, children }) {
+function SettingsGroup({ title, summary, help = "", open, onToggle, children }) {
   return (
     <section className={`settingsGroup ${open ? "open" : ""}`}>
       <button type="button" className="settingsGroupHead" onClick={onToggle}>
         <span>
-          <strong>{title}</strong>
+          <HoverHelpLabel className="settingsGroupLabel" label={title} help={help} />
           <small>{summary}</small>
         </span>
         <ChevronDown size={18} />
@@ -2225,10 +2365,10 @@ function HistoryPane({
         ) : (
           <>
             <div className="historyMeta">
-              <Field label="对话标题">
+              <Field label="对话标题" help={SETTING_HELP.historyTitle}>
                 <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} />
               </Field>
-              <Field label="上下文条数">
+              <Field label="上下文条数" help={SETTING_HELP.historyContextLimit}>
                 <input type="number" min="0" max="50" value={draftLimit} onChange={(e) => setDraftLimit(e.target.value)} />
               </Field>
               <button className="secondaryButton" type="button" onClick={() => onSaveMeta({ title: draftTitle, context_limit: Number(draftLimit) })}>
@@ -2859,6 +2999,46 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
   );
 }
 
+function EditReferencePicker({ images, selectedKeys, onToggle }) {
+  return (
+    <section className="referencePicker">
+      <div className="referencePickerHead">
+        <strong>同会话候选图</strong>
+        <small>可直接把同一会话中的用户图和生成图加入本轮编辑输入</small>
+      </div>
+      {images.length > 0 ? (
+        <div className="referenceStrip">
+          {images.map((image, index) => {
+            const key = imageReferenceKey(image);
+            const isSelected = !!key && selectedKeys.has(key);
+            return (
+              <div className={`referenceChoice ${isSelected ? "active" : ""}`} key={key || image.id || image.url || index}>
+                <button
+                  type="button"
+                  className={isSelected ? "active" : ""}
+                  onClick={() => onToggle(image)}
+                  title={isSelected ? "移除这张编辑输入图" : "加入本轮编辑输入图"}
+                >
+                  <img src={image.public_url || image.url} alt="" />
+                  <span>{isSelected ? "已加入" : "加入编辑"}</span>
+                  <em>{imageSourceLabel(image)}</em>
+                </button>
+                <div className="referenceChoiceMeta">
+                  <strong title={imageDisplayTitle(image) || image.filename || `候选图 ${index + 1}`}>
+                    {imageDisplayTitle(image) || image.filename || `候选图 ${index + 1}`}
+                  </strong>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <small className="uploadEmpty">当前会话还没有可复用的用户图或生成图，先上传一张或完成一次编辑后，这里就会出现候选图。</small>
+      )}
+    </section>
+  );
+}
+
 function Message({ msg, onDownload, onPreview, previewImages = [] }) {
   const storyboard = resolveStoryboardState(msg?.meta);
   return (
@@ -2945,14 +3125,16 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
     });
   }
 
-  const title = image.title || image.filename || `图片 ${state.index + 1}`;
+  const title = imageDisplayTitle(image);
+  const renderTitle = title || "";
+  const altTitle = title || image.filename || `图片 ${state.index + 1}`;
 
   return (
     <div className="previewOverlay" role="dialog" aria-modal="true" onMouseMove={moveDrag} onMouseUp={() => setDrag(null)} onMouseLeave={() => setDrag(null)}>
       <div className="previewPanel">
         <div className="previewHeader">
           <div>
-            <strong title={title}>{title}</strong>
+            <strong title={renderTitle || undefined}>{renderTitle}</strong>
             <small>{state.index + 1}/{state.items.length} · 滚轮缩放，拖拽移动，方向键切换</small>
           </div>
           <div className="previewHeaderActions">
@@ -2971,7 +3153,7 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
           )}
           <img
             src={url}
-            alt={title}
+            alt={altTitle}
             draggable={false}
             onMouseDown={startDrag}
             style={{
@@ -3026,10 +3208,16 @@ function Gallery({ items, loading, onDownload }) {
 function ImageCard({ image, onDownload, onUseImage, onPreview }) {
   const [showPrompt, setShowPrompt] = useState(false);
   const url = image.public_url || image.url;
+  const displayTitle = imageDisplayTitle(image);
   const promptText = image.prompt_text || image.task_prompt || image.message_content || "";
   return (
     <div className="imageCard">
       <img src={url} alt="generated" />
+      {displayTitle ? (
+        <div className="imageMeta">
+          <strong title={displayTitle}>{displayTitle}</strong>
+        </div>
+      ) : null}
       <div className="imageActions">
         <button type="button" onClick={onPreview || (() => window.open(url, "_blank", "noreferrer"))}>
           <ExternalLink size={14} />
@@ -3137,10 +3325,20 @@ function SettingsSaveAction({ feedback, label, onClick }) {
   );
 }
 
+function HoverHelpLabel({ label, help = "", className = "" }) {
+  if (!help) return <span className={className}>{label}</span>;
+  return (
+    <span className={`hoverHelp ${className}`.trim()}>
+      <span className="hoverHelpText">{label}</span>
+      <span className="hoverHelpBubble" role="tooltip">{help}</span>
+    </span>
+  );
+}
+
 function Field({ label, children, help = "", className = "" }) {
   return (
     <label className={`field ${className}`.trim()}>
-      <span className="fieldLabel" title={help || undefined}>{label}</span>
+      <HoverHelpLabel className="fieldLabel" label={label} help={help} />
       {children}
     </label>
   );
@@ -3327,6 +3525,42 @@ async function copyTextToClipboard(text) {
   return true;
 }
 
+function imageDisplayTitle(image) {
+  return String(image?.title || "").trim();
+}
+
+function imageReferenceKey(image) {
+  return String(image?.file_path || image?.public_url || image?.url || image?.id || "").trim();
+}
+
+function imageSourceLabel(image) {
+  const rawSource = String(image?.source || "").trim().toLowerCase();
+  const source = rawSource === "input_reference"
+    ? String(image?.origin_source || rawSource).trim().toLowerCase()
+    : rawSource;
+  if (source === "api") return "生成图";
+  if (source === "input" || source === "input_reference") return "用户图";
+  if (source === "mask") return "蒙版";
+  return "图片";
+}
+
+function imageFileExtension(image) {
+  const filename = String(image?.filename || image?.file_path?.split(/[\\/]/).pop() || "").trim();
+  const match = filename.match(/(\.[A-Za-z0-9]{2,6})$/);
+  if (match) return match[1];
+  const mime = String(image?.mime_type || "").toLowerCase();
+  if (mime.includes("png")) return ".png";
+  if (mime.includes("jpeg") || mime.includes("jpg")) return ".jpg";
+  if (mime.includes("webp")) return ".webp";
+  return ".png";
+}
+
+function imageDownloadName(image) {
+  const title = imageDisplayTitle(image);
+  if (title) return `${title}${imageFileExtension(image)}`;
+  return image?.filename || image?.file_path?.split(/[\\/]/).pop() || `generated-image${imageFileExtension(image)}`;
+}
+
 function normalizeTaskImages(task) {
   return (task?.images || []).map((image) => ({
     ...image,
@@ -3348,12 +3582,26 @@ function uniqueImages(images) {
   const seen = new Set();
   const result = [];
   for (const image of images || []) {
-    const id = image.id || image.url;
+    const id = imageReferenceKey(image);
     if (!id || seen.has(id)) continue;
     seen.add(id);
     result.push(normalizeImageForClient(image));
   }
   return result;
+}
+
+function mergeSelectedFiles(existingFiles, nextFiles) {
+  const merged = [...(existingFiles || [])];
+  const seen = new Set(
+    merged.map((file) => `${file.sourceImageKey || ""}|${file.name}|${file.size}|${file.lastModified}`),
+  );
+  for (const file of nextFiles || []) {
+    const key = `${file.sourceImageKey || ""}|${file.name}|${file.size}|${file.lastModified}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(file);
+  }
+  return merged;
 }
 
 function formatTime(value) {
@@ -3376,11 +3624,17 @@ function groupImages(items) {
         key,
         title,
         items: [],
+        item_keys: new Set(),
         latest_time: item.created_at || "",
         mode,
       });
     }
     const group = map.get(key);
+    const itemKey = imageReferenceKey(item);
+    if (itemKey && group.item_keys.has(itemKey)) {
+      continue;
+    }
+    if (itemKey) group.item_keys.add(itemKey);
     group.items.push(item);
     if (!group.mode && mode) group.mode = mode;
     const currentStamp = new Date(item.created_at || 0).getTime();
@@ -3391,10 +3645,11 @@ function groupImages(items) {
   }
   return [...map.values()]
     .map((group) => {
+      const { item_keys, ...rest } = group;
       const sortedItems = [...group.items].sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
       const previewItems = sortedItems.slice(0, 6);
       return {
-        ...group,
+        ...rest,
         items: sortedItems,
         preview_items: previewItems,
         has_more: sortedItems.length > previewItems.length,
