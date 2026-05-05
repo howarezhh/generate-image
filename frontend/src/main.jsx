@@ -112,6 +112,11 @@ const referenceRoleOptions = [
   { value: "style", label: "风格" },
 ];
 
+const referenceSelectionModeOptions = [
+  { value: "edit_target", label: "直接修改" },
+  { value: "reference", label: "辅助参考" },
+];
+
 const modeOptions = [
   { value: "chat", icon: MessageCircle, label: "对话", help: "对话生图：像聊天一样描述、追问和完善想法，AI 会在合适时机生成或编辑图片。" },
   { value: "storyboard", icon: Clapperboard, label: "分镜", help: "分镜连续生图：为视频镜头逐张生成首帧，并用上一镜头画面保持人物、场景和逻辑连续。" },
@@ -273,6 +278,18 @@ function referenceRoleLabel(role) {
   return referenceRoleOptions.find((option) => option.value === role)?.label || "风格";
 }
 
+function defaultReferenceSelectionMode(index) {
+  return "reference";
+}
+
+function defaultEditSelectionMode(index) {
+  return index === 0 ? "edit_target" : "reference";
+}
+
+function referenceSelectionModeLabel(mode) {
+  return referenceSelectionModeOptions.find((option) => option.value === mode)?.label || "辅助参考";
+}
+
 function uploadFileRoleKey(file) {
   return `${file.name}-${file.size}-${file.lastModified}`;
 }
@@ -292,6 +309,10 @@ function App() {
   const [providers, setProviders] = useState([]);
   const [providerDraft, setProviderDraft] = useState({ name: "", base_url: "", api_key: "" });
   const [editingProviderId, setEditingProviderId] = useState(null);
+  const [currentAccessUser, setCurrentAccessUser] = useState(null);
+  const [accessUsers, setAccessUsers] = useState([]);
+  const [accessUserDraft, setAccessUserDraft] = useState({ password: "" });
+  const [editingAccessUser, setEditingAccessUser] = useState(null);
   const [modeProviders, setModeProviders] = useState({ chat: "", storyboard: "", generate: "", edit: "" });
   const [plannerProviders, setPlannerProviders] = useState({ chat: "", storyboard: "" });
   const [imageProviderPool, setImageProviderPool] = useState([]);
@@ -335,11 +356,14 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [studioSubmissions, setStudioSubmissions] = useState({ generate: [], edit: [] });
   const [editImages, setEditImages] = useState([]);
+  const [editImageSelectionModes, setEditImageSelectionModes] = useState({});
   const [editMask, setEditMask] = useState(null);
   const [chatImages, setChatImages] = useState([]);
   const [chatReferenceImages, setChatReferenceImages] = useState([]);
   const [chatUploadRoles, setChatUploadRoles] = useState({});
   const [chatReferenceRoles, setChatReferenceRoles] = useState({});
+  const [chatUploadSelectionModes, setChatUploadSelectionModes] = useState({});
+  const [chatReferenceSelectionModes, setChatReferenceSelectionModes] = useState({});
   const [previewState, setPreviewState] = useState(null);
   const [runningPanelOpen, setRunningPanelOpen] = useState(false);
   const scrollRef = useRef(null);
@@ -366,6 +390,7 @@ function App() {
   }, [activeView, form.mode, conversation, selectedTask, tasks]);
 
   useEffect(() => {
+    refreshCurrentAccessUser();
     initializeSettings();
     refreshProviders();
     return () => {
@@ -557,6 +582,20 @@ function App() {
     return roles[String(image.id)] || defaultReferenceRole(uploadCount + index);
   }
 
+  function uploadSelectionModeFor(file, index, modes = chatUploadSelectionModes) {
+    const key = uploadFileRoleKey(file, index);
+    return modes[key] || defaultReferenceSelectionMode(index);
+  }
+
+  function selectedReferenceSelectionModeFor(image, index, modes = chatReferenceSelectionModes, uploadCount = chatImages.length) {
+    return modes[String(image.id)] || defaultReferenceSelectionMode(uploadCount + index);
+  }
+
+  function editSelectionModeFor(file, index, modes = editImageSelectionModes) {
+    const key = uploadFileRoleKey(file, index);
+    return modes[key] || defaultEditSelectionMode(index);
+  }
+
   function normalizeUploadRoles(files, currentRoles = chatUploadRoles) {
     const next = {};
     files.forEach((file, index) => {
@@ -566,11 +605,61 @@ function App() {
     return next;
   }
 
+  function normalizeUploadSelectionModes(files, currentModes = chatUploadSelectionModes) {
+    const next = {};
+    files.forEach((file, index) => {
+      const key = uploadFileRoleKey(file, index);
+      next[key] = uploadSelectionModeFor(file, index, currentModes);
+    });
+    return next;
+  }
+
+  function normalizeEditSelectionModes(files, currentModes = editImageSelectionModes) {
+    const next = {};
+    files.forEach((file, index) => {
+      const key = uploadFileRoleKey(file, index);
+      next[key] = editSelectionModeFor(file, index, currentModes);
+    });
+    if (files.length && !Object.values(next).includes("edit_target")) {
+      const firstKey = uploadFileRoleKey(files[0], 0);
+      next[firstKey] = "edit_target";
+    }
+    return next;
+  }
+
+  function clearEditInputs() {
+    setEditImages([]);
+    setEditImageSelectionModes({});
+    setEditMask(null);
+  }
+
+  function updateEditUploads(files) {
+    setEditImages((items) => {
+      const next = mergeSelectedFiles(items, files);
+      setEditImageSelectionModes((current) => normalizeEditSelectionModes(next, current));
+      return next;
+    });
+  }
+
+  function removeEditUpload(index) {
+    setEditImages((items) => {
+      const next = items.filter((_, i) => i !== index);
+      setEditImageSelectionModes((current) => normalizeEditSelectionModes(next, current));
+      return next;
+    });
+  }
+
+  function updateEditImageSelectionMode(file, index, mode) {
+    const key = uploadFileRoleKey(file, index);
+    setEditImageSelectionModes((current) => ({ ...current, [key]: mode }));
+  }
+
   function updateChatUploads(files) {
     const room = Math.max(0, 3 - chatReferenceImages.length);
     const trimmed = files.slice(0, room);
     setChatImages(trimmed);
     setChatUploadRoles((current) => normalizeUploadRoles(trimmed, current));
+    setChatUploadSelectionModes((current) => normalizeUploadSelectionModes(trimmed, current));
     if (files.length > room) {
       setError(describeError({ detail: { message: "对话模式最多同时指定 3 张参考图。" } }));
     }
@@ -585,11 +674,25 @@ function App() {
     setChatReferenceRoles((current) => ({ ...current, [String(imageId)]: role }));
   }
 
+  function updateChatUploadSelectionMode(file, index, mode) {
+    const key = uploadFileRoleKey(file, index);
+    setChatUploadSelectionModes((current) => ({ ...current, [key]: mode }));
+  }
+
+  function updateSelectedReferenceSelectionMode(imageId, mode) {
+    setChatReferenceSelectionModes((current) => ({ ...current, [String(imageId)]: mode }));
+  }
+
   function toggleChatReferenceImage(image) {
     setChatReferenceImages((items) => {
       const exists = items.some((item) => Number(item.id) === Number(image.id));
       if (exists) {
         setChatReferenceRoles((current) => {
+          const next = { ...current };
+          delete next[String(image.id)];
+          return next;
+        });
+        setChatReferenceSelectionModes((current) => {
           const next = { ...current };
           delete next[String(image.id)];
           return next;
@@ -604,6 +707,10 @@ function App() {
         ...current,
         [String(image.id)]: current[String(image.id)] || defaultReferenceRole(chatImages.length + items.length),
       }));
+      setChatReferenceSelectionModes((current) => ({
+        ...current,
+        [String(image.id)]: current[String(image.id)] || defaultReferenceSelectionMode(chatImages.length + items.length),
+      }));
       return [...items, image];
     });
   }
@@ -611,6 +718,11 @@ function App() {
   function removeChatReferenceImage(imageId) {
     setChatReferenceImages((items) => items.filter((item) => Number(item.id) !== Number(imageId)));
     setChatReferenceRoles((current) => {
+      const next = { ...current };
+      delete next[String(imageId)];
+      return next;
+    });
+    setChatReferenceSelectionModes((current) => {
       const next = { ...current };
       delete next[String(imageId)];
       return next;
@@ -676,8 +788,7 @@ function App() {
     setStudioSubmissions((current) => ({ ...current, [form.mode]: [] }));
     setForm((value) => ({ ...value, prompt: "" }));
     if (form.mode === "edit") {
-      setEditImages([]);
-      setEditMask(null);
+      clearEditInputs();
     }
     setError(null);
     setActiveView("studio");
@@ -733,6 +844,10 @@ function App() {
     if (!editImages.length) {
       throw new Error("编辑模式至少上传一张图片");
     }
+    const uploadSelectionModes = editImages.map((file, index) => editSelectionModeFor(file, index));
+    if (!uploadSelectionModes.includes("edit_target")) {
+      throw new Error("请至少把一张编辑图片标记为“直接修改”。");
+    }
     await saveAppSettings({ throwError: true });
     const active = await ensureConversation("edit");
     const localUploads = [...editImages].map((file) => {
@@ -769,6 +884,7 @@ function App() {
       moderation: form.moderation,
       input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
+      upload_selection_modes: uploadSelectionModes,
       config: runConfig,
     };
     data.append("params_json", JSON.stringify(params));
@@ -819,7 +935,9 @@ function App() {
       context_limit: Number(form.context_limit),
       reference_image_ids: chatReferenceImages.map((image) => image.id),
       reference_image_roles: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceRoleFor(image, index)])),
+      reference_image_selection_modes: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceSelectionModeFor(image, index)])),
       upload_reference_roles: chatImages.map((file, index) => uploadRoleFor(file, index)),
+      upload_selection_modes: chatImages.map((file, index) => uploadSelectionModeFor(file, index)),
       config: runConfig,
       planner_config: plannerConfigForMode("chat"),
     };
@@ -835,6 +953,7 @@ function App() {
     startTaskEventStream(result.task?.id, active.id);
     setChatImages([]);
     setChatUploadRoles({});
+    setChatUploadSelectionModes({});
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
@@ -867,13 +986,15 @@ function App() {
       output_format: form.output_format,
       output_compression: form.output_compression === "" ? null : Number(form.output_compression),
       moderation: form.moderation,
-      input_fidelity: form.input_fidelity === "auto" ? "high" : form.input_fidelity,
+      input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
       context_limit: Number(form.context_limit),
       shot_limit: Number(form.shot_limit),
       reference_image_ids: chatReferenceImages.map((image) => image.id),
       reference_image_roles: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceRoleFor(image, index)])),
+      reference_image_selection_modes: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceSelectionModeFor(image, index)])),
       upload_reference_roles: chatImages.map((file, index) => uploadRoleFor(file, index)),
+      upload_selection_modes: chatImages.map((file, index) => uploadSelectionModeFor(file, index)),
       config: runConfig,
       planner_config: plannerConfigForMode("storyboard"),
     };
@@ -889,10 +1010,77 @@ function App() {
     startTaskEventStream(result.task?.id, active.id);
     setChatImages([]);
     setChatUploadRoles({});
+    setChatUploadSelectionModes({});
     await refreshHistory();
     await refreshTasks();
     await refreshPrompts();
     return result.task;
+  }
+
+  async function refreshCurrentAccessUser() {
+    try {
+      const res = await fetch(`${API}/api/access-users/me`);
+      const data = await parse(res);
+      setCurrentAccessUser(data);
+      if (data.is_admin) {
+        await refreshAccessUsers();
+      }
+    } catch {
+      setCurrentAccessUser(null);
+      setAccessUsers([]);
+    }
+  }
+
+  async function refreshAccessUsers() {
+    const res = await fetch(`${API}/api/access-users`);
+    const data = await parse(res);
+    setAccessUsers(data.items || []);
+    return data.items || [];
+  }
+
+  async function saveAccessUser() {
+    try {
+      const password = accessUserDraft.password.trim();
+      if (!password) {
+        setError(describeError({ detail: { message: "访问密码不能为空" } }));
+        return;
+      }
+      const res = await fetch(editingAccessUser ? `${API}/api/access-users/${encodeURIComponent(editingAccessUser.password)}` : `${API}/api/access-users`, {
+        method: editingAccessUser ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      const data = await parse(res);
+      setAccessUsers(data.items || []);
+      setAccessUserDraft({ password: "" });
+      setEditingAccessUser(null);
+      setSettingsFeedback("accessUsers", "success", editingAccessUser ? "用户已修改" : "用户已新建");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("accessUsers", "failed", "保存用户失败");
+    }
+  }
+
+  function editAccessUser(user) {
+    setEditingAccessUser(user);
+    setAccessUserDraft({ password: user.password || "" });
+  }
+
+  async function deleteAccessUser(user) {
+    if (!window.confirm(`确认删除访问用户 ${user.password} 吗？这不会删除该用户已有数据，但该密码将不能再登录。`)) return;
+    try {
+      const res = await fetch(`${API}/api/access-users/${encodeURIComponent(user.password)}`, { method: "DELETE" });
+      const data = await parse(res);
+      setAccessUsers(data.items || []);
+      if (editingAccessUser?.password === user.password) {
+        setEditingAccessUser(null);
+        setAccessUserDraft({ password: "" });
+      }
+      setSettingsFeedback("accessUsers", "success", "用户已删除");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("accessUsers", "failed", "删除用户失败");
+    }
   }
 
   async function loadAppSettings() {
@@ -1210,6 +1398,9 @@ function App() {
         setChatReferenceImages([]);
         setChatUploadRoles({});
         setChatReferenceRoles({});
+        setChatUploadSelectionModes({});
+        setChatReferenceSelectionModes({});
+        clearEditInputs();
       }
       await refreshHistory();
       await refreshTasks();
@@ -1391,8 +1582,11 @@ function App() {
     setChatImages([]);
     setChatReferenceImages([]);
     setChatUploadRoles({});
+    setChatUploadSelectionModes({});
     setChatReferenceRoles({});
+    setChatReferenceSelectionModes({});
     setSelectedTask(null);
+    clearEditInputs();
     setForm((value) => ({ ...value, mode: targetMode }));
     setActiveView("studio");
   }
@@ -1516,17 +1710,17 @@ function App() {
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
       if (activeViewRef.current !== "studio" || !isSessionMode(formModeRef.current) || currentConversation?.id !== id) {
-        return;
+        return null;
       }
     }
     const loadSeq = ++conversationLoadSeqRef.current;
     const res = await fetch(`${API}/api/conversations/${id}`);
     const data = await parse(res);
-    if (loadSeq !== conversationLoadSeqRef.current) return;
+    if (loadSeq !== conversationLoadSeqRef.current) return null;
     if (autoRefresh) {
       const currentConversation = conversationRef.current;
       if (activeViewRef.current !== "studio" || !isSessionMode(formModeRef.current) || currentConversation?.id !== id) {
-        return;
+        return null;
       }
     }
     const imagesByMessage = new Map();
@@ -1576,14 +1770,21 @@ function App() {
         setChatReferenceImages([]);
         setChatUploadRoles({});
         setChatReferenceRoles({});
+        setChatUploadSelectionModes({});
+        setChatReferenceSelectionModes({});
+        clearEditInputs();
       } else {
         setChatReferenceImages((items) => items.filter((image) => Number(image.conversation_id) === Number(data.conversation.id)));
         setChatReferenceRoles((current) => Object.fromEntries(
           Object.entries(current).filter(([imageId]) => (data.images || []).some((image) => String(image.id) === String(imageId)))
         ));
+        setChatReferenceSelectionModes((current) => Object.fromEntries(
+          Object.entries(current).filter(([imageId]) => (data.images || []).some((image) => String(image.id) === String(imageId)))
+        ));
       }
       setActiveView("studio");
     }
+    return data;
   }
 
   async function loadTask(taskId) {
@@ -1635,14 +1836,22 @@ function App() {
     const key = imageReferenceKey(image);
     if (!key) return;
     if (selectedEditCandidateKeys.has(key)) {
-      setEditImages((items) => items.filter((file) => String(file.sourceImageKey || "") !== key));
+      setEditImages((items) => {
+        const next = items.filter((file) => String(file.sourceImageKey || "") !== key);
+        setEditImageSelectionModes((current) => normalizeEditSelectionModes(next, current));
+        return next;
+      });
       return;
     }
     try {
       const file = await historyImageToFile(image);
       file.sourceImageKey = key;
       file.sourceImageLabel = imageSourceLabel(image);
-      setEditImages((items) => [...items, file]);
+      setEditImages((items) => {
+        const next = [...items, file];
+        setEditImageSelectionModes((current) => normalizeEditSelectionModes(next, current));
+        return next;
+      });
     } catch (err) {
       setError(describeError(err));
     }
@@ -1657,8 +1866,9 @@ function App() {
         : "edit";
     let useConversationReference = false;
     if (image.conversation_id) {
-      await loadConversation(image.conversation_id, { openStudio: true });
-      if (resolveConversationMode(conversationRef.current) !== targetMode) {
+      const loaded = await loadConversation(image.conversation_id, { openStudio: true });
+      const loadedMode = resolveConversationMode(loaded?.conversation);
+      if (loadedMode !== targetMode) {
         await newChat(targetMode);
       } else if (targetMode !== "edit" && image.id && image.source === "api") {
         useConversationReference = true;
@@ -1671,26 +1881,31 @@ function App() {
       const normalized = normalizeImageForClient(image);
       setChatReferenceImages([normalized]);
       setChatReferenceRoles({ [String(normalized.id)]: "character" });
+      setChatReferenceSelectionModes({ [String(normalized.id)]: "edit_target" });
       setChatImages([]);
       setChatUploadRoles({});
-      setEditImages([]);
-      setEditMask(null);
+      setChatUploadSelectionModes({});
+      clearEditInputs();
     } else {
       const file = await historyImageToFile(image);
       if (targetMode === "edit") {
         setEditImages([file]);
+        setEditImageSelectionModes({ [uploadFileRoleKey(file, 0)]: "edit_target" });
         setEditMask(null);
         setChatImages([]);
         setChatUploadRoles({});
+        setChatUploadSelectionModes({});
         setChatReferenceImages([]);
         setChatReferenceRoles({});
+        setChatReferenceSelectionModes({});
       } else {
         setChatImages([file]);
         setChatUploadRoles({ [uploadFileRoleKey(file, 0)]: "character" });
+        setChatUploadSelectionModes({ [uploadFileRoleKey(file, 0)]: "edit_target" });
         setChatReferenceImages([]);
         setChatReferenceRoles({});
-        setEditImages([]);
-        setEditMask(null);
+        setChatReferenceSelectionModes({});
+        clearEditInputs();
       }
     }
     setActiveView("studio");
@@ -1756,6 +1971,9 @@ function App() {
                   if (isSessionMode(value) && conversationRef.current && resolveConversationMode(conversationRef.current) !== value) {
                     newChat(value);
                     return;
+                  }
+                  if (value !== form.mode && (value === "edit" || form.mode === "edit")) {
+                    clearEditInputs();
                   }
                   setForm((f) => ({ ...f, mode: value }));
                 }}
@@ -1858,6 +2076,68 @@ function App() {
               onClick={() => saveSettingsSection("providers", "提供商选择已保存")}
             />
           </SettingsGroup>
+
+          {currentAccessUser?.is_admin && (
+            <SettingsGroup
+              title="用户管理"
+              help="仅主账号 hhs54666 可见。用于查看、新建、修改或删除访问密码账号；每个密码账号拥有独立数据空间。"
+              summary={`${accessUsers.length} 个访问用户`}
+              open={!!openGroups.accessUsers}
+              onToggle={() => {
+                toggleGroup("accessUsers");
+                if (!openGroups.accessUsers) refreshAccessUsers().catch((err) => setError(describeError(err)));
+              }}
+            >
+              <div className="providerEditor">
+                <div className="providerEditorGrid">
+                  <Field className="fieldFull" label={editingAccessUser ? "修改访问密码" : "新建访问密码"} help="访问密码必须是 8-32 位字母或数字；主账号 hhs54666 不能修改或删除。">
+                    <input
+                      value={accessUserDraft.password}
+                      onChange={(e) => setAccessUserDraft({ password: e.target.value })}
+                      placeholder="例如 hhs666666"
+                      maxLength={32}
+                    />
+                  </Field>
+                </div>
+                <div className="providerActions">
+                  <button className="secondaryButton" type="button" onClick={saveAccessUser}>
+                    <KeyRound size={16} />
+                    {editingAccessUser ? "保存用户" : "新建用户"}
+                  </button>
+                  {editingAccessUser && (
+                    <button className="ghostButton" type="button" onClick={() => { setEditingAccessUser(null); setAccessUserDraft({ password: "" }); }}>
+                      <X size={16} />
+                      取消
+                    </button>
+                  )}
+                  <button className="ghostButton" type="button" onClick={() => refreshAccessUsers().catch((err) => setError(describeError(err)))}>
+                    <RefreshCw size={16} />
+                    刷新
+                  </button>
+                </div>
+              </div>
+              <div className="providerList">
+                {accessUsers.map((user) => (
+                  <article className="providerItem" key={user.password}>
+                    <div>
+                      <strong>{user.password}</strong>
+                      <small>{user.is_admin ? "主账号 / 管理员" : user.is_builtin ? "默认用户" : "自定义用户"}</small>
+                      <small>数据空间：{user.storage_scope || "默认数据空间"}</small>
+                    </div>
+                    <div>
+                      <button type="button" onClick={() => editAccessUser(user)} title="编辑" disabled={!user.editable}><Edit3 size={15} /></button>
+                      <button type="button" onClick={() => deleteAccessUser(user)} title="删除" disabled={!user.deletable}><Trash2 size={15} /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <SettingsSaveAction
+                feedback={sectionSaveFeedback.accessUsers}
+                label="刷新用户列表"
+                onClick={() => refreshAccessUsers().then(() => setSettingsFeedback("accessUsers", "success", "用户列表已刷新")).catch((err) => { setError(describeError(err)); setSettingsFeedback("accessUsers", "failed", "刷新失败"); })}
+              />
+            </SettingsGroup>
+          )}
 
           <SettingsGroup
             title="模型设置"
@@ -2122,9 +2402,13 @@ function App() {
               <UploadRow
                 label="编辑图片"
                 files={editImages}
-                onChange={(files) => setEditImages((items) => mergeSelectedFiles(items, files))}
-                onRemove={(index) => setEditImages((items) => items.filter((_, i) => i !== index))}
+                onChange={updateEditUploads}
+                onRemove={removeEditUpload}
                 multiple
+                hint="请确认哪些图片是直接修改目标，哪些只是辅助参考"
+                selectionModes={editImageSelectionModes}
+                onSelectionModeChange={updateEditImageSelectionMode}
+                defaultSelectionMode={defaultEditSelectionMode}
               />
             )}
             {form.mode === "edit" && (
@@ -2151,6 +2435,8 @@ function App() {
                   onRemove={removeChatReferenceImage}
                   roles={chatReferenceRoles}
                   onRoleChange={updateSelectedReferenceRole}
+                  selectionModes={chatReferenceSelectionModes}
+                  onSelectionModeChange={updateSelectedReferenceSelectionMode}
                   uploadCount={chatImages.length}
                 />
                 <UploadRow
@@ -2161,11 +2447,14 @@ function App() {
                     const next = chatImages.filter((_, i) => i !== index);
                     setChatImages(next);
                     setChatUploadRoles((current) => normalizeUploadRoles(next, current));
+                    setChatUploadSelectionModes((current) => normalizeUploadSelectionModes(next, current));
                   }}
                   multiple
                   hint={`已指定 ${selectedReferenceCount()}/3 张`}
                   roles={chatUploadRoles}
+                  selectionModes={chatUploadSelectionModes}
                   onRoleChange={updateChatUploadRole}
+                  onSelectionModeChange={updateChatUploadSelectionMode}
                 />
               </>
             )}
@@ -2928,7 +3217,7 @@ function storyboardPromptPreview(shot) {
   return singleLine.length > 120 ? `${singleLine.slice(0, 120)}...` : singleLine;
 }
 
-function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {}, onRoleChange, uploadCount = 0 }) {
+function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {}, onRoleChange, selectionModes = {}, onSelectionModeChange, uploadCount = 0 }) {
   const selectedIds = new Set((selected || []).map((image) => Number(image.id)));
   const selectedImages = uniqueImages(selected || []);
   return (
@@ -2941,13 +3230,20 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
         <div className="selectedReferenceStrip">
           {selectedImages.map((image, index) => {
             const role = roles[String(image.id)] || defaultReferenceRole(uploadCount + index);
+            const selectionMode = selectionModes[String(image.id)] || defaultReferenceSelectionMode(uploadCount + index);
             return (
               <div className="selectedReferenceCard" key={image.id || image.url}>
                 <img src={image.public_url || image.url} alt="" />
                 <div className="selectedReferenceMeta">
                   <strong>{image.title || image.filename || `参考图 ${index + 1}`}</strong>
-                  <small>{referenceRoleLabel(role)}</small>
+                  <small>{referenceSelectionModeLabel(selectionMode)} / {referenceRoleLabel(role)}</small>
                 </div>
+                <label className="referenceRoleSelect compact">
+                  <span>方式</span>
+                  <select value={selectionMode} onChange={(event) => onSelectionModeChange?.(image.id, event.target.value)}>
+                    {referenceSelectionModeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                </label>
                 <label className="referenceRoleSelect compact">
                   <span>用途</span>
                   <select value={role} onChange={(event) => onRoleChange?.(image.id, event.target.value)}>
@@ -2968,6 +3264,7 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
           {images.map((image, index) => {
             const isSelected = selectedIds.has(Number(image.id));
             const role = roles[String(image.id)] || defaultReferenceRole(uploadCount + index);
+            const selectionMode = selectionModes[String(image.id)] || defaultReferenceSelectionMode(uploadCount + index);
             return (
               <div className={`referenceChoice ${isSelected ? "active" : ""}`} key={image.id}>
                 <button
@@ -2981,12 +3278,20 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
                   {isSelected && <em>取消</em>}
                 </button>
                 {isSelected && (
-                  <label className="referenceRoleSelect">
-                    <small>作为{referenceRoleLabel(role)}使用</small>
-                    <select value={role} onChange={(event) => onRoleChange?.(image.id, event.target.value)}>
-                      {referenceRoleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                    </select>
-                  </label>
+                  <>
+                    <label className="referenceRoleSelect">
+                      <small>作为{referenceSelectionModeLabel(selectionMode)}</small>
+                      <select value={selectionMode} onChange={(event) => onSelectionModeChange?.(image.id, event.target.value)}>
+                        {referenceSelectionModeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="referenceRoleSelect">
+                      <small>角色用途：{referenceRoleLabel(role)}</small>
+                      <select value={role} onChange={(event) => onRoleChange?.(image.id, event.target.value)}>
+                        {referenceRoleOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                      </select>
+                    </label>
+                  </>
                 )}
               </div>
             );
@@ -3357,7 +3662,7 @@ function Select({ label, value, onChange, options, help = "", className = "" }) 
   );
 }
 
-function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = "", roles = {}, onRoleChange }) {
+function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = "", roles = {}, onRoleChange, selectionModes = {}, onSelectionModeChange, defaultSelectionMode = defaultReferenceSelectionMode }) {
   const [previews, setPreviews] = useState([]);
 
   useEffect(() => {
@@ -3383,6 +3688,17 @@ function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = 
           <div className="uploadPreview" key={`${item.file.name}-${index}`}>
             <img src={item.url} alt={item.file.name} />
             <small>{item.file.name}</small>
+            {onSelectionModeChange && (
+              <label className="referenceRoleSelect compact">
+                <span>{referenceSelectionModeLabel(selectionModes[uploadFileRoleKey(item.file, index)] || defaultSelectionMode(index))}</span>
+                <select
+                  value={selectionModes[uploadFileRoleKey(item.file, index)] || defaultSelectionMode(index)}
+                  onChange={(event) => onSelectionModeChange?.(item.file, index, event.target.value)}
+                >
+                  {referenceSelectionModeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </label>
+            )}
             {onRoleChange && (
               <label className="referenceRoleSelect compact">
                 <span>{referenceRoleLabel(roles[uploadFileRoleKey(item.file, index)] || defaultReferenceRole(index))}</span>

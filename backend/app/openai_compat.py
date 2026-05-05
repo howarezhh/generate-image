@@ -27,6 +27,14 @@ def resolve_api_key(api_key: str | None) -> str:
     key = (api_key or DEFAULT_API_KEY or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="API key is required")
+    if any(ord(char) > 127 for char in key):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "API Key 包含非 ASCII 字符，疑似误粘贴了中文标点或全角字符。",
+                "suggestion": "请检查并删除中文句号、中文逗号、全角空格等字符后重试。",
+            },
+        )
     return key
 
 

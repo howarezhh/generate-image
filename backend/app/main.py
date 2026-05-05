@@ -70,7 +70,9 @@ IMAGE_PROVIDER_POOL_LOCK: asyncio.Lock | None = None
 IMAGE_PROVIDER_POOL_STATE: dict[str, dict[str, Any]] = {}
 ACCESS_COOKIE_NAME = "studio_access"
 ACCESS_PASSWORD = "hhs54666"
-ACCESS_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9]{8}$")
+ADDITIONAL_DEFAULT_ACCESS_PASSWORDS = ("hhs666666",)
+ACCESS_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9]{8,32}$")
+ACCESS_USER_SETTINGS_KEY = "access_users"
 ACCESS_ERROR_MESSAGE = "密码错误，请联系管理员，管理员QQ为3286385052。"
 ACCESS_LOGIN_PATH = "/auth/login"
 ACCESS_ALLOWED_PATHS = {ACCESS_LOGIN_PATH, "/favicon.ico", "/favicon.svg"}
@@ -79,6 +81,23 @@ DEFAULT_ACCESS_PASSWORD = ACCESS_PASSWORD.lower()
 
 def normalize_access_password(value: str) -> str:
     return str(value or "").strip().lower()
+
+
+DEFAULT_ACCESS_PASSWORDS = tuple(dict.fromkeys([DEFAULT_ACCESS_PASSWORD, *[normalize_access_password(value) for value in ADDITIONAL_DEFAULT_ACCESS_PASSWORDS]]))
+
+
+def configured_base_access_passwords() -> tuple[str, ...]:
+    raw = [normalize_access_password(part) for part in get_env("ACCESS_PASSWORDS", ",".join(DEFAULT_ACCESS_PASSWORDS)).split(",")]
+    return tuple(
+        dict.fromkeys(
+            value
+            for value in [*raw, *DEFAULT_ACCESS_PASSWORDS]
+            if value and ACCESS_PASSWORD_PATTERN.fullmatch(value)
+        )
+    )
+
+
+BASE_ACCESS_PASSWORDS = configured_base_access_passwords()
 
 
 def access_storage_scope(value: str) -> str:
@@ -93,15 +112,92 @@ def access_cookie_token(value: str) -> str:
     return hashlib.sha256(f"gpt-image-studio:access:{normalized}".encode("utf-8")).hexdigest()
 
 
-raw_access_passwords = [normalize_access_password(part) for part in get_env("ACCESS_PASSWORDS", ACCESS_PASSWORD).split(",")]
-ACCESS_PASSWORDS = tuple(
-    dict.fromkeys(
-        value
-        for value in [*raw_access_passwords, DEFAULT_ACCESS_PASSWORD]
-        if value and ACCESS_PASSWORD_PATTERN.fullmatch(value)
+def default_scope_settings_value(key: str) -> dict[str, Any]:
+    token = set_storage_scope("")
+    try:
+        with db.connect() as conn:
+            row = conn.execute("select value from settings where key = ?", (key,)).fetchone()
+        if not row:
+            return {}
+        value = json.loads(row["value"])
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+    finally:
+        reset_storage_scope(token)
+
+
+def save_default_scope_settings_value(key: str, value: dict[str, Any]) -> None:
+    token = set_storage_scope("")
+    try:
+        with db.connect() as conn:
+            conn.execute(
+                "insert or replace into settings (key, value, updated_at) values (?, ?, ?)",
+                (key, db.json_dumps(value), db.now_iso()),
+            )
+    finally:
+        reset_storage_scope(token)
+
+
+def load_access_user_registry() -> dict[str, Any]:
+    payload = default_scope_settings_value(ACCESS_USER_SETTINGS_KEY)
+    users = payload.get("users") if isinstance(payload.get("users"), list) else []
+    disabled = payload.get("disabled_passwords") if isinstance(payload.get("disabled_passwords"), list) else []
+    return {
+        "users": [
+            {"password": normalize_access_password(item.get("password")), "created_at": item.get("created_at"), "updated_at": item.get("updated_at")}
+            for item in users
+            if isinstance(item, dict) and ACCESS_PASSWORD_PATTERN.fullmatch(normalize_access_password(item.get("password")))
+        ],
+        "disabled_passwords": [
+            value
+            for value in (normalize_access_password(item) for item in disabled)
+            if value and value != DEFAULT_ACCESS_PASSWORD and ACCESS_PASSWORD_PATTERN.fullmatch(value)
+        ],
+    }
+
+
+def save_access_user_registry(payload: dict[str, Any]) -> None:
+    save_default_scope_settings_value(ACCESS_USER_SETTINGS_KEY, payload)
+
+
+def effective_access_passwords() -> tuple[str, ...]:
+    registry = load_access_user_registry()
+    disabled = set(registry["disabled_passwords"])
+    managed = [item["password"] for item in registry["users"]]
+    return tuple(
+        dict.fromkeys(
+            value
+            for value in [*BASE_ACCESS_PASSWORDS, *managed, DEFAULT_ACCESS_PASSWORD]
+            if value and value not in disabled and ACCESS_PASSWORD_PATTERN.fullmatch(value)
+        )
     )
-)
-ACCESS_COOKIE_TO_SCOPE = {access_cookie_token(value): access_storage_scope(value) for value in ACCESS_PASSWORDS}
+
+
+def refresh_access_password_cache() -> None:
+    global ACCESS_PASSWORDS, ACCESS_COOKIE_TO_SCOPE, ACCESS_COOKIE_TO_PASSWORD
+    ACCESS_PASSWORDS = effective_access_passwords()
+    ACCESS_COOKIE_TO_SCOPE = {access_cookie_token(value): access_storage_scope(value) for value in ACCESS_PASSWORDS}
+    ACCESS_COOKIE_TO_PASSWORD = {access_cookie_token(value): value for value in ACCESS_PASSWORDS}
+
+
+ACCESS_PASSWORDS: tuple[str, ...] = ()
+ACCESS_COOKIE_TO_SCOPE: dict[str, str] = {}
+ACCESS_COOKIE_TO_PASSWORD: dict[str, str] = {}
+refresh_access_password_cache()
+
+
+def validate_api_key_text(value: str | None, *, field_label: str = "API Key") -> str:
+    text = str(value or "").strip()
+    if text and any(ord(char) > 127 for char in text):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"{field_label} 包含非 ASCII 字符，疑似误粘贴了中文标点或全角字符。",
+                "suggestion": "请检查并删除中文句号、中文逗号、全角空格等字符后重试。",
+            },
+        )
+    return text
 
 
 def all_known_storage_scopes() -> list[str]:
@@ -136,6 +232,10 @@ class ProviderRequest(BaseModel):
 
 class AppSettingsRequest(BaseModel):
     value: dict[str, Any] = Field(default_factory=dict)
+
+
+class AccessUserRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=32)
 
 
 class PromptRequest(BaseModel):
@@ -196,7 +296,9 @@ class ChatRequest(BaseModel):
     context_limit: int = Field(default=10, ge=0, le=50)
     reference_image_ids: list[int] = Field(default_factory=list)
     reference_image_roles: dict[str, str] = Field(default_factory=dict)
+    reference_image_selection_modes: dict[str, str] = Field(default_factory=dict)
     upload_reference_roles: list[str] = Field(default_factory=list)
+    upload_selection_modes: list[str] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
     planner_config: ClientConfig | None = None
 
@@ -219,7 +321,9 @@ class StoryboardRequest(BaseModel):
     shot_limit: int = Field(default=20, ge=1, le=100)
     reference_image_ids: list[int] = Field(default_factory=list)
     reference_image_roles: dict[str, str] = Field(default_factory=dict)
+    reference_image_selection_modes: dict[str, str] = Field(default_factory=dict)
     upload_reference_roles: list[str] = Field(default_factory=list)
+    upload_selection_modes: list[str] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
     planner_config: ClientConfig | None = None
 
@@ -229,6 +333,10 @@ REFERENCE_ROLE_LABELS = {
     "scene": "场景锚点",
     "wardrobe_prop": "服装道具锚点",
     "style": "风格锚点",
+}
+REFERENCE_SELECTION_MODE_LABELS = {
+    "edit_target": "直接修改目标",
+    "reference": "辅助参考",
 }
 DEFAULT_REFERENCE_ROLE_ORDER = ("character", "scene", "wardrobe_prop")
 REFERENCE_ROLE_PRIORITY = {role: index for index, role in enumerate(("character", "scene", "wardrobe_prop", "style"))}
@@ -240,6 +348,7 @@ PROVIDER_UNAVAILABLE_COOLDOWN_SECONDS = 90.0
 
 
 def resolve_access_password(value: str) -> str | None:
+    refresh_access_password_cache()
     normalized = normalize_access_password(value)
     if not ACCESS_PASSWORD_PATTERN.fullmatch(normalized):
         return None
@@ -258,6 +367,22 @@ def access_cookie_valid(request: Request) -> bool:
 def request_storage_scope(request: Request) -> str | None:
     token = str(request.cookies.get(ACCESS_COOKIE_NAME) or "")
     return ACCESS_COOKIE_TO_SCOPE.get(token)
+
+
+def request_access_password(request: Request) -> str | None:
+    token = str(request.cookies.get(ACCESS_COOKIE_NAME) or "")
+    return ACCESS_COOKIE_TO_PASSWORD.get(token)
+
+
+def require_access_user_admin(request: Request) -> None:
+    if request_access_password(request) != DEFAULT_ACCESS_PASSWORD:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "只有主账号 hhs54666 可以管理访问用户。",
+                "status_code": 403,
+            },
+        )
 
 
 def runtime_scope_key(scope: str | None = None) -> str:
@@ -406,7 +531,7 @@ def login_page_html(next_path: str = "/", error_message: str = "") -> str:
   <section class="loginCard">
     <div class="loginMark">鉴权</div>
     <h1>请输入访问密码</h1>
-    <p>访问当前项目之前，需要先完成统一密码验证。密码仅支持 8 位数字或英文字母，英文字母不区分大小写。</p>
+    <p>访问当前项目之前，需要先完成统一密码验证。密码仅支持 8-32 位数字或英文字母，英文字母不区分大小写。</p>
     {error_block}
     <form method="post" action="{ACCESS_LOGIN_PATH}">
       <input type="hidden" name="next" value="{safe_next}" />
@@ -415,9 +540,9 @@ def login_page_html(next_path: str = "/", error_message: str = "") -> str:
         <input
           type="password"
           name="password"
-          maxlength="8"
+          maxlength="32"
           minlength="8"
-          pattern="[A-Za-z0-9]{{8}}"
+          pattern="[A-Za-z0-9]{{8,32}}"
           autocomplete="current-password"
           inputmode="text"
           autofocus
@@ -868,6 +993,34 @@ def reference_role_label(role: str) -> str:
     return REFERENCE_ROLE_LABELS.get(role, REFERENCE_ROLE_LABELS["style"])
 
 
+def normalize_reference_selection_mode(value: Any, *, default: str = "reference") -> str:
+    mode = str(value or "").strip().lower()
+    if mode in REFERENCE_SELECTION_MODE_LABELS:
+        return mode
+    return default
+
+
+def reference_selection_mode_label(mode: str) -> str:
+    return REFERENCE_SELECTION_MODE_LABELS.get(mode, REFERENCE_SELECTION_MODE_LABELS["reference"])
+
+
+def normalize_edit_upload_selection_modes(raw_modes: Any, image_count: int) -> list[str]:
+    modes: list[str] = []
+    raw_list = raw_modes if isinstance(raw_modes, list) else []
+    for index in range(max(0, image_count)):
+        default = "edit_target" if index == 0 else "reference"
+        modes.append(normalize_reference_selection_mode(raw_list[index] if index < len(raw_list) else None, default=default))
+    if modes and "edit_target" not in modes:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "编辑模式至少需要指定一张直接修改目标图。",
+                "suggestion": "请把要直接修改的图片标记为“直接修改”，其它图片标记为“辅助参考”。",
+            },
+        )
+    return modes
+
+
 def reference_candidate_hint(candidate: dict[str, Any]) -> str:
     hint = str(candidate.get("hint") or "").strip()
     if hint:
@@ -875,14 +1028,21 @@ def reference_candidate_hint(candidate: dict[str, Any]) -> str:
     return "无额外说明"
 
 
-def build_reference_input_note(candidate: dict[str, Any], index: int) -> str:
+def build_reference_input_note(candidate: dict[str, Any], index: int, *, usage: str = "reference") -> str:
     role = str(candidate.get("role") or "style")
     role_label = reference_role_label(role)
     hint = reference_candidate_hint(candidate)
     source = "用户本轮上传" if candidate.get("source") == "upload" else "用户显式选择的历史参考"
+    if usage == "edit_target":
+        return (
+            f"Input image {index}: 直接修改目标图。"
+            f"用户明确希望修改这张图；优先保留其主体身份、构图、空间关系和未被点名修改的区域。"
+            f"来源={source}；角色={role_label}；已知说明={hint}。"
+        )
     return (
-        f"Input image {index}: {role_label}. "
-        f"把这张图当作固定锚点，优先保留与该角色对应的身份/场景/服装/风格信息；"
+        f"Input image {index}: 辅助参考图，角色={role_label}。"
+        f"把这张图当作固定锚点或风格参考，不要把它当作默认编辑目标；"
+        f"优先保留与该角色对应的身份/场景/服装/风格信息；"
         f"来源={source}；已知说明={hint}。"
     )
 
@@ -893,6 +1053,7 @@ def serialize_seed_images(candidates: list[dict[str, Any]]) -> list[dict[str, An
         path = candidate.get("path")
         if not isinstance(path, Path):
             continue
+        selection_mode = normalize_reference_selection_mode(candidate.get("selection_mode"), default="reference")
         items.append(
             {
                 "ref": candidate.get("ref"),
@@ -904,6 +1065,7 @@ def serialize_seed_images(candidates: list[dict[str, Any]]) -> list[dict[str, An
                 "mime_type": candidate.get("mime_type") or "image/png",
                 "hint": candidate.get("hint") or "",
                 "role": candidate.get("role") or "style",
+                "selection_mode": selection_mode,
             }
         )
     return items
@@ -1302,6 +1464,7 @@ def build_chat_planner_prompt(
             lines.append(
                 f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
                 f"role={reference_role_label(str(image.get('role') or 'style'))}, "
+                f"selection_mode={reference_selection_mode_label(str(image.get('selection_mode') or 'reference'))}, "
                 f"image_id={image.get('id')}, message_id={image.get('message_id')}, "
                 f"task_id={image.get('task_id')}, {prompt_part}"
             )
@@ -1322,9 +1485,10 @@ def build_chat_planner_prompt(
 4. 若是从零生成新图，action=generate，image_prompt 必须是一张图片的最终生图提示词，只描述这一张图的画面，不要写解释、流程、JSON、镜头列表或多张图信息。
 5. 若是编辑参考图，action=edit；只能使用本轮用户上传或选择的参考图，禁止自行猜测其它历史图片。
 6. 若用户想改图但没有提供参考图，或无法判断要改哪张参考图，should_generate=false，请用户上传或选择参考图。
-7. 若使用参考图，reference_image_refs 必须填写使用到的 ref；reference_image_ids 只填写已选历史生成图的 image_id。用户本轮上传的参考图没有 image_id，也没有对应生图提示词，不要编造。
-8. image_prompt 必须把用户意图改写成适合 image_generation 的单张图片提示词，并明确保留不应变化的主体、构图、风格或参考图特征。
-9. 若 should_generate=true，必须顺便给这张图片生成一个简短中文名称 image_name；名称要便于用户识别、适合直接作为图片名，禁止带文件扩展名。
+7. 若使用参考图，reference_image_refs 必须填写本次实际用到的全部 ref；reference_image_ids 只填写已选历史生成图里实际用到的 image_id。用户本轮上传的参考图没有 image_id，也没有对应生图提示词，不要编造。
+8. 若 action=edit，edit_target_image_refs 必须填写“被直接修改”的目标图 ref；若是历史生成图，同时在 edit_target_image_ids 里填写对应 image_id。若有辅助参考图但不是直接修改对象，它们只能出现在 reference_image_refs 里，不能混进 edit_target_image_refs。
+9. image_prompt 必须把用户意图改写成适合 image_generation 的单张图片提示词，并明确保留不应变化的主体、构图、风格或参考图特征。
+10. 若 should_generate=true，必须顺便给这张图片生成一个简短中文名称 image_name；名称要便于用户识别、适合直接作为图片名，禁止带文件扩展名。
 
 {image_note}
 
@@ -1337,6 +1501,8 @@ def build_chat_planner_prompt(
   "image_prompt": "should_generate 为 true 时填写一张图片的最终生图提示词；它只能对应一张图片，不能包含解释、流程、多图列表或其它信息；否则为空字符串",
   "reference_image_refs": [],
   "reference_image_ids": [],
+  "edit_target_image_refs": [],
+  "edit_target_image_ids": [],
   "reason": "简短说明判断依据"
 }}
 
@@ -1366,6 +1532,8 @@ def parse_planner_json(text: str) -> dict[str, Any]:
             "image_prompt": "",
             "reference_image_refs": [],
             "reference_image_ids": [],
+            "edit_target_image_refs": [],
+            "edit_target_image_ids": [],
             "reason": "planner returned non-json text",
         }
     reference_refs = parsed.get("reference_image_refs") or []
@@ -1374,6 +1542,12 @@ def parse_planner_json(text: str) -> dict[str, Any]:
     reference_ids = parsed.get("reference_image_ids") or []
     if not isinstance(reference_ids, list):
         reference_ids = []
+    edit_target_refs = parsed.get("edit_target_image_refs") or []
+    if not isinstance(edit_target_refs, list):
+        edit_target_refs = []
+    edit_target_ids = parsed.get("edit_target_image_ids") or []
+    if not isinstance(edit_target_ids, list):
+        edit_target_ids = []
     return {
         "reply": fix_mojibake(str(parsed.get("reply") or "").strip()) or "我理解了。",
         "should_generate": bool(parsed.get("should_generate")),
@@ -1382,6 +1556,8 @@ def parse_planner_json(text: str) -> dict[str, Any]:
         "image_prompt": fix_mojibake(str(parsed.get("image_prompt") or "").strip()),
         "reference_image_refs": [str(value).strip() for value in reference_refs if str(value).strip()],
         "reference_image_ids": [int(value) for value in reference_ids if str(value).isdigit()],
+        "edit_target_image_refs": [str(value).strip() for value in edit_target_refs if str(value).strip()],
+        "edit_target_image_ids": [int(value) for value in edit_target_ids if str(value).isdigit()],
         "reason": fix_mojibake(str(parsed.get("reason") or "").strip()),
     }
 
@@ -1401,6 +1577,7 @@ def build_storyboard_planner_prompt(
             lines.append(
                 f"- 候选{index}: ref={image['ref']}, source={image.get('source')}, "
                 f"role={reference_role_label(str(image.get('role') or 'style'))}, "
+                f"selection_mode={reference_selection_mode_label(str(image.get('selection_mode') or 'reference'))}, "
                 f"image_id={image.get('id')}, task_id={image.get('task_id')}, "
                 f"说明={reference_candidate_hint(image)}"
             )
@@ -1422,9 +1599,10 @@ def build_storyboard_planner_prompt(
 5. 每个 shots[i].prompt 都必须是一张图片的生图提示词，只对应该镜头的首帧图片；禁止把多个镜头、解释文字、流程说明或文件保存说明写进同一个 prompt。
 6. 每个镜头只生成一张图，代表该镜头最开始的一帧画面；不要合图、拼图、多格漫画或一次描述多张图。
 7. 镜头必须连续：第 N 镜头的首帧要承接第 N-1 镜头画面，保持人物、服装、道具、空间位置、光线逻辑和故事动作一致。
-8. 第 1 镜头可基于文本或用户显式参考图；第 2 个及后续镜头的 prompt 必须写明“以上一镜头输出画面作为参考继续编辑”，并说明从上一镜头到当前首帧发生了什么连续变化。
-9. 你需要为每个镜头生成中文名字，名字要短、能作为文件名，必须包含镜头顺序含义，但不要包含文件扩展名。
-10. 最多输出 {shot_limit} 个镜头；如果用户没有指定数量，优先 3-5 个镜头。
+8. 第 1 镜头可基于文本生成，也可在用户显式指定的参考图上直接修改；若第 1 镜头要直接修改参考图，必须在该镜头里明确写 action=edit，并给出 edit_target_image_refs。
+9. 第 2 个及后续镜头必须使用 action=edit，并默认以上一镜头输出画面作为直接编辑目标；若还要补充用户显式参考图作为辅助锚点，可在该镜头里填写 reference_image_refs。
+10. 你需要为每个镜头生成中文名字，名字要短、能作为文件名，必须包含镜头顺序含义，但不要包含文件扩展名。
+11. 最多输出 {shot_limit} 个镜头；如果用户没有指定数量，优先 3-5 个镜头。
 
 {image_note}
 
@@ -1438,8 +1616,13 @@ def build_storyboard_planner_prompt(
     {{
       "order": 1,
       "name": "01-中文镜头名",
+      "action": "generate 或 edit；第 2 个及后续镜头必须是 edit",
       "prompt": "这一镜头的一张首帧图片生图提示词，包含人物/场景/构图/动作/连续性/禁止变化项；只能对应这一张图片",
-      "continuity": "这一镜头与上一镜头的衔接关系；第一镜头说明开场状态"
+      "continuity": "这一镜头与上一镜头的衔接关系；第一镜头说明开场状态",
+      "reference_image_refs": [],
+      "reference_image_ids": [],
+      "edit_target_image_refs": [],
+      "edit_target_image_ids": []
     }}
   ],
   "reason": "简短说明判断依据"
@@ -1485,14 +1668,28 @@ def parse_storyboard_plan(text: str, shot_limit: int) -> dict[str, Any]:
         prompt = fix_mojibake(str(item.get("prompt") or "").strip())
         if not prompt:
             continue
+        reference_refs = item.get("reference_image_refs") if isinstance(item.get("reference_image_refs"), list) else []
+        reference_ids = item.get("reference_image_ids") if isinstance(item.get("reference_image_ids"), list) else []
+        edit_target_refs = item.get("edit_target_image_refs") if isinstance(item.get("edit_target_image_refs"), list) else []
+        edit_target_ids = item.get("edit_target_image_ids") if isinstance(item.get("edit_target_image_ids"), list) else []
+        action = str(item.get("action") or ("generate" if index == 1 else "edit")).strip().lower()
+        if action not in {"generate", "edit"}:
+            action = "generate" if index == 1 else "edit"
+        if index > 1:
+            action = "edit"
         shots.append(
             {
                 "order": int(item.get("order") or index),
                 "name": normalize_shot_name(name, index),
+                "action": action,
                 "prompt": prompt,
                 "planner_prompt": prompt,
                 "execution_prompt": "",
                 "continuity": fix_mojibake(str(item.get("continuity") or "").strip()),
+                "reference_image_refs": [str(value).strip() for value in reference_refs if str(value).strip()],
+                "reference_image_ids": [int(value) for value in reference_ids if str(value).isdigit()],
+                "edit_target_image_refs": [str(value).strip() for value in edit_target_refs if str(value).strip()],
+                "edit_target_image_ids": [int(value) for value in edit_target_ids if str(value).isdigit()],
                 "status": "pending",
             }
         )
@@ -1566,6 +1763,7 @@ def publish_storyboard_image_saved(
 def build_uploaded_image_candidates(
     uploaded: list[tuple[Path, str]],
     upload_roles: list[str] | None = None,
+    upload_selection_modes: list[str] | None = None,
     *,
     start_order: int = 1,
 ) -> list[dict[str, Any]]:
@@ -1573,6 +1771,10 @@ def build_uploaded_image_candidates(
     for index, (path, mime_type) in enumerate(uploaded, start=1):
         ordinal = start_order + index - 1
         role = normalize_reference_role(upload_roles[index - 1] if upload_roles and index - 1 < len(upload_roles) else None, ordinal)
+        selection_mode = normalize_reference_selection_mode(
+            upload_selection_modes[index - 1] if upload_selection_modes and index - 1 < len(upload_selection_modes) else None,
+            default="reference",
+        )
         candidates.append(
             {
                 "ref": f"upload:{index}",
@@ -1584,6 +1786,8 @@ def build_uploaded_image_candidates(
                 "mime_type": mime_type,
                 "role": role,
                 "role_label": reference_role_label(role),
+                "selection_mode": selection_mode,
+                "selection_mode_label": reference_selection_mode_label(selection_mode),
                 "hint": f"本轮用户上传的第 {index} 张图片，没有历史生图提示词",
             }
         )
@@ -1593,6 +1797,7 @@ def build_uploaded_image_candidates(
 def build_selected_image_candidates(
     selected: list[dict[str, Any]],
     reference_roles: dict[str, str] | None = None,
+    selection_modes: dict[str, str] | None = None,
     *,
     start_order: int = 1,
 ) -> list[dict[str, Any]]:
@@ -1603,6 +1808,10 @@ def build_selected_image_candidates(
             continue
         ordinal = start_order + index - 1
         role = normalize_reference_role((reference_roles or {}).get(str(item["id"])), ordinal)
+        selection_mode = normalize_reference_selection_mode(
+            (selection_modes or {}).get(str(item["id"])),
+            default="reference",
+        )
         candidates.append(
             {
                 "ref": f"image:{item['id']}",
@@ -1614,6 +1823,8 @@ def build_selected_image_candidates(
                 "mime_type": item.get("mime_type") or "image/png",
                 "role": role,
                 "role_label": reference_role_label(role),
+                "selection_mode": selection_mode,
+                "selection_mode_label": reference_selection_mode_label(selection_mode),
                 "hint": item.get("task_prompt") or item.get("message_content") or item.get("title") or "用户指定的历史图片",
             }
         )
@@ -1693,35 +1904,157 @@ def selected_candidate_uploads(
     reference_ids: list[int],
     reference_refs: list[str],
 ) -> list[tuple[Path, str]]:
-    selected: list[tuple[Path, str]] = []
-    wanted = set(reference_ids)
-    wanted_refs = set(reference_refs)
+    return [
+        (item["path"], item.get("mime_type") or "image/png")
+        for item in resolve_selected_candidates(candidates, reference_ids, reference_refs)
+    ]
+
+
+def candidate_identity(candidate: dict[str, Any]) -> str:
+    item_id = candidate.get("id")
+    if item_id is not None:
+        try:
+            return f"id:{int(item_id)}"
+        except (TypeError, ValueError):
+            pass
+    return f"ref:{str(candidate.get('ref') or '')}"
+
+
+def unique_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for item in candidates:
-        item_id = item.get("id")
-        item_ref = str(item.get("ref") or "")
-        if item_ref in wanted_refs or (item_id is not None and int(item_id) in wanted):
-            selected.append((item["path"], item.get("mime_type") or "image/png"))
+        key = candidate_identity(item)
+        if key in seen:
+            continue
+        selected.append(item)
+        seen.add(key)
     return selected
 
 
-def storyboard_anchor_candidates(candidates: list[dict[str, Any]], limit: int = 2) -> list[dict[str, Any]]:
-    anchors = [item for item in candidates if isinstance(item.get("path"), Path)]
-    anchors.sort(
-        key=lambda item: (
-            REFERENCE_ROLE_PRIORITY.get(str(item.get("role") or "style"), len(REFERENCE_ROLE_PRIORITY)),
-            str(item.get("ref") or ""),
-        )
-    )
+def resolve_selected_candidates(
+    candidates: list[dict[str, Any]],
+    reference_ids: list[int] | None = None,
+    reference_refs: list[str] | None = None,
+    *,
+    fallback_to_all: bool = False,
+) -> list[dict[str, Any]]:
+    wanted: set[int] = set()
+    wanted_refs = {str(value).strip() for value in reference_refs or [] if str(value).strip()}
+    for value in reference_ids or []:
+        try:
+            image_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if image_id > 0:
+            wanted.add(image_id)
+    if not wanted and not wanted_refs:
+        return unique_candidates(candidates) if fallback_to_all else []
+    selected: list[dict[str, Any]] = []
+    for item in candidates:
+        item_ref = str(item.get("ref") or "")
+        matched = item_ref in wanted_refs
+        if not matched and item.get("id") is not None:
+            try:
+                matched = int(item["id"]) in wanted
+            except (TypeError, ValueError):
+                matched = False
+        if matched:
+            selected.append(item)
+    return unique_candidates(selected)
+
+
+def merge_candidate_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for group in groups:
+        merged.extend(group)
+    return unique_candidates(merged)
+
+
+def explicit_edit_target_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in unique_candidates(candidates)
+        if normalize_reference_selection_mode(item.get("selection_mode"), default="reference") == "edit_target"
+    ]
+
+
+def candidate_refs(candidates: list[dict[str, Any]]) -> list[str]:
+    refs: list[str] = []
+    for item in candidates:
+        ref = str(item.get("ref") or "").strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def candidate_ids(candidates: list[dict[str, Any]]) -> list[int]:
+    values: list[int] = []
+    for item in candidates:
+        item_id = item.get("id")
+        try:
+            image_id = int(item_id)
+        except (TypeError, ValueError):
+            continue
+        if image_id > 0:
+            values.append(image_id)
+    return values
+
+
+def build_candidate_input_bundle(
+    primary_candidates: list[dict[str, Any]],
+    reference_candidates: list[dict[str, Any]],
+) -> tuple[list[tuple[Path, str]], list[str]]:
+    uploads: list[tuple[Path, str]] = []
+    notes: list[str] = []
+    seen_paths: set[str] = set()
+    for usage, items in (("edit_target", primary_candidates), ("reference", reference_candidates)):
+        for candidate in items:
+            path = candidate.get("path")
+            if not isinstance(path, Path):
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen_paths:
+                continue
+            uploads.append((path, candidate.get("mime_type") or "image/png"))
+            notes.append(build_reference_input_note(candidate, len(uploads), usage=usage))
+            seen_paths.add(resolved)
+    return uploads, notes
+
+
+def build_edit_input_bundle(
+    uploaded: list[tuple[Path, str]],
+    upload_selection_modes: list[str] | None = None,
+) -> tuple[list[tuple[Path, str]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    selection_modes = normalize_edit_upload_selection_modes(upload_selection_modes, len(uploaded))
+    candidates = build_uploaded_image_candidates(uploaded, upload_selection_modes=selection_modes)
+    target_candidates = explicit_edit_target_candidates(candidates)
+    reference_candidates = [
+        item
+        for item in candidates
+        if candidate_identity(item) not in {candidate_identity(target) for target in target_candidates}
+    ]
+    edit_inputs, input_image_notes = build_candidate_input_bundle(target_candidates, reference_candidates)
+    return edit_inputs, input_image_notes, reference_candidates, target_candidates
+
+
+def storyboard_anchor_candidates(candidates: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    anchors = unique_candidates([item for item in candidates if isinstance(item.get("path"), Path)])
     return anchors[: max(0, limit)]
 
 
 def build_storyboard_generation_inputs(
     previous_image: tuple[Path, str] | None,
     seed_candidates: list[dict[str, Any]],
+    *,
+    action: str,
+    edit_target_candidates: list[dict[str, Any]] | None = None,
 ) -> tuple[list[tuple[Path, str]], list[str]]:
     uploads: list[tuple[Path, str]] = []
     notes: list[str] = []
     seen_paths: set[str] = set()
+    seed_candidates = unique_candidates(seed_candidates)
+    edit_target_candidates = unique_candidates(edit_target_candidates or [])
     if previous_image is not None:
         previous_path, previous_mime = previous_image
         uploads.append((previous_path, previous_mime))
@@ -1729,7 +2062,18 @@ def build_storyboard_generation_inputs(
             "Input image 1: 上一镜头输出画面。必须把它作为连续编辑基底，优先保留人物身份、构图关系、空间方位、光线方向和镜头语义连续性。"
         )
         seen_paths.add(str(previous_path.resolve()))
-    for candidate in storyboard_anchor_candidates(seed_candidates):
+    elif action == "edit":
+        for candidate in edit_target_candidates:
+            path = candidate.get("path")
+            if not isinstance(path, Path):
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen_paths:
+                continue
+            uploads.append((path, candidate.get("mime_type") or "image/png"))
+            notes.append(build_reference_input_note(candidate, len(uploads), usage="edit_target"))
+            seen_paths.add(resolved)
+    for candidate in storyboard_anchor_candidates(seed_candidates, limit=max(1, len(seed_candidates) or 1)):
         path = candidate.get("path")
         if not isinstance(path, Path):
             continue
@@ -1740,6 +2084,68 @@ def build_storyboard_generation_inputs(
         notes.append(build_reference_input_note(candidate, len(uploads)))
         seen_paths.add(resolved)
     return uploads, notes
+
+
+def resolve_storyboard_shot_inputs(
+    previous_image: tuple[Path, str] | None,
+    seed_candidates: list[dict[str, Any]],
+    shot: dict[str, Any],
+    *,
+    index: int,
+) -> tuple[str, list[tuple[Path, str]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    action = str(shot.get("action") or ("generate" if previous_image is None and index == 1 else "edit")).strip().lower()
+    if action not in {"generate", "edit"}:
+        action = "generate" if previous_image is None and index == 1 else "edit"
+    if previous_image is not None or index > 1:
+        action = "edit"
+    requested_reference_candidates = resolve_selected_candidates(
+        seed_candidates,
+        shot.get("reference_image_ids") if isinstance(shot.get("reference_image_ids"), list) else [],
+        shot.get("reference_image_refs") if isinstance(shot.get("reference_image_refs"), list) else [],
+        fallback_to_all=bool(seed_candidates),
+    )
+    user_target_candidates = explicit_edit_target_candidates(seed_candidates)
+    target_candidates = resolve_selected_candidates(
+        seed_candidates,
+        shot.get("edit_target_image_ids") if isinstance(shot.get("edit_target_image_ids"), list) else [],
+        shot.get("edit_target_image_refs") if isinstance(shot.get("edit_target_image_refs"), list) else [],
+    )
+    if not target_candidates and previous_image is None and action == "edit" and user_target_candidates:
+        target_candidates = list(user_target_candidates)
+    if not target_candidates and previous_image is None and user_target_candidates:
+        target_candidates = list(user_target_candidates)
+    if previous_image is None and target_candidates:
+        action = "edit"
+    if previous_image is None and index == 1 and action == "edit" and not target_candidates:
+        if len(requested_reference_candidates) == 1:
+            target_candidates = list(requested_reference_candidates)
+        elif not requested_reference_candidates and len(seed_candidates) == 1:
+            target_candidates = list(seed_candidates)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"镜头 {index} 需要直接修改参考图，但当前无法唯一确定要改哪一张。",
+                    "suggestion": "请为该镜头明确指定 edit_target_image_refs，或只保留一张直接修改目标图。",
+                },
+            )
+    merged_references = merge_candidate_lists(
+        target_candidates if previous_image is None and action == "edit" else [],
+        requested_reference_candidates,
+    )
+    target_keys = {candidate_identity(item) for item in target_candidates}
+    auxiliary_reference_candidates = [
+        item
+        for item in merged_references
+        if candidate_identity(item) not in target_keys
+    ]
+    uploads, notes = build_storyboard_generation_inputs(
+        previous_image,
+        auxiliary_reference_candidates if action == "edit" else merged_references,
+        action=action,
+        edit_target_candidates=target_candidates,
+    )
+    return action, uploads, notes, merged_references, target_candidates
 
 
 def load_seed_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1755,6 +2161,7 @@ def load_seed_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any
         if not path.exists():
             continue
         role = normalize_reference_role(item.get("role"), index)
+        selection_mode = normalize_reference_selection_mode(item.get("selection_mode"), default="reference")
         candidates.append(
             {
                 "ref": item.get("ref") or f"seed:{index}",
@@ -1768,6 +2175,8 @@ def load_seed_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any
                 "hint": item.get("hint") or "",
                 "role": role,
                 "role_label": reference_role_label(role),
+                "selection_mode": selection_mode,
+                "selection_mode_label": reference_selection_mode_label(selection_mode),
             }
         )
     return candidates
@@ -1862,7 +2271,8 @@ def build_responses_input(
     input_image_notes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
-    if input_fidelity and input_fidelity != "auto":
+    has_edit_inputs = bool(uploaded or mask)
+    if has_edit_inputs and input_fidelity and input_fidelity != "auto":
         if input_fidelity == "high":
             content.append(
                 {
@@ -2652,6 +3062,127 @@ def access_logout():
     return response
 
 
+def normalize_access_user_password(value: str) -> str:
+    normalized = normalize_access_password(value)
+    if not ACCESS_PASSWORD_PATTERN.fullmatch(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "访问密码必须是 8-32 位字母或数字。",
+                "suggestion": "请使用不含空格、符号或中文字符的字母数字组合。",
+            },
+        )
+    return normalized
+
+
+def access_user_items() -> list[dict[str, Any]]:
+    refresh_access_password_cache()
+    registry = load_access_user_registry()
+    managed = {item["password"]: item for item in registry["users"]}
+    items: list[dict[str, Any]] = []
+    for password in ACCESS_PASSWORDS:
+        scope = access_storage_scope(password)
+        managed_item = managed.get(password, {})
+        items.append(
+            {
+                "password": password,
+                "storage_scope": scope,
+                "is_admin": password == DEFAULT_ACCESS_PASSWORD,
+                "is_builtin": password in BASE_ACCESS_PASSWORDS,
+                "is_managed": password in managed,
+                "editable": password != DEFAULT_ACCESS_PASSWORD,
+                "deletable": password != DEFAULT_ACCESS_PASSWORD,
+                "created_at": managed_item.get("created_at"),
+                "updated_at": managed_item.get("updated_at"),
+            }
+        )
+    return items
+
+
+def ensure_access_user_exists(password: str) -> None:
+    refresh_access_password_cache()
+    if password not in ACCESS_PASSWORDS:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+
+def write_access_user_change(*, old_password: str | None = None, new_password: str | None = None, delete: bool = False) -> None:
+    registry = load_access_user_registry()
+    users_by_password = {item["password"]: item for item in registry["users"]}
+    disabled = set(registry["disabled_passwords"])
+    stamp = db.now_iso()
+    if old_password:
+        if old_password == DEFAULT_ACCESS_PASSWORD:
+            raise HTTPException(status_code=400, detail="主账号 hhs54666 不能修改或删除")
+        if old_password in BASE_ACCESS_PASSWORDS:
+            disabled.add(old_password)
+        users_by_password.pop(old_password, None)
+    if new_password and not delete:
+        users_by_password[new_password] = {
+            "password": new_password,
+            "created_at": users_by_password.get(new_password, {}).get("created_at") or stamp,
+            "updated_at": stamp,
+        }
+        disabled.discard(new_password)
+        ensure_dirs(access_storage_scope(new_password))
+    payload = {
+        "users": sorted(users_by_password.values(), key=lambda item: item["password"]),
+        "disabled_passwords": sorted(value for value in disabled if value != DEFAULT_ACCESS_PASSWORD),
+    }
+    save_access_user_registry(payload)
+    refresh_access_password_cache()
+
+
+@app.get("/api/access-users/me")
+def get_current_access_user(request: Request) -> dict[str, Any]:
+    password = request_access_password(request) or ""
+    return {
+        "password": password,
+        "storage_scope": access_storage_scope(password) if password else "",
+        "is_admin": password == DEFAULT_ACCESS_PASSWORD,
+    }
+
+
+@app.get("/api/access-users")
+def list_access_users(request: Request) -> dict[str, Any]:
+    require_access_user_admin(request)
+    return {"items": access_user_items()}
+
+
+@app.post("/api/access-users")
+def create_access_user(request: Request, payload: AccessUserRequest) -> dict[str, Any]:
+    require_access_user_admin(request)
+    password = normalize_access_user_password(payload.password)
+    refresh_access_password_cache()
+    if password in ACCESS_PASSWORDS:
+        raise HTTPException(status_code=409, detail="该用户已存在")
+    write_access_user_change(new_password=password)
+    return {"items": access_user_items()}
+
+
+@app.put("/api/access-users/{password}")
+def update_access_user(password: str, request: Request, payload: AccessUserRequest) -> dict[str, Any]:
+    require_access_user_admin(request)
+    old_password = normalize_access_user_password(password)
+    new_password = normalize_access_user_password(payload.password)
+    ensure_access_user_exists(old_password)
+    if old_password == new_password:
+        return {"items": access_user_items()}
+    refresh_access_password_cache()
+    if new_password in ACCESS_PASSWORDS:
+        raise HTTPException(status_code=409, detail="新密码对应用户已存在")
+    write_access_user_change(old_password=old_password, new_password=new_password)
+    return {"items": access_user_items()}
+
+
+@app.delete("/api/access-users/{password}")
+def delete_access_user(password: str, request: Request) -> dict[str, Any]:
+    require_access_user_admin(request)
+    old_password = normalize_access_user_password(password)
+    ensure_access_user_exists(old_password)
+    write_access_user_change(old_password=old_password, delete=True)
+    return {"items": access_user_items()}
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -2671,16 +3202,17 @@ def get_settings() -> dict[str, str]:
 @app.put("/api/settings")
 def put_settings(config: ClientConfig) -> dict[str, str]:
     stamp = db.now_iso()
+    api_key = validate_api_key_text(config.api_key, field_label="默认 API Key") if config.api_key is not None else None
     with db.connect() as conn:
         if config.base_url is not None:
             conn.execute(
                 "insert or replace into settings (key, value, updated_at) values (?, ?, ?)",
                 ("base_url", config.base_url, stamp),
             )
-        if config.api_key is not None:
+        if api_key is not None:
             conn.execute(
                 "insert or replace into settings (key, value, updated_at) values (?, ?, ?)",
-                ("api_key", config.api_key, stamp),
+                ("api_key", api_key, stamp),
             )
     return get_settings()
 
@@ -2737,13 +3269,14 @@ def list_providers() -> dict[str, Any]:
 @app.post("/api/providers")
 def create_provider(request: ProviderRequest) -> dict[str, Any]:
     stamp = db.now_iso()
+    api_key = validate_api_key_text(request.api_key, field_label="提供商 API Key")
     with db.connect() as conn:
         cursor = conn.execute(
             """
             insert into providers (name, base_url, api_key, created_at, updated_at)
             values (?, ?, ?, ?, ?)
             """,
-            (request.name.strip(), request.base_url.strip(), request.api_key.strip(), stamp, stamp),
+            (request.name.strip(), request.base_url.strip(), api_key, stamp, stamp),
         )
         provider_id = int(cursor.lastrowid)
         row = conn.execute("select * from providers where id = ?", (provider_id,)).fetchone()
@@ -2752,6 +3285,7 @@ def create_provider(request: ProviderRequest) -> dict[str, Any]:
 
 @app.put("/api/providers/{provider_id}")
 def update_provider(provider_id: int, request: ProviderRequest) -> dict[str, Any]:
+    api_key = validate_api_key_text(request.api_key, field_label="提供商 API Key")
     with db.connect() as conn:
         cursor = conn.execute(
             """
@@ -2759,7 +3293,7 @@ def update_provider(provider_id: int, request: ProviderRequest) -> dict[str, Any
             set name = ?, base_url = ?, api_key = ?, updated_at = ?
             where id = ?
             """,
-            (request.name.strip(), request.base_url.strip(), request.api_key.strip(), db.now_iso(), provider_id),
+            (request.name.strip(), request.base_url.strip(), api_key, db.now_iso(), provider_id),
         )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="provider not found")
@@ -2983,6 +3517,10 @@ async def edit_image(
     prompt = str(params.get("prompt") or "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
+    if not images:
+        raise HTTPException(status_code=400, detail="images is required")
+    upload_selection_modes = normalize_edit_upload_selection_modes(params.get("upload_selection_modes"), len(images))
+    params["upload_selection_modes"] = upload_selection_modes
     db.add_prompt(prompt, source="auto", mode="edit")
 
     saved_images = [await save_upload(upload) for upload in images]
@@ -3025,6 +3563,7 @@ async def edit_image(
             "input_fidelity": params.get("input_fidelity", "auto"),
             "action": "edit",
             "partial_images": params.get("partial_images"),
+            "upload_selection_modes": upload_selection_modes,
             "conversation_id": conversation_id,
         }
     )
@@ -3062,6 +3601,10 @@ async def run_edit_task(
         count = clamp_image_count(params.get("n", 1))
         provider_attempts: list[dict[str, Any]] = []
         last_provider: dict[str, Any] | None = None
+        edit_inputs, input_image_notes, reference_candidates, target_candidates = build_edit_input_bundle(
+            saved_images,
+            params.get("upload_selection_modes") if isinstance(params.get("upload_selection_modes"), list) else None,
+        )
         for index in range(count):
             response, provider, attempt_log = await execute_with_provider_failover(
                 task_id,
@@ -3078,9 +3621,10 @@ async def run_edit_task(
                     action="edit",
                     partial_images=params.get("partial_images"),
                     config=client_config,
-                    uploaded=saved_images,
+                    uploaded=edit_inputs,
                     mask=saved_mask,
                     input_fidelity=str(params.get("input_fidelity", "auto")),
+                    input_image_notes=input_image_notes,
                     on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
                     on_stream_event=lambda event: handle_image_stream_event(task_id, event),
                 ),
@@ -3130,6 +3674,9 @@ async def run_edit_task(
             "tool": "image_generation",
             "image_provider": {"id": last_provider["id"], "name": last_provider["name"]} if last_provider else None,
             "provider_attempts": provider_attempts,
+            "selected_reference_image_refs": candidate_refs(reference_candidates),
+            "edit_target_image_refs": candidate_refs(target_candidates),
+            "input_image_notes": input_image_notes,
             "responses": responses,
             "images": saved_output_images,
         }
@@ -3524,10 +4071,11 @@ async def storyboard_message(
         for item in selected_reference_images
     ]
     image_candidates = [
-        *build_uploaded_image_candidates(uploaded, params.upload_reference_roles),
+        *build_uploaded_image_candidates(uploaded, params.upload_reference_roles, params.upload_selection_modes),
         *build_selected_image_candidates(
             selected_reference_images,
             params.reference_image_roles,
+            params.reference_image_selection_modes,
             start_order=len(uploaded) + 1,
         ),
     ]
@@ -3562,7 +4110,9 @@ async def storyboard_message(
                         "uploads": [str(path) for path, _ in uploaded],
                         "reference_image_ids": [item["id"] for item in selected_reference_images],
                         "reference_image_roles": params.reference_image_roles,
+                        "reference_image_selection_modes": params.reference_image_selection_modes,
                         "upload_reference_roles": params.upload_reference_roles,
+                        "upload_selection_modes": params.upload_selection_modes,
                         "context_limit": context_limit,
                         "mode": "storyboard",
                     }
@@ -3597,7 +4147,9 @@ async def storyboard_message(
             "shot_limit": params.shot_limit,
             "reference_image_ids": [item["id"] for item in selected_reference_images],
             "reference_image_roles": params.reference_image_roles,
+            "reference_image_selection_modes": params.reference_image_selection_modes,
             "upload_reference_roles": params.upload_reference_roles,
+            "upload_selection_modes": params.upload_selection_modes,
             "seed_images": serialize_seed_images(image_candidates),
             "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
@@ -3794,8 +4346,17 @@ async def run_storyboard_task(
                 ]
                 if str(part or "").strip()
             )
-            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, image_candidates)
-            action = "edit" if edit_inputs else "generate"
+            action, edit_inputs, input_image_notes, shot_reference_candidates, shot_target_candidates = resolve_storyboard_shot_inputs(
+                previous_image,
+                image_candidates,
+                shot,
+                index=index,
+            )
+            shot["action"] = action
+            shot["used_reference_image_refs"] = candidate_refs(shot_reference_candidates)
+            shot["used_reference_image_ids"] = candidate_ids(shot_reference_candidates)
+            shot["edit_target_image_refs"] = candidate_refs(shot_target_candidates)
+            shot["edit_target_image_ids"] = candidate_ids(shot_target_candidates)
             try:
                 response, provider, attempt_log = await execute_with_provider_failover(
                     task_id,
@@ -3979,6 +4540,7 @@ async def retry_task(task_id: int) -> dict[str, Any]:
                 input_images.append(item)
         if not input_images:
             raise HTTPException(status_code=400, detail="该编辑任务缺少可重试的原始输入图")
+        params["upload_selection_modes"] = normalize_edit_upload_selection_modes(params.get("upload_selection_modes"), len(input_images))
         retry_payload = compact_params({**params, "retry_of": task_id})
         retry_id = db.create_task(
             "edit",
@@ -4103,8 +4665,17 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
             update_storyboard_task_state(task_id, payload, storyboard)
             db.update_task(task_id, progress=min(25 + int((index - 1) / max(total, 1) * 65), 88), stage=f"准备重试镜头 {index}/{total}：{shot_name}")
             publish_task_snapshot(task_id)
-            edit_inputs, input_image_notes = build_storyboard_generation_inputs(previous_image, seed_candidates)
-            action = "edit" if edit_inputs else "generate"
+            action, edit_inputs, input_image_notes, shot_reference_candidates, shot_target_candidates = resolve_storyboard_shot_inputs(
+                previous_image,
+                seed_candidates,
+                shot,
+                index=index,
+            )
+            shot["action"] = action
+            shot["used_reference_image_refs"] = candidate_refs(shot_reference_candidates)
+            shot["used_reference_image_ids"] = candidate_ids(shot_reference_candidates)
+            shot["edit_target_image_refs"] = candidate_refs(shot_target_candidates)
+            shot["edit_target_image_ids"] = candidate_ids(shot_target_candidates)
             try:
                 if previous_image is None and index > 1:
                     raise HTTPException(
@@ -4266,10 +4837,11 @@ async def chat_message(
         for item in selected_reference_images
     ]
     image_candidates = [
-        *build_uploaded_image_candidates(uploaded, params.upload_reference_roles),
+        *build_uploaded_image_candidates(uploaded, params.upload_reference_roles, params.upload_selection_modes),
         *build_selected_image_candidates(
             selected_reference_images,
             params.reference_image_roles,
+            params.reference_image_selection_modes,
             start_order=len(uploaded) + 1,
         ),
     ]
@@ -4304,7 +4876,9 @@ async def chat_message(
                         "uploads": [str(path) for path, _ in uploaded],
                         "reference_image_ids": [item["id"] for item in selected_reference_images],
                         "reference_image_roles": params.reference_image_roles,
+                        "reference_image_selection_modes": params.reference_image_selection_modes,
                         "upload_reference_roles": params.upload_reference_roles,
+                        "upload_selection_modes": params.upload_selection_modes,
                         "context_limit": context_limit,
                     }
                 ),
@@ -4333,11 +4907,14 @@ async def chat_message(
             "output_compression": params.output_compression,
             "moderation": params.moderation,
             "action": params.action,
+            "input_fidelity": params.input_fidelity,
             "partial_images": params.partial_images,
             "context_limit": context_limit,
             "reference_image_ids": [item["id"] for item in selected_reference_images],
             "reference_image_roles": params.reference_image_roles,
+            "reference_image_selection_modes": params.reference_image_selection_modes,
             "upload_reference_roles": params.upload_reference_roles,
+            "upload_selection_modes": params.upload_selection_modes,
             "seed_images": serialize_seed_images(image_candidates),
             "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
@@ -4439,14 +5016,22 @@ async def run_chat_task(
         )
         planner_text = extract_text_from_responses(planner_response)
         plan = parse_planner_json(planner_text)
-        reference_uploads = [
-            (item["path"], item.get("mime_type") or "image/png")
-            for item in image_candidates
-        ]
-        if plan["should_generate"] and plan["action"] == "edit" and not reference_uploads:
-            plan["should_generate"] = False
-            plan["reply"] = "我需要你先上传或选择要修改的参考图。最多可以选择 3 张，然后我再按你的意见编辑。"
-            plan["reason"] = "planner requested edit but user did not provide selected reference images"
+        requested_reference_candidates = resolve_selected_candidates(
+            image_candidates,
+            plan["reference_image_ids"],
+            plan["reference_image_refs"],
+            fallback_to_all=bool(image_candidates) and plan["action"] != "edit",
+        )
+        user_target_candidates = explicit_edit_target_candidates(image_candidates)
+        target_candidates = resolve_selected_candidates(
+            image_candidates,
+            plan["edit_target_image_ids"],
+            plan["edit_target_image_refs"],
+        )
+        if not target_candidates and plan["action"] == "edit" and user_target_candidates:
+            target_candidates = list(user_target_candidates)
+        if not target_candidates and user_target_candidates and params.action != "generate":
+            target_candidates = list(user_target_candidates)
         planner_response_id = planner_response.get("id")
         db.update_task(
             task_id,
@@ -4494,12 +5079,64 @@ async def run_chat_task(
 
         image_prompt = plan["image_prompt"] or params.prompt
         action = plan["action"] if plan["action"] in {"generate", "edit", "auto"} else params.action
-        if reference_uploads:
+        if target_candidates:
             action = "edit"
-        edit_inputs = reference_uploads
-        input_image_notes = [build_reference_input_note(item, index) for index, item in enumerate(image_candidates, start=1)]
-        raw_for_meta["selected_reference_image_refs"] = [item.get("ref") for item in image_candidates]
-        raw_for_meta["selected_reference_image_ids"] = [item.get("id") for item in image_candidates if item.get("id")]
+        if action == "auto":
+            if target_candidates:
+                action = "edit"
+            elif params.action == "edit" and image_candidates:
+                action = "edit"
+            else:
+                action = "generate"
+        if action == "edit":
+            if not target_candidates:
+                if len(requested_reference_candidates) == 1:
+                    target_candidates = list(requested_reference_candidates)
+                elif not requested_reference_candidates and len(image_candidates) == 1:
+                    target_candidates = list(image_candidates)
+                else:
+                    plan["should_generate"] = False
+                    plan["reply"] = "我已经知道你想继续改图，但当前无法安全判断要直接修改哪一张。请明确勾选要改的那几张图；如果其余图片只是风格或角色参考，请保留它们为辅助参考。"
+                    plan["reason"] = "edit requested without unambiguous direct edit targets"
+            if not plan["should_generate"]:
+                db.update_task(task_id, progress=36, stage="需要你确认具体要修改的图片")
+                update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
+                update_message_meta(assistant_message_id, {**raw_for_meta, "plan": plan, "planner_status": "done"}, planner_response_id)
+                publish_task_event(
+                    task_id,
+                    "assistant_reply",
+                    {"message_id": assistant_message_id, "content": plan["reply"] or "我理解了。"},
+                    snapshot=True,
+                )
+                db.finish_task(
+                    task_id,
+                    {
+                        "user_message_id": user_message_id,
+                        "assistant_message_id": assistant_message_id,
+                        "text": plan["reply"],
+                        "images": [],
+                        "fallback": False,
+                        "raw": {**raw_for_meta, "plan": plan},
+                    },
+                )
+                return
+        used_reference_candidates = merge_candidate_lists(
+            target_candidates if action == "edit" else [],
+            requested_reference_candidates,
+        )
+        auxiliary_reference_candidates = [
+            item
+            for item in used_reference_candidates
+            if candidate_identity(item) not in {candidate_identity(target) for target in target_candidates}
+        ]
+        edit_inputs, input_image_notes = build_candidate_input_bundle(
+            target_candidates if action == "edit" else [],
+            auxiliary_reference_candidates if action == "edit" else used_reference_candidates,
+        )
+        raw_for_meta["selected_reference_image_refs"] = candidate_refs(used_reference_candidates)
+        raw_for_meta["selected_reference_image_ids"] = candidate_ids(used_reference_candidates)
+        raw_for_meta["edit_target_image_refs"] = candidate_refs(target_candidates)
+        raw_for_meta["edit_target_image_ids"] = candidate_ids(target_candidates)
         raw_for_meta["resolved_action"] = action
         raw_for_meta["tool"] = "image_generation"
         image_name = normalize_image_title(plan.get("image_name") or "")
