@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import {
   BookOpen,
   Bot,
@@ -38,7 +39,12 @@ import projectLogo from "./assets/project-logo.svg";
 
 const API = "";
 const ACCESS_LOGIN_PATH = "/auth/login";
-const APP_SETTINGS_VERSION = 6;
+const APP_SETTINGS_VERSION = 7;
+const LIVE_POLL_INTERVAL_MS = 6000;
+const SSE_BACKUP_POLL_INTERVAL_MS = 15000;
+const IDLE_POLL_INTERVAL_MS = 15000;
+const GALLERY_GROUP_LIMIT = 40;
+const GALLERY_PREVIEW_LIMIT = 6;
 
 const defaultConfig = {
   base_url: "https://api.asxs.top/v1",
@@ -144,6 +150,12 @@ const defaults = {
   context_limit: 10,
   shot_limit: 20,
   image_title: "",
+  style_lock_id: "",
+  character_profile_ids: [],
+  schedule_at: "",
+  schedule_spacing_seconds: 0,
+  batch_label: "",
+  variant_plan_text: "",
 };
 
 const SETTING_HELP = {
@@ -175,6 +187,16 @@ const SETTING_HELP = {
   imageTitle: "作用：为本次生成或编辑的结果指定图片名称。\n建议：需要归档或下载时填写明确中文名；不填则系统按时间和会话标题自动命名。",
   historyTitle: "作用：修改当前历史会话的标题，便于后续在历史和图库中检索。\n建议：写成能概括主题或人物的短标题，避免只写“测试”“1”。",
   historyContextLimit: "作用：修改当前会话后续继续对话时允许带入的上下文条数。\n建议：越大越完整，但也更容易把旧内容带回；只在确实需要更长上下文时提高。",
+  groupConsistency: "作用：集中管理角色档案和风格锁定，让普通生图、改图、对话和分镜都能复用同一组长期约束。\n建议：角色档案写稳定的人物设定，风格锁定写构图、色调和材质等不变量，避免把一次性灵感写进这里。",
+  groupBatch: "作用：控制生成/编辑任务的定时执行、批量排期和多变体编排。\n建议：先把基础提示词跑通，再用批量变体扩展不同风格或参数；需要夜间自动跑图时再打开定时。",
+  styleLock: "作用：给当前任务套用一套固定的主体、构图、色调和材质约束。\n建议：当你在做系列海报、同角色连续图、同品牌视觉时开启；不需要长期一致性时留空即可。",
+  characterProfiles: "作用：为当前任务绑定一个或多个角色档案，让后端在规划和实际生图时持续注入人物设定。\n建议：只勾选真正要出现在本轮画面里的角色，避免一次绑定过多人物导致画面拥挤。",
+  scheduleAt: "作用：设置这一批任务的起跑时间；留空则立即进入当前任务编排。\n建议：需要夜间挂机跑图或错峰避开线路高峰时再填写。",
+  scheduleSpacing: "作用：控制同一批任务之间的额外时间间隔，单位是秒。\n建议：同会话串行任务可以设 0；如果想让每个变体隔几分钟再跑，再提高这个值。",
+  batchLabel: "作用：给这一批排期或变体任务起一个统一标签，方便在历史里识别。\n建议：写成“角色海报第一轮”“冷暖色对比测试”这类短标签。",
+  variantPlanText: "作用：按行定义批量变体。格式：名称 | 附加提示词 | quality=high | size=2560x1440 | n=1 | delay=60。\n建议：至少写名称和附加提示词；参数可选，留空时默认继承当前表单设置。",
+  styleLockEditor: "作用：维护可复用的风格锁模板。\n建议：把“人物不变、低机位、青灰冷调、电影颗粒”这类长期约束写进去。",
+  characterProfileEditor: "作用：维护角色档案，供后续对话和分镜直接调用。\n建议：把脸部特征、服装、年龄、标志物写清楚，越稳定越容易保持一致。",
 };
 
 function persistableForm(form) {
@@ -206,6 +228,13 @@ function normalizeFormSettings(settings) {
   if (!Number.isFinite(shotLimit) || shotLimit < 1 || shotLimit > 100) {
     next.shot_limit = defaults.shot_limit;
   }
+  next.style_lock_id = String(next.style_lock_id || "");
+  next.character_profile_ids = Array.isArray(next.character_profile_ids) ? next.character_profile_ids.map((item) => String(item)) : [];
+  next.schedule_at = String(next.schedule_at || "");
+  next.batch_label = String(next.batch_label || "");
+  next.variant_plan_text = String(next.variant_plan_text || "");
+  const spacing = Number(next.schedule_spacing_seconds);
+  next.schedule_spacing_seconds = Number.isFinite(spacing) && spacing >= 0 ? spacing : 0;
   return next;
 }
 
@@ -233,6 +262,17 @@ function continueLabel(mode) {
   return { chat: "继续对话", storyboard: "继续分镜", generate: "继续生图", edit: "继续编辑" }[mode] || "继续";
 }
 
+function canRetryTask(task) {
+  return ["generate", "edit", "storyboard", "chat"].includes(task?.mode) && ["failed", "canceled"].includes(task?.status);
+}
+
+function retryTaskLabel(task, variant = "default") {
+  if (task?.checkpoint?.can_resume) {
+    return variant === "detail" ? "按当前进度继续" : "继续任务";
+  }
+  return variant === "detail" ? "重试当前任务" : "重试任务";
+}
+
 function taskProviderName(task) {
   return (
     task?.image_provider_name ||
@@ -240,6 +280,58 @@ function taskProviderName(task) {
     task?.response?.image_provider?.name ||
     ""
   );
+}
+
+function storyboardStateForTask(task) {
+  const paramsStoryboard = task?.params?.storyboard;
+  if (paramsStoryboard && typeof paramsStoryboard === "object") return paramsStoryboard;
+  const responseStoryboard = task?.response?.raw?.storyboard || task?.response?.storyboard;
+  if (responseStoryboard && typeof responseStoryboard === "object") return responseStoryboard;
+  return null;
+}
+
+function storyboardHasContent(storyboard) {
+  return !!(
+    storyboard &&
+    typeof storyboard === "object" &&
+    (storyboard.character_summary || storyboard.scene_summary || (Array.isArray(storyboard.shots) && storyboard.shots.length > 0))
+  );
+}
+
+function mergeStoryboardShotMeta(meta, shot) {
+  if (!shot || typeof shot !== "object") return meta || {};
+  const currentMeta = meta || {};
+  const storyboard = currentMeta.storyboard && typeof currentMeta.storyboard === "object" ? currentMeta.storyboard : {};
+  const shots = Array.isArray(storyboard.shots) ? storyboard.shots : [];
+  if (!shots.length) return currentMeta;
+  const nextShots = shots.map((item, index) => {
+    const sameOrder = item?.order && shot.order && Number(item.order) === Number(shot.order);
+    const sameName = item?.name && shot.name && String(item.name) === String(shot.name);
+    const sameIndex = !item?.order && !shot.order && index + 1 === Number(shot.index || 0);
+    return sameOrder || sameName || sameIndex ? { ...item, ...shot } : item;
+  });
+  return { ...currentMeta, storyboard: { ...storyboard, shots: nextShots } };
+}
+
+function mergeStoryboardTaskIntoMessage(message, task) {
+  const storyboard = storyboardStateForTask(task);
+  if (!storyboardHasContent(storyboard)) return message;
+  const taskImages = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
+  return {
+    ...message,
+    meta: { ...(message.meta || {}), storyboard },
+    images: uniqueImages([...(message.images || []), ...taskImages]),
+  };
+}
+
+function providerAttemptsForTask(task) {
+  const attempts =
+    task?.response?.raw?.provider_attempts ||
+    task?.response?.provider_attempts ||
+    task?.error_detail?.provider_attempts ||
+    task?.error_detail?.detail?.provider_attempts ||
+    [];
+  return Array.isArray(attempts) ? attempts : [];
 }
 
 function providerAvailabilityLabel(provider) {
@@ -296,12 +388,51 @@ function uploadFileRoleKey(file) {
 
 function statusLabel(status) {
   return {
+    scheduled: "待执行",
     queued: "排队中",
     running: "运行中",
     done: "已完成",
     failed: "失败",
     canceled: "已停止",
   }[status] || status;
+}
+
+function parseVariantPlanText(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const variants = [];
+  for (const line of lines) {
+    const parts = line.split("|").map((part) => part.trim()).filter(Boolean);
+    if (!parts.length) continue;
+    const [name, promptSuffix = "", ...tokens] = parts;
+    const item = { name, prompt_suffix: promptSuffix };
+    for (const token of tokens) {
+      const [rawKey, ...rest] = token.split("=");
+      const key = String(rawKey || "").trim().toLowerCase();
+      const value = rest.join("=").trim();
+      if (!key || !value) continue;
+      if (["quality", "size", "background", "output_format"].includes(key)) {
+        item[key] = value;
+      } else if (["output_compression", "n", "delay", "delay_seconds"].includes(key)) {
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) {
+          if (key === "delay") item.delay_seconds = numeric;
+          else item[key] = numeric;
+        }
+      } else if (key === "image_title") {
+        item.image_title = value;
+      }
+    }
+    variants.push(item);
+  }
+  return variants;
+}
+
+function variantSummary(text) {
+  const count = parseVariantPlanText(text).length;
+  return count > 0 ? `${count} 个批量变体` : "未配置批量变体";
 }
 
 function App() {
@@ -320,16 +451,42 @@ function App() {
     ...defaults,
     prompt: "",
   }));
-  const [controlsOpen, setControlsOpen] = useState(false);
   const [openGroups, setOpenGroups] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [galleryHistory, setGalleryHistory] = useState([]);
+  const [downloadDraft, setDownloadDraft] = useState({ folderName: "图片批量下载", tag: "", favorite: "" });
   const [prompts, setPrompts] = useState([]);
   const [promptDraft, setPromptDraft] = useState("");
   const [promptDraftMode, setPromptDraftMode] = useState("");
   const [promptFilter, setPromptFilter] = useState({ q: "", mode: "", favorite: false });
   const [editingPromptId, setEditingPromptId] = useState(null);
+  const [styleLocks, setStyleLocks] = useState([]);
+  const [styleLockDraft, setStyleLockDraft] = useState({
+    name: "",
+    subject_lock: "",
+    composition_lock: "",
+    color_tone_lock: "",
+    lighting_lock: "",
+    texture_lock: "",
+    negative_lock: "",
+    notes: "",
+  });
+  const [editingStyleLockId, setEditingStyleLockId] = useState(null);
+  const [characterProfiles, setCharacterProfiles] = useState([]);
+  const [characterProfileDraft, setCharacterProfileDraft] = useState({
+    name: "",
+    age: "",
+    gender: "",
+    appearance: "",
+    wardrobe: "",
+    personality: "",
+    voice_style: "",
+    signature_items: "",
+    extra_prompt: "",
+    notes: "",
+  });
+  const [editingCharacterProfileId, setEditingCharacterProfileId] = useState(null);
   const [promptCopyId, setPromptCopyId] = useState(null);
   const [refreshFeedback, setRefreshFeedback] = useState({});
   const [sectionSaveFeedback, setSectionSaveFeedback] = useState({});
@@ -411,12 +568,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const liveCount = tasks.filter((task) => ["scheduled", "queued", "running"].includes(task.status)).length;
+    const hasActiveSse = taskEventSourcesRef.current.size > 0;
+    const interval = liveCount > 0
+      ? hasActiveSse ? SSE_BACKUP_POLL_INTERVAL_MS : LIVE_POLL_INTERVAL_MS
+      : IDLE_POLL_INTERVAL_MS;
     const timer = setInterval(() => {
       refreshTasks();
+      if (!liveCount && activeViewRef.current !== "history") return;
       refreshHistory();
-    }, 1800);
+    }, interval);
     return () => clearInterval(timer);
-  }, [selectedTask?.id, conversation?.id, activeView]);
+  }, [tasks, selectedTask?.id, conversation?.id, activeView]);
 
   useEffect(() => {
     const liveTaskIds = new Set(tasks.filter((task) => ["queued", "running"].includes(task.status)).map((task) => Number(task.id)));
@@ -452,11 +615,15 @@ function App() {
     }
   }, [messages, loading]);
 
+  const trackedTasks = tasks.filter((task) => ["scheduled", "queued", "running"].includes(task.status));
   const runningTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
   const atTaskLimit = runningTasks.length >= (taskMeta.max_concurrent || 3);
   const activeConversationMode = resolveConversationMode(conversation);
   const activePlannerProvider = ["chat", "storyboard"].includes(form.mode) ? providerForPlannerMode(form.mode) : null;
   const imageProviderPoolMeta = taskMeta.image_provider_pool || { total_providers: 0, used_providers: 0, idle_providers: 0, available_providers: 0, unavailable_providers: 0, limit_per_provider: 3, total_capacity: 3, providers: [] };
+  const selectedStyleLock = styleLocks.find((item) => String(item.id) === String(form.style_lock_id)) || null;
+  const selectedCharacterIds = new Set((form.character_profile_ids || []).map((item) => String(item)));
+  const selectedCharacterProfiles = characterProfiles.filter((item) => selectedCharacterIds.has(String(item.id)));
   const chatGeneratedImages = useMemo(() => uniqueImages(
     messages.flatMap((msg) => msg.images || [])
   ), [messages]);
@@ -479,9 +646,18 @@ function App() {
       conversationLoadSeqRef.current += 1;
     }
     setActiveView(view);
-    if (window.innerWidth <= 760) {
-      setControlsOpen(false);
-    }
+  }
+
+  function toggleCharacterProfileSelection(profileId) {
+    setForm((current) => {
+      const currentIds = Array.isArray(current.character_profile_ids) ? current.character_profile_ids.map((item) => String(item)) : [];
+      const targetId = String(profileId);
+      const exists = currentIds.includes(targetId);
+      return {
+        ...current,
+        character_profile_ids: exists ? currentIds.filter((id) => id !== targetId) : [...currentIds, targetId],
+      };
+    });
   }
 
   function providerForPlannerMode(mode) {
@@ -633,9 +809,10 @@ function App() {
     setEditMask(null);
   }
 
-  function updateEditUploads(files) {
+  async function updateEditUploads(files) {
+    const compressed = await compressUploadBatch(files, { maxEdge: 2048, quality: 0.9 });
     setEditImages((items) => {
-      const next = mergeSelectedFiles(items, files);
+      const next = mergeSelectedFiles(items, compressed);
       setEditImageSelectionModes((current) => normalizeEditSelectionModes(next, current));
       return next;
     });
@@ -654,9 +831,9 @@ function App() {
     setEditImageSelectionModes((current) => ({ ...current, [key]: mode }));
   }
 
-  function updateChatUploads(files) {
+  async function updateChatUploads(files) {
     const room = Math.max(0, 3 - chatReferenceImages.length);
-    const trimmed = files.slice(0, room);
+    const trimmed = await compressUploadBatch(files.slice(0, room), { maxEdge: 1600, quality: 0.82 });
     setChatImages(trimmed);
     setChatUploadRoles((current) => normalizeUploadRoles(trimmed, current));
     setChatUploadSelectionModes((current) => normalizeUploadSelectionModes(trimmed, current));
@@ -821,6 +998,12 @@ function App() {
       moderation: form.moderation,
       action: "generate",
       partial_images: Number(form.partial_images),
+      style_lock_id: form.style_lock_id ? Number(form.style_lock_id) : null,
+      character_profile_ids: (form.character_profile_ids || []).map((item) => Number(item)).filter(Boolean),
+      schedule_at: form.schedule_at || null,
+      schedule_spacing_seconds: Number(form.schedule_spacing_seconds || 0),
+      batch_label: form.batch_label.trim(),
+      variant_plan: parseVariantPlanText(form.variant_plan_text),
       config: runConfig,
     };
     const res = await fetch(`${API}/api/images/generate`, {
@@ -829,15 +1012,22 @@ function App() {
       body: JSON.stringify(body),
     });
     const data = await parse(res);
-    if (data.user_message_id) {
-      setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: data.user_message_id } : item)));
+    const returnedTasks = data.tasks || (data.task ? [data.task] : []);
+    const firstUserMessageId = data.user_message_id || (data.user_message_ids || [])[0];
+    if (firstUserMessageId) {
+      setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: firstUserMessageId } : item)));
     }
-    mergeTask(data.task);
+    returnedTasks.forEach((task) => {
+      mergeTask(task);
+      if (["queued", "running"].includes(task?.status)) {
+        startTaskEventStream(task.id, active.id);
+      }
+    });
     await refreshTasks();
     await refreshHistory();
     await refreshPrompts();
     await loadConversation(active.id, { openStudio: true, autoRefresh: true });
-    return data.task;
+    return returnedTasks[0] || null;
   }
 
   async function runEdit() {
@@ -885,6 +1075,12 @@ function App() {
       input_fidelity: form.input_fidelity,
       partial_images: Number(form.partial_images),
       upload_selection_modes: uploadSelectionModes,
+      style_lock_id: form.style_lock_id ? Number(form.style_lock_id) : null,
+      character_profile_ids: (form.character_profile_ids || []).map((item) => Number(item)).filter(Boolean),
+      schedule_at: form.schedule_at || null,
+      schedule_spacing_seconds: Number(form.schedule_spacing_seconds || 0),
+      batch_label: form.batch_label.trim(),
+      variant_plan: parseVariantPlanText(form.variant_plan_text),
       config: runConfig,
     };
     data.append("params_json", JSON.stringify(params));
@@ -892,15 +1088,22 @@ function App() {
     if (editMask) data.append("mask", editMask);
     const res = await fetch(`${API}/api/images/edit`, { method: "POST", body: data });
     const result = await parse(res);
-    if (result.user_message_id) {
-      setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: result.user_message_id } : item)));
+    const returnedTasks = result.tasks || (result.task ? [result.task] : []);
+    const firstUserMessageId = result.user_message_id || (result.user_message_ids || [])[0];
+    if (firstUserMessageId) {
+      setMessages((items) => items.map((item) => (item.id === localUser.id ? { ...item, id: firstUserMessageId } : item)));
     }
-    mergeTask(result.task);
+    returnedTasks.forEach((task) => {
+      mergeTask(task);
+      if (["queued", "running"].includes(task?.status)) {
+        startTaskEventStream(task.id, active.id);
+      }
+    });
     await refreshTasks();
     await refreshHistory();
     await refreshPrompts();
     await loadConversation(active.id, { openStudio: true, autoRefresh: true });
-    return result.task;
+    return returnedTasks[0] || null;
   }
 
   async function runChat() {
@@ -938,6 +1141,8 @@ function App() {
       reference_image_selection_modes: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceSelectionModeFor(image, index)])),
       upload_reference_roles: chatImages.map((file, index) => uploadRoleFor(file, index)),
       upload_selection_modes: chatImages.map((file, index) => uploadSelectionModeFor(file, index)),
+      style_lock_id: form.style_lock_id ? Number(form.style_lock_id) : null,
+      character_profile_ids: (form.character_profile_ids || []).map((item) => Number(item)).filter(Boolean),
       config: runConfig,
       planner_config: plannerConfigForMode("chat"),
     };
@@ -995,6 +1200,8 @@ function App() {
       reference_image_selection_modes: Object.fromEntries(chatReferenceImages.map((image, index) => [String(image.id), selectedReferenceSelectionModeFor(image, index)])),
       upload_reference_roles: chatImages.map((file, index) => uploadRoleFor(file, index)),
       upload_selection_modes: chatImages.map((file, index) => uploadSelectionModeFor(file, index)),
+      style_lock_id: form.style_lock_id ? Number(form.style_lock_id) : null,
+      character_profile_ids: (form.character_profile_ids || []).map((item) => Number(item)).filter(Boolean),
       config: runConfig,
       planner_config: plannerConfigForMode("storyboard"),
     };
@@ -1083,6 +1290,157 @@ function App() {
     }
   }
 
+  async function refreshStyleLocks() {
+    const res = await fetch(`${API}/api/style-locks`);
+    const data = await parse(res);
+    setStyleLocks(data.items || []);
+    return data.items || [];
+  }
+
+  async function saveStyleLock() {
+    try {
+      if (!styleLockDraft.name.trim()) {
+        setError(describeError({ detail: { message: "风格锁名称不能为空" } }));
+        setSettingsFeedback("consistency", "failed", "保存风格锁失败");
+        return;
+      }
+      const url = editingStyleLockId ? `${API}/api/style-locks/${editingStyleLockId}` : `${API}/api/style-locks`;
+      const res = await fetch(url, {
+        method: editingStyleLockId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(styleLockDraft),
+      });
+      await parse(res);
+      await refreshStyleLocks();
+      setStyleLockDraft({
+        name: "",
+        subject_lock: "",
+        composition_lock: "",
+        color_tone_lock: "",
+        lighting_lock: "",
+        texture_lock: "",
+        negative_lock: "",
+        notes: "",
+      });
+      setEditingStyleLockId(null);
+      setSettingsFeedback("consistency", "success", editingStyleLockId ? "风格锁已修改" : "风格锁已新建");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("consistency", "failed", "保存风格锁失败");
+    }
+  }
+
+  function editStyleLock(item) {
+    setEditingStyleLockId(item.id);
+    setStyleLockDraft({
+      name: item.name || "",
+      subject_lock: item.subject_lock || "",
+      composition_lock: item.composition_lock || "",
+      color_tone_lock: item.color_tone_lock || "",
+      lighting_lock: item.lighting_lock || "",
+      texture_lock: item.texture_lock || "",
+      negative_lock: item.negative_lock || "",
+      notes: item.notes || "",
+    });
+  }
+
+  async function deleteStyleLock(item) {
+    if (!window.confirm(`确认删除风格锁“${item.name}”吗？`)) return;
+    try {
+      const res = await fetch(`${API}/api/style-locks/${item.id}`, { method: "DELETE" });
+      await parse(res);
+      if (String(form.style_lock_id) === String(item.id)) {
+        setForm((current) => ({ ...current, style_lock_id: "" }));
+      }
+      if (editingStyleLockId === item.id) {
+        setEditingStyleLockId(null);
+      }
+      await refreshStyleLocks();
+      setSettingsFeedback("consistency", "success", "风格锁已删除");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("consistency", "failed", "删除风格锁失败");
+    }
+  }
+
+  async function refreshCharacterProfiles() {
+    const res = await fetch(`${API}/api/character-profiles`);
+    const data = await parse(res);
+    setCharacterProfiles(data.items || []);
+    return data.items || [];
+  }
+
+  async function saveCharacterProfile() {
+    try {
+      if (!characterProfileDraft.name.trim()) {
+        setError(describeError({ detail: { message: "角色档案名称不能为空" } }));
+        setSettingsFeedback("consistency", "failed", "保存角色档案失败");
+        return;
+      }
+      const url = editingCharacterProfileId ? `${API}/api/character-profiles/${editingCharacterProfileId}` : `${API}/api/character-profiles`;
+      const res = await fetch(url, {
+        method: editingCharacterProfileId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(characterProfileDraft),
+      });
+      await parse(res);
+      await refreshCharacterProfiles();
+      setCharacterProfileDraft({
+        name: "",
+        age: "",
+        gender: "",
+        appearance: "",
+        wardrobe: "",
+        personality: "",
+        voice_style: "",
+        signature_items: "",
+        extra_prompt: "",
+        notes: "",
+      });
+      setEditingCharacterProfileId(null);
+      setSettingsFeedback("consistency", "success", editingCharacterProfileId ? "角色档案已修改" : "角色档案已新建");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("consistency", "failed", "保存角色档案失败");
+    }
+  }
+
+  function editCharacterProfile(item) {
+    setEditingCharacterProfileId(item.id);
+    setCharacterProfileDraft({
+      name: item.name || "",
+      age: item.age || "",
+      gender: item.gender || "",
+      appearance: item.appearance || "",
+      wardrobe: item.wardrobe || "",
+      personality: item.personality || "",
+      voice_style: item.voice_style || "",
+      signature_items: item.signature_items || "",
+      extra_prompt: item.extra_prompt || "",
+      notes: item.notes || "",
+    });
+  }
+
+  async function deleteCharacterProfile(item) {
+    if (!window.confirm(`确认删除角色档案“${item.name}”吗？`)) return;
+    try {
+      const res = await fetch(`${API}/api/character-profiles/${item.id}`, { method: "DELETE" });
+      await parse(res);
+      setForm((current) => ({
+        ...current,
+        character_profile_ids: (current.character_profile_ids || []).filter((id) => String(id) !== String(item.id)),
+      }));
+      if (editingCharacterProfileId === item.id) {
+        setEditingCharacterProfileId(null);
+      }
+      await refreshCharacterProfiles();
+      setSettingsFeedback("consistency", "success", "角色档案已删除");
+    } catch (err) {
+      setError(describeError(err));
+      setSettingsFeedback("consistency", "failed", "删除角色档案失败");
+    }
+  }
+
   async function loadAppSettings() {
     try {
       const res = await fetch(`${API}/api/app-settings`);
@@ -1133,6 +1491,8 @@ function App() {
       setConfig(defaultConfig);
     }
     await loadAppSettings();
+    await refreshStyleLocks().catch(() => {});
+    await refreshCharacterProfiles().catch(() => {});
   }
 
   async function saveAppSettings(options = {}) {
@@ -1162,8 +1522,8 @@ function App() {
 
   function mergeTask(task) {
     if (!task) return;
-    setTasks((items) => [task, ...items.filter((item) => item.id !== task.id)]);
-    setSelectedTask((current) => (current && Number(current.id) === Number(task.id) ? { ...current, ...task } : current));
+    setTasks((items) => [mergeTaskData(items.find((item) => item.id === task.id), task), ...items.filter((item) => item.id !== task.id)]);
+    setSelectedTask((current) => (current && Number(current.id) === Number(task.id) ? mergeTaskData(current, task) : current));
   }
 
   function closeTaskEventSource(taskId) {
@@ -1236,12 +1596,23 @@ function App() {
     }));
   }
 
-  function appendStreamingMessageImage(messageId, image, conversationId) {
+  function syncStoryboardTaskMessage(task) {
+    if (!task || task.mode !== "storyboard" || !task.assistant_message_id || Number(conversationRef.current?.id) !== Number(task.conversation_id)) return;
+    setMessages((items) => items.map((item) => (
+      Number(item.id) === Number(task.assistant_message_id) ? mergeStoryboardTaskIntoMessage(item, task) : item
+    )));
+  }
+
+  function appendStreamingMessageImage(messageId, image, conversationId, shot = null) {
     if (!image || Number(conversationRef.current?.id) !== Number(conversationId)) return;
     const normalizedImage = normalizeImageForClient(image);
     setMessages((items) => items.map((item) => {
       if (Number(item.id) !== Number(messageId)) return item;
-      return { ...item, images: uniqueImages([...(item.images || []), normalizedImage]) };
+      return {
+        ...item,
+        meta: mergeStoryboardShotMeta(item.meta, shot),
+        images: uniqueImages([...(item.images || []), normalizedImage]),
+      };
     }));
   }
 
@@ -1294,18 +1665,25 @@ function App() {
     });
     source.addEventListener("task_update", (event) => {
       const data = parseEventData(event);
-      if (data.task) mergeTask(data.task);
+      if (data.task) {
+        mergeTask(data.task);
+        syncStoryboardTaskMessage(data.task);
+      }
     });
     source.addEventListener("storyboard_image", (event) => {
       const data = parseEventData(event);
-      appendStreamingMessageImage(data.message_id, data.image, data.conversation_id);
+      appendStreamingMessageImage(data.message_id, data.image, data.conversation_id, data.shot);
     });
     for (const eventName of ["done", "failed", "canceled"]) {
       source.addEventListener(eventName, async () => {
         closeTaskEventStream(normalizedTaskId);
         await refreshTasks();
         await refreshHistory();
+        await refreshGallery();
         await refreshPrompts();
+        if (normalizedConversationId && Number(conversationRef.current?.id) === Number(normalizedConversationId)) {
+          await loadConversation(normalizedConversationId, { openStudio: true, autoRefresh: true });
+        }
       });
     }
     source.onerror = () => {
@@ -1324,7 +1702,7 @@ function App() {
         return previous && previous !== task.status && ["done", "failed", "canceled"].includes(task.status);
       });
       taskStatusRef.current = Object.fromEntries(items.map((task) => [task.id, task.status]));
-      setTasks(items);
+      setTasks((current) => items.map((task) => mergeTaskData(current.find((item) => item.id === task.id), task)));
       setTaskMeta((current) => ({
         ...current,
         active_count: data.active_count || 0,
@@ -1334,16 +1712,25 @@ function App() {
       const currentSelectedTask = selectedTaskRef.current;
       if (currentSelectedTask) {
         const latestSelected = items.find((task) => task.id === currentSelectedTask.id);
-        if (latestSelected) setSelectedTask(latestSelected);
+        if (latestSelected) setSelectedTask((current) => mergeTaskData(current, latestSelected));
       }
       const currentConversation = conversationRef.current;
       const canRefreshCurrentConversation = activeViewRef.current === "studio" && isSessionMode(formModeRef.current) && currentConversation;
       const activeConversationTask = canRefreshCurrentConversation && items.some(
-        (task) => isSessionMode(task.mode) && task.conversation_id === currentConversation.id && ["queued", "running", "done"].includes(task.status)
+        (task) => isSessionMode(task.mode) && task.conversation_id === currentConversation.id && ["queued", "running"].includes(task.status)
       );
-      if (completedNow || activeConversationTask) {
+      const liveConversationTaskIds = canRefreshCurrentConversation
+        ? items
+          .filter((task) => isSessionMode(task.mode) && task.conversation_id === currentConversation.id && ["queued", "running"].includes(task.status))
+          .map((task) => Number(task.id))
+        : [];
+      const hasConversationSse = liveConversationTaskIds.some((taskId) => taskEventSourcesRef.current.has(taskId));
+      if (completedNow) {
         refreshGallery();
-        if (activeConversationTask) loadConversation(currentConversation.id, { openStudio: true, autoRefresh: true });
+        refreshHistory();
+        if (currentConversation) loadConversation(currentConversation.id, { openStudio: true, autoRefresh: true });
+      } else if (activeConversationTask && !hasConversationSse) {
+        loadConversation(currentConversation.id, { openStudio: true, autoRefresh: true });
       }
     } catch (err) {
       setError(describeError(err));
@@ -1361,6 +1748,7 @@ function App() {
 
   async function retryTask(taskId) {
     await saveAppSettings({ throwError: true });
+    closeTaskEventStream(taskId);
     const res = await fetch(`${API}/api/tasks/${taskId}/retry`, { method: "POST" });
     const data = await parse(res);
     mergeTask(data.task);
@@ -1604,12 +1992,84 @@ function App() {
 
   async function refreshGallery(options = {}) {
     try {
-      const res = await fetch(`${API}/api/gallery`);
+      const params = new URLSearchParams({
+        group_limit: String(GALLERY_GROUP_LIMIT),
+        preview_limit: String(GALLERY_PREVIEW_LIMIT),
+      });
+      const res = await fetch(`${API}/api/gallery?${params.toString()}`);
       const data = await parse(res);
       setGalleryHistory(data.items || []);
     } catch (err) {
       setError(describeError(err));
       if (options.throwError) throw err;
+    }
+  }
+
+  async function loadGalleryGroupDetail(group) {
+    if (!group || group.detail_loaded || group.loading_detail) return;
+    const params = new URLSearchParams({ preview_limit: String(GALLERY_PREVIEW_LIMIT) });
+    if (group.conversation_id) params.set("conversation_id", String(group.conversation_id));
+    if (group.task_id) params.set("task_id", String(group.task_id));
+    setGalleryHistory((items) => items.map((item) => (
+      item.key === group.key ? { ...item, loading_detail: true } : item
+    )));
+    try {
+      const res = await fetch(`${API}/api/gallery/group?${params.toString()}`);
+      const data = await parse(res);
+      if (!data.group) return;
+      setGalleryHistory((items) => items.map((item) => (
+        item.key === group.key ? { ...item, ...data.group, loading_detail: false } : item
+      )));
+    } catch (err) {
+      setGalleryHistory((items) => items.map((item) => (
+        item.key === group.key ? { ...item, loading_detail: false } : item
+      )));
+      setError(describeError(err));
+    }
+  }
+
+  function replaceImageRecord(image) {
+    const normalized = { ...image, ...normalizeImageUrlFields(image) };
+    const sameImage = (item) => Number(item?.id) === Number(normalized.id);
+    const replaceList = (list = []) => list.map((item) => (sameImage(item) ? { ...item, ...normalized } : item));
+    setGalleryHistory((groups) => groups.map((group) => ({
+      ...group,
+      preview_items: replaceList(group.preview_items || []),
+      items: replaceList(group.items || []),
+    })));
+    setMessages((items) => items.map((message) => ({
+      ...message,
+      images: replaceList(message.images || []),
+      uploaded_images: replaceList(message.uploaded_images || []),
+    })));
+    setSelectedTask((task) => task ? { ...task, images: replaceList(task.images || []) } : task);
+    setTasks((items) => items.map((task) => task.images ? { ...task, images: replaceList(task.images) } : task));
+  }
+
+  async function saveImageMetadata(image, patch) {
+    const res = await fetch(`${API}/api/images/${image.id}/metadata`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    const data = await parse(res);
+    if (data.image) replaceImageRecord(data.image);
+    return data.image;
+  }
+
+  async function toggleImageFavorite(image) {
+    try {
+      await saveImageMetadata(image, { favorite: image.favorite ? 0 : 1 });
+    } catch (err) {
+      setError(describeError(err));
+    }
+  }
+
+  async function saveImageTags(image, tags) {
+    try {
+      await saveImageMetadata(image, { tags });
+    } catch (err) {
+      setError(describeError(err));
     }
   }
 
@@ -1726,24 +2186,17 @@ function App() {
     const imagesByMessage = new Map();
     for (const image of data.images || []) {
       const list = imagesByMessage.get(image.message_id) || [];
-      list.push({
-        id: image.id,
-        url: image.public_url,
-        mime_type: image.mime_type,
-        conversation_id: image.conversation_id,
-        message_id: image.message_id,
-        file_path: image.file_path,
-        filename: image.file_path?.split(/[\\/]/).pop() || "generated-image.png",
-        title: image.title,
-        bucket: image.bucket,
-        source: image.source,
-        prompt_text: image.prompt_text,
-      });
+      list.push(normalizeImageForClient(image));
       imagesByMessage.set(image.message_id, list);
     }
+    const liveStoryboardTasks = tasksRef.current.filter((task) => (
+      task.mode === "storyboard" &&
+      Number(task.conversation_id) === Number(data.conversation.id) &&
+      ["queued", "running"].includes(task.status)
+    ));
     const hydrated = (data.messages || []).map((msg) => {
       const meta = parseJsonObject(msg.meta_json);
-      return {
+      const message = {
         ...msg,
         meta,
         image_error_detail: meta.image_error || null,
@@ -1751,11 +2204,12 @@ function App() {
         image_prompt: meta.image_prompt || "",
         images: imagesByMessage.get(msg.id) || [],
         uploaded_images: (msg.uploaded_images || []).map((image) => ({
-          ...image,
-          url: image.public_url || image.url,
+          ...normalizeImageForClient(image),
           filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "uploaded-image.png",
         })),
       };
+      const liveTask = liveStoryboardTasks.find((task) => Number(task.assistant_message_id) === Number(msg.id));
+      return liveTask ? mergeStoryboardTaskIntoMessage(message, liveTask) : message;
     });
     setSelectedHistory({ ...data, messages: hydrated });
     setSelectedTask(null);
@@ -1826,10 +2280,18 @@ function App() {
   }
 
   async function historyImageToFile(image) {
-    const response = await fetch(image.public_url || image.url);
+    const response = await fetch(imageOriginalUrl(image));
     const blob = await response.blob();
     const filename = imageDownloadName(image);
     return new File([blob], filename, { type: image.mime_type || blob.type || "image/png" });
+  }
+
+  function attachHistoryImageKey(file, image) {
+    if (!(file instanceof File) || !image) return file;
+    const key = imageReferenceKey(image);
+    if (key) file.sourceImageKey = key;
+    file.sourceImageLabel = imageSourceLabel(image);
+    return file;
   }
 
   async function toggleEditReferenceImage(image) {
@@ -1844,9 +2306,7 @@ function App() {
       return;
     }
     try {
-      const file = await historyImageToFile(image);
-      file.sourceImageKey = key;
-      file.sourceImageLabel = imageSourceLabel(image);
+      const file = attachHistoryImageKey(await historyImageToFile(image), image);
       setEditImages((items) => {
         const next = [...items, file];
         setEditImageSelectionModes((current) => normalizeEditSelectionModes(next, current));
@@ -1888,9 +2348,16 @@ function App() {
       clearEditInputs();
     } else {
       const file = await historyImageToFile(image);
+      const [preparedFile] = await compressUploadBatch(
+        [file],
+        targetMode === "edit"
+          ? { maxEdge: 2048, quality: 0.9 }
+          : { maxEdge: 1600, quality: 0.82 },
+      );
+      const nextFile = attachHistoryImageKey(preparedFile || file, image);
       if (targetMode === "edit") {
-        setEditImages([file]);
-        setEditImageSelectionModes({ [uploadFileRoleKey(file, 0)]: "edit_target" });
+        setEditImages([nextFile]);
+        setEditImageSelectionModes({ [uploadFileRoleKey(nextFile, 0)]: "edit_target" });
         setEditMask(null);
         setChatImages([]);
         setChatUploadRoles({});
@@ -1899,9 +2366,9 @@ function App() {
         setChatReferenceRoles({});
         setChatReferenceSelectionModes({});
       } else {
-        setChatImages([file]);
-        setChatUploadRoles({ [uploadFileRoleKey(file, 0)]: "character" });
-        setChatUploadSelectionModes({ [uploadFileRoleKey(file, 0)]: "edit_target" });
+        setChatImages([nextFile]);
+        setChatUploadRoles({ [uploadFileRoleKey(nextFile, 0)]: "character" });
+        setChatUploadSelectionModes({ [uploadFileRoleKey(nextFile, 0)]: "edit_target" });
         setChatReferenceImages([]);
         setChatReferenceRoles({});
         setChatReferenceSelectionModes({});
@@ -1918,7 +2385,7 @@ function App() {
   }
 
   async function downloadImage(image) {
-    const response = await fetch(image.public_url || image.url);
+    const response = await fetch(imageOriginalUrl(image));
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -1928,6 +2395,40 @@ function App() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+  }
+
+  async function downloadImageBatch(filters = {}) {
+    const params = new URLSearchParams();
+    const folderName = sanitizeDownloadFolderName(filters.folderName || downloadDraft.folderName || "图片批量下载");
+    params.set("folder_name", folderName);
+    if (filters.conversation_id) params.set("conversation_id", String(filters.conversation_id));
+    if (filters.task_id) params.set("task_id", String(filters.task_id));
+    if (filters.tag) params.set("tag", String(filters.tag));
+    if (filters.favorite !== "" && filters.favorite !== undefined && filters.favorite !== null) {
+      params.set("favorite", String(filters.favorite));
+    }
+    if (filters.mode) params.set("mode", String(filters.mode));
+    const response = await fetch(`${API}/api/images/download?${params.toString()}`);
+    if (!response.ok) {
+      throw await response.json().catch(() => ({ detail: { message: "批量下载失败" } }));
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${folderName}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runBatchDownload(filters = {}) {
+    try {
+      await downloadImageBatch(filters);
+    } catch (err) {
+      setError(describeError(err));
+    }
   }
 
   function toggleGroup(name) {
@@ -1941,6 +2442,395 @@ function App() {
     return { icon: MessageCircle, title: "对话生图" };
   }, [form.mode]);
   const ModeIcon = modeMeta.icon;
+
+  function ModeRunSettings() {
+    return (
+      <section className="modeRunSettings">
+        <div className="modeRunSettingsHead">
+          <div>
+            <strong>{modeLabel(form.mode)}参数</strong>
+            <small>当前模式专属设置只作用于本工作台，不再放进通用设置页。</small>
+          </div>
+          <button className="ghostButton compact" type="button" onClick={() => saveSettingsSection("modeWorkspace", "当前模式设置已保存")}>
+            <Check size={15} /> 保存当前模式设置
+          </button>
+        </div>
+        {sectionSaveFeedback.modeWorkspace?.message && (
+          <div className={`settingsSaveNotice ${sectionSaveFeedback.modeWorkspace.state || "idle"}`}>{sectionSaveFeedback.modeWorkspace.message}</div>
+        )}
+        <div className="modeRunGrid">
+          <div className="modeRunBlock">
+            <strong>模型</strong>
+            {["chat", "storyboard"].includes(form.mode) && (
+              <>
+                <Field label="规划模型" help={SETTING_HELP.plannerModel}>
+                  <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} placeholder="例如 qwen-plus / deepseek-chat / gpt-5.4" />
+                </Field>
+                <Select label="规划接口格式" help={SETTING_HELP.plannerEndpoint} value={form.plannerEndpoint} onChange={(v) => setForm({ ...form, plannerEndpoint: v })} options={plannerEndpointOptions} />
+              </>
+            )}
+            <Select label="Responses 模型" help={SETTING_HELP.responsesModel} value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
+            <Select label="图片工具模型" help={SETTING_HELP.imageToolModel} value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
+          </div>
+          <div className="modeRunBlock">
+            <strong>图片参数</strong>
+            <Select label="画面比例" help={SETTING_HELP.size} value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={sizeOptions} />
+            <Select label="分辨率" help={SETTING_HELP.quality} value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={qualityOptions} />
+            <Select label="背景" help={SETTING_HELP.background} value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={backgroundOptions} />
+            <Select label="格式" help={SETTING_HELP.format} value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={formatOptions} />
+            {!["chat", "storyboard"].includes(form.mode) && (
+              <Field label="数量" help={SETTING_HELP.imageCount}>
+                <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
+              </Field>
+            )}
+          </div>
+          <div className="modeRunBlock">
+            <strong>一致性控制</strong>
+            <Select
+              label="风格锁"
+              help={SETTING_HELP.styleLock}
+              value={form.style_lock_id}
+              onChange={(v) => setForm({ ...form, style_lock_id: v })}
+              options={[{ value: "", label: "不使用风格锁" }, ...styleLocks.map((item) => ({ value: String(item.id), label: item.name }))]}
+            />
+            <Field label="角色档案" help={SETTING_HELP.characterProfiles}>
+              <div className="selectionChipGrid compact">
+                {characterProfiles.length ? characterProfiles.map((item) => {
+                  const active = selectedCharacterIds.has(String(item.id));
+                  return (
+                    <button key={item.id} type="button" className={`selectionChip ${active ? "active" : ""}`} onClick={() => toggleCharacterProfileSelection(item.id)}>
+                      <strong>{item.name}</strong>
+                      <small>{item.age || item.appearance || "点击绑定"}</small>
+                    </button>
+                  );
+                }) : <small className="mutedHint">先到通用设置里新建角色档案。</small>}
+              </div>
+            </Field>
+          </div>
+          <div className="modeRunBlock">
+            <strong>高级</strong>
+            {form.mode === "chat" && <Select label="动作" help={SETTING_HELP.action} value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={actionOptions} />}
+            {["chat", "storyboard", "edit"].includes(form.mode) && <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />}
+            {["chat", "storyboard", "edit"].includes(form.mode) && <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />}
+            {["chat", "storyboard"].includes(form.mode) && (
+              <Field label="上下文条数" help={SETTING_HELP.contextLimit}>
+                <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
+              </Field>
+            )}
+            {form.mode === "storyboard" && (
+              <Field label="最多镜头" help={SETTING_HELP.shotLimit}>
+                <input type="number" min="1" max="100" value={form.shot_limit} onChange={(e) => setForm({ ...form, shot_limit: e.target.value })} />
+              </Field>
+            )}
+            {["generate", "edit"].includes(form.mode) && (
+              <Field label="图片名称" help={SETTING_HELP.imageTitle}>
+                <input value={form.image_title} onChange={(e) => setForm({ ...form, image_title: e.target.value })} placeholder="可选，不填则自动命名" />
+              </Field>
+            )}
+            <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
+              <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
+            </Field>
+            <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
+          </div>
+          {["generate", "edit"].includes(form.mode) && (
+            <div className="modeRunBlock wide">
+              <strong>批量编排</strong>
+              <div className="modeRunInline">
+                <Field label="起跑时间" help={SETTING_HELP.scheduleAt}>
+                  <input type="datetime-local" value={form.schedule_at} onChange={(e) => setForm({ ...form, schedule_at: e.target.value })} />
+                </Field>
+                <Field label="批量标签" help={SETTING_HELP.batchLabel}>
+                  <input value={form.batch_label} onChange={(e) => setForm({ ...form, batch_label: e.target.value })} placeholder="例如 角色海报第一轮" />
+                </Field>
+                <Field label="批间隔（秒）" help={SETTING_HELP.scheduleSpacing}>
+                  <input type="number" min="0" max="86400" value={form.schedule_spacing_seconds} onChange={(e) => setForm({ ...form, schedule_spacing_seconds: e.target.value })} />
+                </Field>
+              </div>
+              <Field label="批量变体" help={SETTING_HELP.variantPlanText}>
+                <textarea value={form.variant_plan_text} onChange={(e) => setForm({ ...form, variant_plan_text: e.target.value })} placeholder={"冷调海报 | 青灰冷调，电影海报 | quality=high | size=2560x1440\n暖色插画 | 金橙暖调，柔和插画笔触 | n=2 | delay=60"} />
+              </Field>
+            </div>
+          )}
+        </div>
+      </section>
+    );
+  }
+
+  function SettingsPage() {
+    return (
+      <div className="settingsPage">
+        <div className="settingsPageIntro">
+          <p><SlidersHorizontal size={18} /> 独立设置页</p>
+          <h3>通用设置</h3>
+          <small>这里仅保留提供商、访问用户和可复用资源管理；不同模式的模型、图片参数、批量编排和一致性选择已移动到对应工作台。</small>
+        </div>
+        <div className="settingsPageBody">
+          <div className="settingsPageShell">
+            <SettingsGroup
+              title="提供商管理"
+              help={SETTING_HELP.groupProviders}
+              summary={`生图池 ${imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length} 个 / 已用 ${imageProviderPoolMeta.used_providers || 0} / 空闲 ${imageProviderPoolMeta.idle_providers || 0} / 不可用 ${imageProviderPoolMeta.unavailable_providers || 0}${activePlannerProvider ? ` / 当前规划：${activePlannerProvider.name}` : ""}`}
+              open={!!openGroups.providers}
+              onToggle={() => toggleGroup("providers")}
+            >
+              <div className="providerModeGrid">
+                <Select
+                  className="fieldCompact"
+                  label="对话规划"
+                  help={SETTING_HELP.plannerChatProvider}
+                  value={plannerProviders.chat}
+                  onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
+                  options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+                />
+                <Select
+                  className="fieldCompact"
+                  label="分镜规划"
+                  help={SETTING_HELP.plannerStoryboardProvider}
+                  value={plannerProviders.storyboard}
+                  onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
+                  options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
+                />
+              </div>
+              <div className="providerPoolStats">
+                <span>池中总数 {imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length}</span>
+                <span>已使用 {imageProviderPoolMeta.used_providers || 0}</span>
+                <span>可用 {imageProviderPoolMeta.available_providers || 0}</span>
+                <span>空闲 {imageProviderPoolMeta.idle_providers || 0}</span>
+                <span>不可用 {imageProviderPoolMeta.unavailable_providers || 0}</span>
+                <span>单提供商上限 {imageProviderPoolMeta.limit_per_provider || 3}</span>
+              </div>
+
+              <div className="providerEditor">
+                <div className="providerEditorGrid">
+                  <Field className="fieldCompact" label="提供商名称" help={SETTING_HELP.providerName}>
+                    <input value={providerDraft.name} onChange={(e) => setProviderDraft({ ...providerDraft, name: e.target.value })} placeholder="例如 asxs / OpenAI / 备用线路" />
+                  </Field>
+                  <Field className="fieldCompact" label="接口地址" help={SETTING_HELP.providerBaseUrl}>
+                    <input value={providerDraft.base_url} onChange={(e) => setProviderDraft({ ...providerDraft, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
+                  </Field>
+                  <Field className="fieldFull" label="密钥" help={SETTING_HELP.providerApiKey}>
+                    <input type="password" value={providerDraft.api_key} onChange={(e) => setProviderDraft({ ...providerDraft, api_key: e.target.value })} placeholder="sk-..." />
+                  </Field>
+                </div>
+                <div className="providerActions">
+                  <button className="secondaryButton" type="button" onClick={saveProvider}>
+                    <KeyRound size={16} />
+                    {editingProviderId ? "保存修改" : "新建提供商"}
+                  </button>
+                  {editingProviderId && (
+                    <button className="ghostButton" type="button" onClick={() => { setEditingProviderId(null); setProviderDraft({ name: "", base_url: "", api_key: "" }); }}>
+                      <X size={16} />
+                      取消
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="providerList">
+                {providers.map((provider) => (
+                  <article className="providerItem" key={provider.id}>
+                    <div>
+                      <label className="providerPoolToggle">
+                        <input
+                          type="checkbox"
+                          checked={imageProviderPool.includes(String(provider.id))}
+                          onChange={() => toggleImageProvider(provider.id)}
+                        />
+                        <span>加入生图池</span>
+                      </label>
+                      <strong>{provider.name}</strong>
+                      <small>{provider.base_url}</small>
+                      <small>当前任务 {provider.pool_assigned_tasks || 0} / 运行中 {provider.pool_running_tasks || 0} / 空闲槽位 {provider.pool_idle_slots ?? (imageProviderPoolMeta.limit_per_provider || 3)}</small>
+                      <small>{providerAvailabilityLabel(provider)}</small>
+                    </div>
+                    <div>
+                      <Tooltip text="编辑"><button type="button" onClick={() => editProvider(provider)} aria-label="编辑"><Edit3 size={15} /></button></Tooltip>
+                      <Tooltip text="删除"><button type="button" onClick={() => deleteProvider(provider.id)} aria-label="删除"><Trash2 size={15} /></button></Tooltip>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <SettingsSaveAction
+                feedback={sectionSaveFeedback.providers}
+                label="保存提供商选择"
+                onClick={() => saveSettingsSection("providers", "提供商选择已保存")}
+              />
+            </SettingsGroup>
+
+            {currentAccessUser?.is_admin && (
+              <SettingsGroup
+                title="用户管理"
+                help="仅主账号 hhs54666 可见。用于查看、新建、修改或删除访问密码账号；每个密码账号拥有独立数据空间。"
+                summary={`${accessUsers.length} 个访问用户`}
+                open={!!openGroups.accessUsers}
+                onToggle={() => {
+                  toggleGroup("accessUsers");
+                  if (!openGroups.accessUsers) refreshAccessUsers().catch((err) => setError(describeError(err)));
+                }}
+              >
+                <div className="providerEditor">
+                  <div className="providerEditorGrid">
+                    <Field className="fieldFull" label={editingAccessUser ? "修改访问密码" : "新建访问密码"} help="访问密码必须是 8-32 位字母或数字；主账号 hhs54666 不能修改或删除。">
+                      <input
+                        value={accessUserDraft.password}
+                        onChange={(e) => setAccessUserDraft({ password: e.target.value })}
+                        placeholder="例如 hhs666666"
+                        maxLength={32}
+                      />
+                    </Field>
+                  </div>
+                  <div className="providerActions">
+                    <button className="secondaryButton" type="button" onClick={saveAccessUser}>
+                      <KeyRound size={16} />
+                      {editingAccessUser ? "保存用户" : "新建用户"}
+                    </button>
+                    {editingAccessUser && (
+                      <button className="ghostButton" type="button" onClick={() => { setEditingAccessUser(null); setAccessUserDraft({ password: "" }); }}>
+                        <X size={16} />
+                        取消
+                      </button>
+                    )}
+                    <button className="ghostButton" type="button" onClick={() => refreshAccessUsers().catch((err) => setError(describeError(err)))}>
+                      <RefreshCw size={16} />
+                      刷新
+                    </button>
+                  </div>
+                </div>
+                <div className="providerList">
+                  {accessUsers.map((user) => (
+                    <article className="providerItem" key={user.password}>
+                      <div>
+                        <strong>{user.password}</strong>
+                        <small>{user.is_admin ? "主账号 / 管理员" : user.is_builtin ? "默认用户" : "自定义用户"}</small>
+                        <small>数据空间：{user.storage_scope || "默认数据空间"}</small>
+                      </div>
+                      <div>
+                        <Tooltip text="编辑"><button type="button" onClick={() => editAccessUser(user)} aria-label="编辑" disabled={!user.editable}><Edit3 size={15} /></button></Tooltip>
+                        <Tooltip text="删除"><button type="button" onClick={() => deleteAccessUser(user)} aria-label="删除" disabled={!user.deletable}><Trash2 size={15} /></button></Tooltip>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                <SettingsSaveAction
+                  feedback={sectionSaveFeedback.accessUsers}
+                  label="刷新用户列表"
+                  onClick={() => refreshAccessUsers().then(() => setSettingsFeedback("accessUsers", "success", "用户列表已刷新")).catch((err) => { setError(describeError(err)); setSettingsFeedback("accessUsers", "failed", "刷新失败"); })}
+                />
+              </SettingsGroup>
+            )}
+
+            <SettingsGroup
+              title="一致性资源库"
+              help={SETTING_HELP.groupConsistency}
+              summary={`${styleLocks.length} 个风格锁 / ${characterProfiles.length} 个角色档案`}
+              open={!!openGroups.consistency}
+              onToggle={() => toggleGroup("consistency")}
+            >
+              <div className="batchHintBox">
+                <strong>仅管理资源</strong>
+                <small>风格锁和角色档案在这里维护；每个模式是否使用、使用哪一组，请在当前模式工作台内选择。</small>
+              </div>
+
+                <div className="resourceEditorGrid">
+                <div className="resourceEditorCard">
+                  <div className="sectionTitle">
+                    <strong>风格锁模板</strong>
+                    <small>{SETTING_HELP.styleLockEditor}</small>
+                  </div>
+                  <Field label="名称">
+                    <input value={styleLockDraft.name} onChange={(e) => setStyleLockDraft({ ...styleLockDraft, name: e.target.value })} placeholder="例如 冷调电影海报" />
+                  </Field>
+                  <Field label="主体保持">
+                    <textarea value={styleLockDraft.subject_lock} onChange={(e) => setStyleLockDraft({ ...styleLockDraft, subject_lock: e.target.value })} placeholder="例如 始终保持同一人物五官、发型和身材比例" />
+                  </Field>
+                  <Field label="构图 / 色调">
+                    <textarea value={styleLockDraft.composition_lock} onChange={(e) => setStyleLockDraft({ ...styleLockDraft, composition_lock: e.target.value })} placeholder="例如 中近景、低机位、留出标题区" />
+                  </Field>
+                  <Field label="色调 / 光线">
+                    <textarea value={styleLockDraft.color_tone_lock} onChange={(e) => setStyleLockDraft({ ...styleLockDraft, color_tone_lock: e.target.value })} placeholder="例如 青灰冷调、边缘背光、对比度克制" />
+                  </Field>
+                  <div className="inlineButtonRow">
+                    <button className="secondaryButton" type="button" onClick={saveStyleLock}>{editingStyleLockId ? "保存风格锁" : "新建风格锁"}</button>
+                    {editingStyleLockId && <button className="ghostButton" type="button" onClick={() => { setEditingStyleLockId(null); setStyleLockDraft({ name: "", subject_lock: "", composition_lock: "", color_tone_lock: "", lighting_lock: "", texture_lock: "", negative_lock: "", notes: "" }); }}>取消</button>}
+                  </div>
+                  <div className="resourceList">
+                    {styleLocks.map((item) => (
+                      <article className="resourceListItem" key={item.id}>
+                        <div>
+                          <strong>{item.name}</strong>
+                          <small>{item.color_tone_lock || item.composition_lock || item.subject_lock || "暂无摘要"}</small>
+                        </div>
+                        <div>
+                          <Tooltip text="编辑"><button type="button" onClick={() => editStyleLock(item)} aria-label="编辑"><Edit3 size={15} /></button></Tooltip>
+                          <Tooltip text="删除"><button type="button" onClick={() => deleteStyleLock(item)} aria-label="删除"><Trash2 size={15} /></button></Tooltip>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="resourceEditorCard">
+                  <div className="sectionTitle">
+                    <strong>角色档案</strong>
+                    <small>{SETTING_HELP.characterProfileEditor}</small>
+                  </div>
+                  <Field label="角色名">
+                    <input value={characterProfileDraft.name} onChange={(e) => setCharacterProfileDraft({ ...characterProfileDraft, name: e.target.value })} placeholder="例如 白发女主" />
+                  </Field>
+                  <div className="providerEditorGrid">
+                    <Field className="fieldCompact" label="年龄">
+                      <input value={characterProfileDraft.age} onChange={(e) => setCharacterProfileDraft({ ...characterProfileDraft, age: e.target.value })} placeholder="例如 24 岁" />
+                    </Field>
+                    <Field className="fieldCompact" label="性别">
+                      <input value={characterProfileDraft.gender} onChange={(e) => setCharacterProfileDraft({ ...characterProfileDraft, gender: e.target.value })} placeholder="例如 女" />
+                    </Field>
+                  </div>
+                  <Field label="外观特征">
+                    <textarea value={characterProfileDraft.appearance} onChange={(e) => setCharacterProfileDraft({ ...characterProfileDraft, appearance: e.target.value })} placeholder="例如 白色长发、细长凤眼、左眼下有泪痣" />
+                  </Field>
+                  <Field label="服装 / 标志物">
+                    <textarea value={characterProfileDraft.wardrobe} onChange={(e) => setCharacterProfileDraft({ ...characterProfileDraft, wardrobe: e.target.value })} placeholder="例如 黑色长风衣、银色耳坠、旧相机" />
+                  </Field>
+                  <Field label="补充提示">
+                    <textarea value={characterProfileDraft.extra_prompt} onChange={(e) => setCharacterProfileDraft({ ...characterProfileDraft, extra_prompt: e.target.value })} placeholder="例如 气质克制、目光坚定，不要幼态化" />
+                  </Field>
+                  <div className="inlineButtonRow">
+                    <button className="secondaryButton" type="button" onClick={saveCharacterProfile}>{editingCharacterProfileId ? "保存角色档案" : "新建角色档案"}</button>
+                    {editingCharacterProfileId && <button className="ghostButton" type="button" onClick={() => { setEditingCharacterProfileId(null); setCharacterProfileDraft({ name: "", age: "", gender: "", appearance: "", wardrobe: "", personality: "", voice_style: "", signature_items: "", extra_prompt: "", notes: "" }); }}>取消</button>}
+                  </div>
+                  <div className="resourceList">
+                    {characterProfiles.map((item) => (
+                      <article className="resourceListItem" key={item.id}>
+                        <div>
+                          <strong>{item.name}</strong>
+                          <small>{item.appearance || item.wardrobe || item.extra_prompt || "暂无摘要"}</small>
+                        </div>
+                        <div>
+                          <Tooltip text="编辑"><button type="button" onClick={() => editCharacterProfile(item)} aria-label="编辑"><Edit3 size={15} /></button></Tooltip>
+                          <Tooltip text="删除"><button type="button" onClick={() => deleteCharacterProfile(item)} aria-label="删除"><Trash2 size={15} /></button></Tooltip>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <SettingsSaveAction
+                feedback={sectionSaveFeedback.consistency}
+                label="同步资源库"
+                onClick={() => Promise.all([refreshStyleLocks(), refreshCharacterProfiles()])
+                  .then(() => setSettingsFeedback("consistency", "success", "资源库已同步"))
+                  .catch((err) => {
+                    setError(describeError(err));
+                    setSettingsFeedback("consistency", "failed", "资源库同步失败");
+                  })}
+              />
+            </SettingsGroup>
+
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -1959,311 +2849,7 @@ function App() {
         </div>
       </header>
 
-      <section className={`workspace ${controlsOpen ? "withControls" : "withoutControls"}`}>
-        {controlsOpen && (
-        <aside className="controls" id="studio-controls">
-          <div className="modeSwitch">
-            {modeOptions.map(({ value, icon: Icon, label, help }) => (
-              <button
-                key={value}
-                className={form.mode === value ? "active" : ""}
-                onClick={() => {
-                  if (isSessionMode(value) && conversationRef.current && resolveConversationMode(conversationRef.current) !== value) {
-                    newChat(value);
-                    return;
-                  }
-                  if (value !== form.mode && (value === "edit" || form.mode === "edit")) {
-                    clearEditInputs();
-                  }
-                  setForm((f) => ({ ...f, mode: value }));
-                }}
-                title={help}
-                aria-label={`${label}：${help}`}
-              >
-                <Icon size={17} />
-                {label}
-              </button>
-            ))}
-          </div>
-
-          <SettingsGroup
-            title="提供商管理"
-            help={SETTING_HELP.groupProviders}
-            summary={`生图池 ${imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length} 个 / 已用 ${imageProviderPoolMeta.used_providers || 0} / 空闲 ${imageProviderPoolMeta.idle_providers || 0} / 不可用 ${imageProviderPoolMeta.unavailable_providers || 0}${activePlannerProvider ? ` / 当前规划：${activePlannerProvider.name}` : ""}`}
-            open={!!openGroups.providers}
-            onToggle={() => toggleGroup("providers")}
-          >
-            <div className="providerModeGrid">
-              <Select
-                className="fieldCompact"
-                label="对话规划"
-                help={SETTING_HELP.plannerChatProvider}
-                value={plannerProviders.chat}
-                onChange={(v) => setPlannerProviders({ ...plannerProviders, chat: v })}
-                options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-              />
-              <Select
-                className="fieldCompact"
-                label="分镜规划"
-                help={SETTING_HELP.plannerStoryboardProvider}
-                value={plannerProviders.storyboard}
-                onChange={(v) => setPlannerProviders({ ...plannerProviders, storyboard: v })}
-                options={providers.map((provider) => ({ value: String(provider.id), label: provider.name }))}
-              />
-            </div>
-            <div className="providerPoolStats">
-              <span>池中总数 {imageProviderPoolMeta.total_providers || imageProviderPool.length || providers.length}</span>
-              <span>已使用 {imageProviderPoolMeta.used_providers || 0}</span>
-              <span>可用 {imageProviderPoolMeta.available_providers || 0}</span>
-              <span>空闲 {imageProviderPoolMeta.idle_providers || 0}</span>
-              <span>不可用 {imageProviderPoolMeta.unavailable_providers || 0}</span>
-              <span>单提供商上限 {imageProviderPoolMeta.limit_per_provider || 3}</span>
-            </div>
-
-            <div className="providerEditor">
-              <div className="providerEditorGrid">
-              <Field className="fieldCompact" label="提供商名称" help={SETTING_HELP.providerName}>
-                <input value={providerDraft.name} onChange={(e) => setProviderDraft({ ...providerDraft, name: e.target.value })} placeholder="例如 asxs / OpenAI / 备用线路" />
-              </Field>
-              <Field className="fieldCompact" label="接口地址" help={SETTING_HELP.providerBaseUrl}>
-                <input value={providerDraft.base_url} onChange={(e) => setProviderDraft({ ...providerDraft, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
-              </Field>
-              <Field className="fieldFull" label="密钥" help={SETTING_HELP.providerApiKey}>
-                <input type="password" value={providerDraft.api_key} onChange={(e) => setProviderDraft({ ...providerDraft, api_key: e.target.value })} placeholder="sk-..." />
-              </Field>
-              </div>
-              <div className="providerActions">
-                <button className="secondaryButton" type="button" onClick={saveProvider}>
-                  <KeyRound size={16} />
-                  {editingProviderId ? "保存修改" : "新建提供商"}
-                </button>
-                {editingProviderId && (
-                  <button className="ghostButton" type="button" onClick={() => { setEditingProviderId(null); setProviderDraft({ name: "", base_url: "", api_key: "" }); }}>
-                    <X size={16} />
-                    取消
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <div className="providerList">
-              {providers.map((provider) => (
-                <article className="providerItem" key={provider.id}>
-                  <div>
-                    <label className="providerPoolToggle">
-                      <input
-                        type="checkbox"
-                        checked={imageProviderPool.includes(String(provider.id))}
-                        onChange={() => toggleImageProvider(provider.id)}
-                      />
-                      <span>加入生图池</span>
-                    </label>
-                    <strong>{provider.name}</strong>
-                    <small>{provider.base_url}</small>
-                    <small>当前任务 {provider.pool_assigned_tasks || 0} / 运行中 {provider.pool_running_tasks || 0} / 空闲槽位 {provider.pool_idle_slots ?? (imageProviderPoolMeta.limit_per_provider || 3)}</small>
-                    <small>{providerAvailabilityLabel(provider)}</small>
-                  </div>
-                  <div>
-                    <button type="button" onClick={() => editProvider(provider)} title="编辑"><Edit3 size={15} /></button>
-                    <button type="button" onClick={() => deleteProvider(provider.id)} title="删除"><Trash2 size={15} /></button>
-                  </div>
-                </article>
-              ))}
-            </div>
-            <SettingsSaveAction
-              feedback={sectionSaveFeedback.providers}
-              label="保存提供商选择"
-              onClick={() => saveSettingsSection("providers", "提供商选择已保存")}
-            />
-          </SettingsGroup>
-
-          {currentAccessUser?.is_admin && (
-            <SettingsGroup
-              title="用户管理"
-              help="仅主账号 hhs54666 可见。用于查看、新建、修改或删除访问密码账号；每个密码账号拥有独立数据空间。"
-              summary={`${accessUsers.length} 个访问用户`}
-              open={!!openGroups.accessUsers}
-              onToggle={() => {
-                toggleGroup("accessUsers");
-                if (!openGroups.accessUsers) refreshAccessUsers().catch((err) => setError(describeError(err)));
-              }}
-            >
-              <div className="providerEditor">
-                <div className="providerEditorGrid">
-                  <Field className="fieldFull" label={editingAccessUser ? "修改访问密码" : "新建访问密码"} help="访问密码必须是 8-32 位字母或数字；主账号 hhs54666 不能修改或删除。">
-                    <input
-                      value={accessUserDraft.password}
-                      onChange={(e) => setAccessUserDraft({ password: e.target.value })}
-                      placeholder="例如 hhs666666"
-                      maxLength={32}
-                    />
-                  </Field>
-                </div>
-                <div className="providerActions">
-                  <button className="secondaryButton" type="button" onClick={saveAccessUser}>
-                    <KeyRound size={16} />
-                    {editingAccessUser ? "保存用户" : "新建用户"}
-                  </button>
-                  {editingAccessUser && (
-                    <button className="ghostButton" type="button" onClick={() => { setEditingAccessUser(null); setAccessUserDraft({ password: "" }); }}>
-                      <X size={16} />
-                      取消
-                    </button>
-                  )}
-                  <button className="ghostButton" type="button" onClick={() => refreshAccessUsers().catch((err) => setError(describeError(err)))}>
-                    <RefreshCw size={16} />
-                    刷新
-                  </button>
-                </div>
-              </div>
-              <div className="providerList">
-                {accessUsers.map((user) => (
-                  <article className="providerItem" key={user.password}>
-                    <div>
-                      <strong>{user.password}</strong>
-                      <small>{user.is_admin ? "主账号 / 管理员" : user.is_builtin ? "默认用户" : "自定义用户"}</small>
-                      <small>数据空间：{user.storage_scope || "默认数据空间"}</small>
-                    </div>
-                    <div>
-                      <button type="button" onClick={() => editAccessUser(user)} title="编辑" disabled={!user.editable}><Edit3 size={15} /></button>
-                      <button type="button" onClick={() => deleteAccessUser(user)} title="删除" disabled={!user.deletable}><Trash2 size={15} /></button>
-                    </div>
-                  </article>
-                ))}
-              </div>
-              <SettingsSaveAction
-                feedback={sectionSaveFeedback.accessUsers}
-                label="刷新用户列表"
-                onClick={() => refreshAccessUsers().then(() => setSettingsFeedback("accessUsers", "success", "用户列表已刷新")).catch((err) => { setError(describeError(err)); setSettingsFeedback("accessUsers", "failed", "刷新失败"); })}
-              />
-            </SettingsGroup>
-          )}
-
-          <SettingsGroup
-            title="模型设置"
-            help={SETTING_HELP.groupModels}
-            summary={["chat", "storyboard"].includes(form.mode) ? `规划 ${form.chatModel} · ${optionLabel(plannerEndpointOptions, form.plannerEndpoint)} / 生图 ${form.model} + ${form.imageModel}` : `${form.model} / ${form.imageModel}`}
-            open={!!openGroups.models}
-            onToggle={() => toggleGroup("models")}
-          >
-            {["chat", "storyboard"].includes(form.mode) ? (
-              <>
-                <Field label="规划模型" help={SETTING_HELP.plannerModel}>
-                  <input value={form.chatModel} onChange={(e) => setForm({ ...form, chatModel: e.target.value })} placeholder="例如 qwen-plus / deepseek-chat / gpt-5.4" />
-                </Field>
-                <Select
-                  label="规划接口格式"
-                  help={SETTING_HELP.plannerEndpoint}
-                  value={form.plannerEndpoint}
-                  onChange={(v) => setForm({ ...form, plannerEndpoint: v })}
-                  options={plannerEndpointOptions}
-                />
-                <Select label="生图 Responses 模型" help={SETTING_HELP.responsesModel} value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
-                <Select label="图片工具模型" help={SETTING_HELP.imageToolModel} value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
-              </>
-            ) : (
-              <>
-                <Select label="Responses 模型" help={SETTING_HELP.responsesModel} value={form.model} onChange={(v) => setForm({ ...form, model: v })} options={chatModelOptions} />
-                <Select label="图片工具模型" help={SETTING_HELP.imageToolModel} value={form.imageModel} onChange={(v) => setForm({ ...form, imageModel: v })} options={imageModelOptions} />
-              </>
-            )}
-            <SettingsSaveAction
-              feedback={sectionSaveFeedback.models}
-              label="保存模型设置"
-              onClick={() => saveSettingsSection("models", "模型设置已保存")}
-            />
-          </SettingsGroup>
-
-          <SettingsGroup
-            title="图片参数"
-            help={SETTING_HELP.groupImage}
-            summary={`${optionLabel(sizeOptions, form.size)} / ${optionLabel(qualityOptions, form.quality)} / ${optionLabel(formatOptions, form.output_format)}`}
-            open={!!openGroups.image}
-            onToggle={() => toggleGroup("image")}
-          >
-            <Select label="画面比例" help={SETTING_HELP.size} value={form.size} onChange={(v) => setForm({ ...form, size: v })} options={sizeOptions} />
-            <Select label="分辨率" help={SETTING_HELP.quality} value={form.quality} onChange={(v) => setForm({ ...form, quality: v })} options={qualityOptions} />
-            <Select label="背景" help={SETTING_HELP.background} value={form.background} onChange={(v) => setForm({ ...form, background: v })} options={backgroundOptions} />
-            <Select label="格式" help={SETTING_HELP.format} value={form.output_format} onChange={(v) => setForm({ ...form, output_format: v })} options={formatOptions} />
-            {!["chat", "storyboard"].includes(form.mode) && (
-              <Field label="数量" help={SETTING_HELP.imageCount}>
-                <input type="number" min="1" max="10" value={form.n} onChange={(e) => setForm({ ...form, n: e.target.value })} />
-              </Field>
-            )}
-            <SettingsSaveAction
-              feedback={sectionSaveFeedback.image}
-              label="保存图片参数"
-              onClick={() => saveSettingsSection("image", "图片参数已保存")}
-            />
-          </SettingsGroup>
-
-          <SettingsGroup
-            title="高级选项"
-            help={SETTING_HELP.groupAdvanced}
-            summary={["chat", "storyboard"].includes(form.mode) ? `${form.mode === "storyboard" ? `${form.shot_limit} 镜头 / ` : `${optionLabel(actionOptions, form.action)} / `}${optionLabel(fidelityOptions, form.input_fidelity)}` : optionLabel(moderationOptions, form.moderation)}
-            open={!!openGroups.advanced}
-            onToggle={() => toggleGroup("advanced")}
-          >
-            {form.mode === "chat" ? (
-              <>
-                <Select label="动作" help={SETTING_HELP.action} value={form.action} onChange={(v) => setForm({ ...form, action: v })} options={actionOptions} />
-                <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
-                <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-                <Field label="上下文条数" help={SETTING_HELP.contextLimit}>
-                  <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
-                </Field>
-                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
-                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
-                </Field>
-                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
-              </>
-            ) : form.mode === "storyboard" ? (
-              <>
-                <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
-                <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-                <Field label="上下文条数" help={SETTING_HELP.contextLimit}>
-                  <input type="number" min="0" max="50" value={form.context_limit} onChange={(e) => setForm({ ...form, context_limit: e.target.value })} />
-                </Field>
-                <Field label="最多镜头" help={SETTING_HELP.shotLimit}>
-                  <input type="number" min="1" max="100" value={form.shot_limit} onChange={(e) => setForm({ ...form, shot_limit: e.target.value })} />
-                </Field>
-                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
-                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
-                </Field>
-                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
-              </>
-            ) : form.mode === "edit" ? (
-              <>
-                <Field label="图片名称" help={SETTING_HELP.imageTitle}>
-                  <input value={form.image_title} onChange={(e) => setForm({ ...form, image_title: e.target.value })} placeholder="可选，不填则自动按时间和会话标题命名" />
-                </Field>
-                <Select label="输入保真" help={SETTING_HELP.inputFidelity} value={form.input_fidelity} onChange={(v) => setForm({ ...form, input_fidelity: v })} options={fidelityOptions} />
-                <Select label="局部图" help={SETTING_HELP.partialImages} value={String(form.partial_images)} onChange={(v) => setForm({ ...form, partial_images: Number(v) })} options={["0", "1", "2", "3"]} />
-                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
-                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
-                </Field>
-                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
-              </>
-            ) : (
-              <>
-                <Field label="图片名称" help={SETTING_HELP.imageTitle}>
-                  <input value={form.image_title} onChange={(e) => setForm({ ...form, image_title: e.target.value })} placeholder="可选，不填则自动按时间和会话标题命名" />
-                </Field>
-                <Field label="压缩 0-100" help={SETTING_HELP.outputCompression}>
-                  <input value={form.output_compression} onChange={(e) => setForm({ ...form, output_compression: e.target.value })} placeholder="可留空" />
-                </Field>
-                <Select label="审核" help={SETTING_HELP.moderation} value={form.moderation} onChange={(v) => setForm({ ...form, moderation: v })} options={moderationOptions} />
-              </>
-            )}
-            <SettingsSaveAction
-              feedback={sectionSaveFeedback.advanced}
-              label="保存高级选项"
-              onClick={() => saveSettingsSection("advanced", "高级选项已保存")}
-            />
-          </SettingsGroup>
-        </aside>
-        )}
-
+      <section className="workspace">
         <section className="stage">
           <div className="viewTabsBar">
             <nav className="viewTabs">
@@ -2272,34 +2858,25 @@ function App() {
                 ["history", Clock3, "历史"],
                 ["gallery", Images, "图库"],
                 ["prompts", BookOpen, "提示词"],
+                ["settings", SlidersHorizontal, "设置"],
               ].map(([value, Icon, label]) => (
                 <button key={value} className={activeView === value ? "active" : ""} onClick={() => switchView(value)}>
                   <Icon size={16} />
                   {label}
                 </button>
               ))}
-              <button
-                type="button"
-                className={`settingsToggle ${controlsOpen ? "active" : ""}`}
-                onClick={() => setControlsOpen((value) => !value)}
-                aria-expanded={controlsOpen}
-                aria-controls="studio-controls"
-              >
-                <SlidersHorizontal size={16} />
-                设置
-              </button>
             </nav>
           </div>
           <div className="stageHead">
             <div>
-              <p><ModeIcon size={18} /> {modeMeta.title}</p>
-              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : form.mode === "storyboard" ? "按镜头顺序生成连续首帧" : form.mode === "chat" ? "像聊天一样连续生图" : form.mode === "edit" ? "同一会话内直接按完整提示词连续编辑" : "同一会话内直接按完整提示词连续生图"}</h2>
+              <p>{activeView === "settings" ? <><SlidersHorizontal size={18} /> 系统设置</> : <><ModeIcon size={18} /> {modeMeta.title}</>}</p>
+              <h2>{activeView === "history" ? "对话历史可查看和修改" : activeView === "gallery" ? "历史图片按对话和时间保存" : activeView === "prompts" ? "维护可复制的提示词库" : activeView === "settings" ? "把所有系统设置集中到独立页面中管理" : form.mode === "storyboard" ? "按镜头顺序生成连续首帧" : form.mode === "chat" ? "像聊天一样连续生图" : form.mode === "edit" ? "同一会话内直接按完整提示词连续编辑" : "同一会话内直接按完整提示词连续生图"}</h2>
             </div>
-            {(activeView === "studio" || runningTasks.length > 0) && (
+            {(activeView === "studio" || trackedTasks.length > 0) && (
               <div className="headActions">
-                {runningTasks.length > 0 && (
+                {trackedTasks.length > 0 && (
                   <RunningTasksPanel
-                    tasks={runningTasks}
+                    tasks={trackedTasks}
                     open={runningPanelOpen}
                     onToggle={() => setRunningPanelOpen((value) => !value)}
                     onOpenTask={loadTask}
@@ -2317,7 +2894,9 @@ function App() {
 
           {error && <ErrorPanel error={error} onClose={() => setError(null)} />}
 
-          {activeView === "history" ? (
+          {activeView === "settings" ? (
+            <SettingsPage />
+          ) : activeView === "history" ? (
             <HistoryPane
               conversations={conversations}
               tasks={tasks}
@@ -2347,8 +2926,14 @@ function App() {
               refreshState={refreshFeedback.gallery}
               onRefresh={() => runRefresh("gallery", () => refreshGallery({ throwError: true }))}
               onDownload={downloadImage}
+              onBatchDownload={runBatchDownload}
               onUseImage={useImageAsReference}
               onPreview={openImagePreview}
+              onExpandGroup={loadGalleryGroupDetail}
+              onToggleFavorite={toggleImageFavorite}
+              onSaveTags={saveImageTags}
+              downloadDraft={downloadDraft}
+              onDownloadDraft={setDownloadDraft}
             />
           ) : activeView === "prompts" ? (
             <PromptLibrary
@@ -2398,6 +2983,7 @@ function App() {
           )}
 
           {activeView === "studio" && <form className="composer" onSubmit={handleSubmit}>
+            <ModeRunSettings />
             {form.mode === "edit" && (
               <UploadRow
                 label="编辑图片"
@@ -2422,7 +3008,10 @@ function App() {
               <UploadRow
                 label="Mask"
                 files={editMask ? [editMask] : []}
-                onChange={(files) => setEditMask(files[0] || null)}
+                onChange={async (files) => {
+                  const [nextMask] = await compressUploadBatch(files.slice(0, 1), { maxEdge: 2048, quality: 0.92, keepPng: true });
+                  setEditMask(nextMask || null);
+                }}
                 onRemove={() => setEditMask(null)}
               />
             )}
@@ -2530,7 +3119,7 @@ function ErrorPanel({ error, onClose }) {
           <button className={`copyFeedbackButton ${copyState}`} type="button" onClick={copyError} disabled={copyState === "copying"}>
             <Copy size={15} /> {copyState === "copying" ? "复制中" : copyState === "success" ? "复制成功" : copyState === "failed" ? "复制失败" : "复制原因"}
           </button>
-          <button type="button" onClick={onClose} title="关闭"><X size={15} /></button>
+          <Tooltip text="关闭"><button type="button" onClick={onClose} aria-label="关闭"><X size={15} /></button></Tooltip>
         </div>
       </div>
       {error.meta?.length > 0 && (
@@ -2620,7 +3209,7 @@ function HistoryPane({
             onClick={() => item.kind === "conversation" ? onOpen(item.id) : onOpenTask(item.id)}
           >
             <div className="historyItemTop">
-              <span title={item.title}>{item.title}</span>
+              <TooltipText text={item.title}>{item.title}</TooltipText>
               <StatusPill mode={item.mode} status={item.status} />
             </div>
             <small>{item.summary}</small>
@@ -2788,14 +3377,16 @@ function StatusPill({ mode, status }) {
 
 function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask, poolMeta }) {
   const firstTask = tasks[0];
+  const activeCount = tasks.filter((task) => ["queued", "running"].includes(task.status)).length;
+  const scheduledCount = tasks.filter((task) => task.status === "scheduled").length;
   return (
     <section className={`runningPanel ${open ? "open" : ""}`} aria-live="polite">
       <button className="runningPanelHead" type="button" onClick={onToggle} aria-expanded={open}>
         <span>
           <Loader2 className="spin" size={15} aria-hidden="true" />
-          <strong>{tasks.length} 个任务运行中</strong>
+          <strong>{tasks.length} 个任务待执行</strong>
         </span>
-        <small>{firstTask ? `${modeLabel(firstTask.mode)} #${firstTask.id} · ${taskProviderName(firstTask) || "等待分配提供商"}` : `生图池 ${poolMeta?.total_providers || 0} / 已用 ${poolMeta?.used_providers || 0} / 空闲 ${poolMeta?.idle_providers || 0}`}</small>
+        <small>{firstTask ? `${activeCount} 运行中 / ${scheduledCount} 待定时 · ${modeLabel(firstTask.mode)} #${firstTask.id}` : `生图池 ${poolMeta?.total_providers || 0} / 已用 ${poolMeta?.used_providers || 0} / 空闲 ${poolMeta?.idle_providers || 0}`}</small>
         <ChevronDown size={16} />
       </button>
       {open && (
@@ -2823,9 +3414,9 @@ function RunningTasksPanel({ tasks, open, onToggle, onOpenTask, onCancelTask, po
 
 function TaskMiniRow({ task, onOpenTask, onCancelTask, onContinue, onRetryTask }) {
   const [open, setOpen] = useState(false);
-  const isLive = ["queued", "running"].includes(task.status);
+  const isLive = ["scheduled", "queued", "running"].includes(task.status);
   const providerName = taskProviderName(task);
-  const canRetry = ["generate", "edit", "storyboard"].includes(task.mode) && ["failed", "canceled"].includes(task.status);
+  const canRetry = canRetryTask(task);
 
   return (
     <article className={`taskMiniRow ${task.status} ${open ? "open" : ""}`}>
@@ -2845,7 +3436,7 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask, onContinue, onRetryTask }
           <div className="taskMiniActions">
             <button type="button" onClick={() => onOpenTask(task.id)}>查看详情</button>
             {task.conversation_id && <button type="button" onClick={() => onContinue(task.conversation_id)}><MessageCircle size={14} /> {continueLabel(task.mode)}</button>}
-            {canRetry && <button type="button" onClick={() => onRetryTask(task.id)}><RefreshCw size={14} /> 重试</button>}
+            {canRetry && <button type="button" onClick={() => onRetryTask(task.id)}><RefreshCw size={14} /> {retryTaskLabel(task)}</button>}
             {isLive && <button className="danger" type="button" onClick={() => onCancelTask(task.id)}><X size={14} /> 停止</button>}
           </div>
           {task.error_detail && <ErrorSummaryBox title="失败原因" error={task.error_detail} className="taskMiniError" />}
@@ -2856,11 +3447,14 @@ function TaskMiniRow({ task, onOpenTask, onCancelTask, onContinue, onRetryTask }
 }
 
 function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onContinue, onDelete, onRetry }) {
-  const isLive = ["queued", "running"].includes(task.status);
+  const isLive = ["scheduled", "queued", "running"].includes(task.status);
   const images = normalizeTaskImages(task).filter((image) => image.source === "api" || !image.source);
   const inputImages = normalizeTaskImages(task).filter((image) => ["input", "mask", "input_reference"].includes(image.source));
   const providerName = taskProviderName(task);
-  const canRetry = ["generate", "edit", "storyboard"].includes(task.mode) && ["failed", "canceled"].includes(task.status);
+  const providerAttempts = providerAttemptsForTask(task);
+  const storyboard = resolveStoryboardState(task);
+  const hasStoryboard = task.mode === "storyboard" && storyboardHasContent(storyboard);
+  const canRetry = canRetryTask(task);
 
   return (
     <div className="taskDetail">
@@ -2879,7 +3473,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
           )}
           {canRetry && (
             <button className="secondaryButton compact" type="button" onClick={() => onRetry(task.id)}>
-              <RefreshCw size={16} /> 重试原任务
+              <RefreshCw size={16} /> {retryTaskLabel(task, "detail")}
             </button>
           )}
           <button className="ghostButton danger" type="button" onClick={() => onDelete(task.id)}>
@@ -2894,9 +3488,20 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
         <span>创建：{formatTime(task.created_at)}</span>
         <span>更新：{formatTime(task.updated_at)}</span>
         <span>模式：{modeLabel(task.mode)}</span>
+        {task.scheduled_for && <span>定时：{formatTime(task.scheduled_for)}</span>}
+        {task.variant_name && <span>变体：{task.variant_name}</span>}
         {providerName && <span>生图提供商：{providerName}</span>}
       </div>
-      {task.mode === "storyboard" && <StoryboardProgress task={task} />}
+      {hasStoryboard && (
+        <StoryboardProgress
+          storyboard={storyboard}
+          images={images}
+          onDownload={onDownload}
+          onPreview={onPreview}
+          previewImages={images}
+        />
+      )}
+      {providerAttempts.length > 0 && <ProviderAttemptList attempts={providerAttempts} />}
       {task.error_detail && <ErrorSummaryBox title="失败原因" error={task.error_detail} className="taskErrorBox" />}
       {inputImages.length > 0 && (
         <section>
@@ -2909,7 +3514,7 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
           </div>
         </section>
       )}
-      {images.length > 0 ? (
+      {!hasStoryboard && images.length > 0 ? (
         <section>
           <div className="sectionTitle">
             <strong>生成图片</strong>
@@ -2919,19 +3524,50 @@ function TaskDetail({ task, onCancel, onDownload, onUseImage, onPreview, onConti
             {images.map((image, index) => <ImageCard key={image.id || image.url} image={image} onDownload={onDownload} onUseImage={onUseImage} onPreview={() => onPreview(images, index)} />)}
           </div>
         </section>
-      ) : (
+      ) : !hasStoryboard ? (
         <div className="emptyMini detailEmpty">这个任务还没有可查看的图片。</div>
-      )}
+      ) : null}
     </div>
   );
 }
 
-function StoryboardProgress({ task = null, storyboard: storyboardProp = null, title = "分镜连续性", compact = false }) {
+function providerAttemptLabel(action) {
+  return {
+    retrying_same_provider: "同渠道重试",
+    provider_unavailable: "渠道不可用",
+    success: "接力成功",
+  }[action] || "渠道事件";
+}
+
+function ProviderAttemptList({ attempts }) {
+  if (!attempts?.length) return null;
+  return (
+    <section className="providerAttemptList">
+      <div className="sectionTitle">
+        <strong>渠道容错记录</strong>
+        <small>{attempts.length} 条</small>
+      </div>
+      <div className="providerAttemptItems">
+        {attempts.map((attempt, index) => (
+          <div className={`providerAttemptItem ${attempt.action || ""}`} key={`${attempt.provider_id || attempt.provider_name || "provider"}-${index}`}>
+            <span>{providerAttemptLabel(attempt.action)}</span>
+            <strong>{attempt.provider_name || `渠道 ${attempt.provider_id || index + 1}`}</strong>
+            <small>{attempt.message || (attempt.action === "success" ? "该渠道完成了本次生图" : `第 ${attempt.attempt || index + 1} 次尝试`)}</small>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function StoryboardProgress({ task = null, storyboard: storyboardProp = null, title = "分镜连续性", compact = false, images = [], onDownload, onPreview, previewImages = [] }) {
   const storyboard = storyboardProp || resolveStoryboardState(task);
   const shots = Array.isArray(storyboard.shots) ? storyboard.shots : [];
   if (!storyboard.character_summary && !storyboard.scene_summary && shots.length === 0) return null;
   const doneCount = shots.filter((shot) => shot.status === "done").length;
   const [expandedPrompts, setExpandedPrompts] = useState({});
+  const storyboardImages = uniqueImages(images);
+  const storyboardPreviewImages = uniqueImages(previewImages.length ? previewImages : storyboardImages);
 
   function togglePrompt(key) {
     setExpandedPrompts((current) => ({ ...current, [key]: !current[key] }));
@@ -2959,6 +3595,7 @@ function StoryboardProgress({ task = null, storyboard: storyboardProp = null, ti
             const shotKey = `${shot.name || `镜头${index + 1}`}-${index}`;
             const prompt = storyboardShotPrompt(shot);
             const expanded = !!expandedPrompts[shotKey];
+            const shotImage = imageForStoryboardShot(shot, storyboardImages);
             return (
             <article className={`shotStep ${shot.status || "pending"}`} key={shotKey}>
               <span>{String(shot.order || index + 1).padStart(2, "0")}</span>
@@ -2978,6 +3615,13 @@ function StoryboardProgress({ task = null, storyboard: storyboardProp = null, ti
                     <em>{expanded ? "点击收起" : "点击展开全部内容"}</em>
                   </button>
                 )}
+                <ShotImageSlot
+                  image={shotImage}
+                  shot={shot}
+                  previewImages={storyboardPreviewImages}
+                  onDownload={onDownload}
+                  onPreview={onPreview}
+                />
               </div>
             </article>
           )})}
@@ -2985,6 +3629,58 @@ function StoryboardProgress({ task = null, storyboard: storyboardProp = null, ti
       )}
     </section>
   );
+}
+
+function imageForStoryboardShot(shot, images) {
+  const normalizedImages = uniqueImages(images);
+  const shotId = Number(shot?.image_id || 0);
+  const shotUrl = String(shot?.url || "").trim();
+  const shotName = String(shot?.name || "").trim();
+  const matched = normalizedImages.find((image) => (
+    (shotId && Number(image.id) === shotId) ||
+    (shotUrl && (image.url === shotUrl || image.public_url === shotUrl)) ||
+    (shotName && image.title === shotName)
+  ));
+  if (matched) return matched;
+  if (!shotUrl) return null;
+  return normalizeImageForClient({
+    id: shotId || shotUrl,
+    url: shotUrl,
+    public_url: shotUrl,
+    title: shotName,
+    filename: `${shotName || "storyboard-shot"}.png`,
+    source: "api",
+  });
+}
+
+function ShotImageSlot({ image, shot, previewImages, onDownload, onPreview }) {
+  if (image) {
+    const previewItems = uniqueImages(previewImages.length ? previewImages : [image]);
+    const previewIndex = previewItems.findIndex((item) => imageReferenceKey(item) === imageReferenceKey(image));
+    return (
+      <div className="shotImageSlot">
+        <button type="button" className="shotImagePreview" onClick={() => onPreview?.(previewItems, previewIndex >= 0 ? previewIndex : 0)}>
+          <img src={imageThumbUrl(image)} alt={image.title || shot?.name || "分镜图片"} loading="lazy" decoding="async" />
+        </button>
+        <div className="shotImageActions">
+          <button type="button" onClick={() => onPreview?.(previewItems, previewIndex >= 0 ? previewIndex : 0)}><ExternalLink size={14} /> 预览</button>
+          {onDownload && <button type="button" onClick={() => onDownload(image)}><Download size={14} /> 下载</button>}
+        </div>
+      </div>
+    );
+  }
+  if (shot?.status === "running") {
+    return (
+      <div className="shotInlineStatus running">
+        <Loader2 className="spin" size={14} />
+        <span>正在生成这一镜头...</span>
+      </div>
+    );
+  }
+  if (shot?.status === "failed") {
+    return <div className="shotInlineStatus failed">这一镜头生成失败，可在任务详情中查看原因并重试。</div>;
+  }
+  return null;
 }
 
 function PromptLibrary({
@@ -3094,10 +3790,32 @@ function PromptLibrary({
   );
 }
 
-function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage, onPreview }) {
-  const groups = useMemo(() => groupImages(items), [items]);
+function GalleryHistory({
+  items,
+  refreshState,
+  onRefresh,
+  onDownload,
+  onBatchDownload,
+  onUseImage,
+  onPreview,
+  onExpandGroup,
+  onToggleFavorite,
+  onSaveTags,
+  downloadDraft,
+  onDownloadDraft,
+}) {
+  const groups = useMemo(() => normalizeGalleryGroups(items), [items]);
   const [expandedGroups, setExpandedGroups] = useState({});
   const [modeFilter, setModeFilter] = useState("");
+  const allTags = useMemo(() => {
+    const tags = new Set();
+    for (const group of groups) {
+      for (const image of [...(group.preview_items || []), ...(group.items || [])]) {
+        for (const tag of image.tags || []) tags.add(tag);
+      }
+    }
+    return [...tags].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  }, [groups]);
   const filteredGroups = useMemo(
     () => (!modeFilter ? groups : groups.filter((group) => group.mode === modeFilter)),
     [groups, modeFilter],
@@ -3113,8 +3831,12 @@ function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage
     });
   }, [filteredGroups]);
 
-  function toggleGroup(groupKey) {
-    setExpandedGroups((current) => ({ ...current, [groupKey]: !current[groupKey] }));
+  function toggleGroup(group) {
+    const nextExpanded = !expandedGroups[group.key];
+    if (nextExpanded && group.has_more && !group.detail_loaded) {
+      onExpandGroup?.(group);
+    }
+    setExpandedGroups((current) => ({ ...current, [group.key]: nextExpanded }));
   }
 
   return (
@@ -3132,6 +3854,51 @@ function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage
           <RefreshButton state={refreshState} onClick={onRefresh} />
         </div>
       </div>
+      <section className="batchDownloadPanel">
+        <div className="batchDownloadHead">
+          <strong>批量下载</strong>
+          <small>按会话、任务、标签或收藏状态打包为 ZIP，可自定义压缩包内文件夹名称。</small>
+        </div>
+        <div className="batchDownloadControls">
+          <Field label="文件夹名称">
+            <input
+              value={downloadDraft.folderName}
+              onChange={(event) => onDownloadDraft({ ...downloadDraft, folderName: event.target.value })}
+              placeholder="例如 角色海报第一轮"
+            />
+          </Field>
+          <Field label="标签筛选">
+            <input
+              value={downloadDraft.tag}
+              onChange={(event) => onDownloadDraft({ ...downloadDraft, tag: event.target.value })}
+              list="galleryTagOptions"
+              placeholder="留空为全部标签"
+            />
+            <datalist id="galleryTagOptions">
+              {allTags.map((tag) => <option key={tag} value={tag} />)}
+            </datalist>
+          </Field>
+          <Field label="收藏状态">
+            <select value={downloadDraft.favorite} onChange={(event) => onDownloadDraft({ ...downloadDraft, favorite: event.target.value })}>
+              <option value="">全部图片</option>
+              <option value="1">仅收藏</option>
+              <option value="0">仅未收藏</option>
+            </select>
+          </Field>
+          <button
+            type="button"
+            className="secondaryButton compact"
+            onClick={() => onBatchDownload?.({
+              folderName: downloadDraft.folderName,
+              tag: downloadDraft.tag,
+              favorite: downloadDraft.favorite,
+              mode: modeFilter,
+            })}
+          >
+            <Download size={16} /> 下载筛选结果
+          </button>
+        </div>
+      </section>
       {filteredGroups.length === 0 ? (
         <div className="emptyState">
           <Images size={34} />
@@ -3140,34 +3907,53 @@ function GalleryHistory({ items, refreshState, onRefresh, onDownload, onUseImage
         </div>
       ) : filteredGroups.map((group) => {
         const expanded = !!expandedGroups[group.key];
-        const visibleItems = expanded ? group.items : group.preview_items;
+        const fullItems = group.items?.length ? group.items : group.preview_items;
+        const visibleItems = expanded ? fullItems : group.preview_items;
         return (
         <article className="galleryGroup" key={group.key}>
           <div className="galleryGroupHead">
             <div className="galleryGroupMeta">
               <span>{group.title}</span>
-              <small>{group.mode ? modeLabel(group.mode) : "未分类"} · {group.time} · 共 {group.items.length} 张</small>
+              <small>{group.mode ? modeLabel(group.mode) : "未分类"} · {group.time} · 共 {group.total_count || fullItems.length} 张</small>
             </div>
-            {group.has_more && (
-              <button type="button" className="galleryGroupToggle" onClick={() => toggleGroup(group.key)}>
-                {expanded ? "收起" : `查看详情（全部 ${group.items.length} 张）`}
+            <div className="galleryGroupActions">
+              <button
+                type="button"
+                className="galleryGroupToggle"
+                onClick={() => onBatchDownload?.({
+                  folderName: downloadDraft.folderName || group.title,
+                  conversation_id: group.conversation_id,
+                  task_id: group.task_id,
+                })}
+              >
+                <Download size={14} /> 下载本组
               </button>
-            )}
+              {group.has_more && (
+                <button type="button" className="galleryGroupToggle" onClick={() => toggleGroup(group)}>
+                  {group.loading_detail ? "加载中..." : expanded ? "收起" : `查看详情（全部 ${group.total_count || fullItems.length} 张）`}
+                </button>
+              )}
+            </div>
           </div>
           <div className="imageGrid">
             {visibleItems.map((image) => {
-              const previewIndex = group.items.findIndex((item) => Number(item.id) === Number(image.id));
+              const previewIndex = fullItems.findIndex((item) => Number(item.id) === Number(image.id));
               return (
                 <ImageCard
                   key={image.id}
                   image={image}
                   onDownload={onDownload}
                   onUseImage={onUseImage}
-                  onPreview={() => onPreview(group.items, previewIndex >= 0 ? previewIndex : 0)}
+                  onPreview={() => onPreview(fullItems, previewIndex >= 0 ? previewIndex : 0)}
+                  onToggleFavorite={onToggleFavorite}
+                  onSaveTags={onSaveTags}
                 />
               );
             })}
           </div>
+          {expanded && group.loading_detail && (
+            <small className="galleryGroupHint">正在加载该会话全部图片，请稍候。</small>
+          )}
           {!expanded && group.has_more && (
             <small className="galleryGroupHint">当前先展示 {group.preview_items.length} 张预览图，点击“查看详情”可查看该会话全部图片。</small>
           )}
@@ -3192,7 +3978,6 @@ function ChatTaskProgress({ task }) {
         </div>
         <small>#{task.id} · {task.params?.action || task.mode} · 上游事件会实时写入这里</small>
         {providerName && <small>当前生图提供商：{providerName}</small>}
-        {task.mode === "storyboard" && <StoryboardProgress task={task} title="本次分镜计划" compact />}
       </div>
     </div>
   );
@@ -3233,7 +4018,7 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
             const selectionMode = selectionModes[String(image.id)] || defaultReferenceSelectionMode(uploadCount + index);
             return (
               <div className="selectedReferenceCard" key={image.id || image.url}>
-                <img src={image.public_url || image.url} alt="" />
+                <img src={imageThumbUrl(image)} alt="" loading="lazy" decoding="async" />
                 <div className="selectedReferenceMeta">
                   <strong>{image.title || image.filename || `参考图 ${index + 1}`}</strong>
                   <small>{referenceSelectionModeLabel(selectionMode)} / {referenceRoleLabel(role)}</small>
@@ -3267,16 +4052,18 @@ function ChatReferencePicker({ images, selected, onToggle, onRemove, roles = {},
             const selectionMode = selectionModes[String(image.id)] || defaultReferenceSelectionMode(uploadCount + index);
             return (
               <div className={`referenceChoice ${isSelected ? "active" : ""}`} key={image.id}>
-                <button
-                  type="button"
-                  className={isSelected ? "active" : ""}
-                  onClick={() => onToggle(image)}
-                  title={isSelected ? "取消选择" : "选择为本轮参考图"}
-                >
-                  <img src={image.public_url || image.url} alt="" />
-                  <span>{isSelected ? "已选" : "选择"}</span>
-                  {isSelected && <em>取消</em>}
-                </button>
+                <Tooltip text={isSelected ? "取消选择" : "选择为本轮参考图"}>
+                  <button
+                    type="button"
+                    className={isSelected ? "active" : ""}
+                    onClick={() => onToggle(image)}
+                    aria-label={isSelected ? "取消选择" : "选择为本轮参考图"}
+                  >
+                    <img src={imageThumbUrl(image)} alt="" loading="lazy" decoding="async" />
+                    <span>{isSelected ? "已选" : "选择"}</span>
+                    {isSelected && <em>取消</em>}
+                  </button>
+                </Tooltip>
                 {isSelected && (
                   <>
                     <label className="referenceRoleSelect">
@@ -3318,20 +4105,22 @@ function EditReferencePicker({ images, selectedKeys, onToggle }) {
             const isSelected = !!key && selectedKeys.has(key);
             return (
               <div className={`referenceChoice ${isSelected ? "active" : ""}`} key={key || image.id || image.url || index}>
-                <button
-                  type="button"
-                  className={isSelected ? "active" : ""}
-                  onClick={() => onToggle(image)}
-                  title={isSelected ? "移除这张编辑输入图" : "加入本轮编辑输入图"}
-                >
-                  <img src={image.public_url || image.url} alt="" />
-                  <span>{isSelected ? "已加入" : "加入编辑"}</span>
-                  <em>{imageSourceLabel(image)}</em>
-                </button>
+                <Tooltip text={isSelected ? "移除这张编辑输入图" : "加入本轮编辑输入图"}>
+                  <button
+                    type="button"
+                    className={isSelected ? "active" : ""}
+                    onClick={() => onToggle(image)}
+                    aria-label={isSelected ? "移除这张编辑输入图" : "加入本轮编辑输入图"}
+                  >
+                    <img src={imageThumbUrl(image)} alt="" loading="lazy" decoding="async" />
+                    <span>{isSelected ? "已加入" : "加入编辑"}</span>
+                    <em>{imageSourceLabel(image)}</em>
+                  </button>
+                </Tooltip>
                 <div className="referenceChoiceMeta">
-                  <strong title={imageDisplayTitle(image) || image.filename || `候选图 ${index + 1}`}>
+                  <TooltipText as="strong" text={imageDisplayTitle(image) || image.filename || `候选图 ${index + 1}`}>
                     {imageDisplayTitle(image) || image.filename || `候选图 ${index + 1}`}
-                  </strong>
+                  </TooltipText>
                 </div>
               </div>
             );
@@ -3346,18 +4135,29 @@ function EditReferencePicker({ images, selectedKeys, onToggle }) {
 
 function Message({ msg, onDownload, onPreview, previewImages = [] }) {
   const storyboard = resolveStoryboardState(msg?.meta);
+  const hasStoryboard = msg.role === "assistant" && storyboardHasContent(storyboard);
   return (
     <div className={`message ${msg.role}`}>
       <div className="avatar">{msg.role === "user" ? "你" : <Bot size={18} />}</div>
       <div className="bubble">
         <p>{msg.content}</p>
-        {msg.role === "assistant" && <StoryboardProgress storyboard={storyboard} title="本次分镜计划" compact />}
+        {hasStoryboard && (
+          <StoryboardProgress
+            storyboard={storyboard}
+            title="本次分镜计划"
+            compact
+            images={msg.images || []}
+            onDownload={onDownload}
+            onPreview={onPreview}
+            previewImages={previewImages.length ? previewImages : msg.images}
+          />
+        )}
         {msg.image_error_detail && (
           <InlineErrorBox title="生图失败原因" error={msg.image_error_detail} />
         )}
         {msg.previews?.length > 0 && (
           <div className="imageGrid">
-            {msg.previews.map((url) => <img key={url} src={url} alt="" />)}
+            {msg.previews.map((url) => <img key={url} src={url} alt="" loading="lazy" decoding="async" />)}
           </div>
         )}
         {msg.uploaded_images?.length > 0 && (
@@ -3365,7 +4165,7 @@ function Message({ msg, onDownload, onPreview, previewImages = [] }) {
             {msg.uploaded_images.map((image, index) => <ImageCard key={image.url} image={image} onDownload={onDownload} onPreview={() => onPreview(msg.uploaded_images, index)} />)}
           </div>
         )}
-        {msg.images?.length > 0 && (
+        {!hasStoryboard && msg.images?.length > 0 && (
           <div className="imageGrid">
             {msg.images.map((image, index) => {
               const previewIndex = previewImages.findIndex((item) => Number(item.id) === Number(image.id));
@@ -3384,7 +4184,7 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
   const [drag, setDrag] = useState(null);
   const stageRef = useRef(null);
   const image = state?.items?.[state.index];
-  const url = image?.public_url || image?.url;
+  const url = imageMediumUrl(image) || imageOriginalUrl(image);
 
   useEffect(() => {
     setZoom(1);
@@ -3439,7 +4239,7 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
       <div className="previewPanel">
         <div className="previewHeader">
           <div>
-            <strong title={renderTitle || undefined}>{renderTitle}</strong>
+            <TooltipText as="strong" text={renderTitle}>{renderTitle}</TooltipText>
             <small>{state.index + 1}/{state.items.length} · 滚轮缩放，拖拽移动，方向键切换</small>
           </div>
           <div className="previewHeaderActions">
@@ -3447,14 +4247,14 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
             <button type="button" onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }); }}>原始适配</button>
             <button type="button" onClick={() => setZoom((value) => Math.min(6, Number((value + 0.2).toFixed(2))))}>放大</button>
             <button type="button" onClick={() => onDownload(image)}><Download size={14} /> 下载</button>
-            <button type="button" onClick={onClose} title="关闭"><X size={16} /></button>
+            <Tooltip text="关闭"><button type="button" onClick={onClose} aria-label="关闭"><X size={16} /></button></Tooltip>
           </div>
         </div>
         <div className="previewStage" ref={stageRef}>
           {state.items.length > 1 && (
-            <button className="previewNav prev" type="button" onClick={() => onMove(-1)} title="上一张">
+            <Tooltip text="上一张"><button className="previewNav prev" type="button" onClick={() => onMove(-1)} aria-label="上一张">
               <ChevronLeft size={28} />
-            </button>
+            </button></Tooltip>
           )}
           <img
             src={url}
@@ -3467,9 +4267,9 @@ function ImagePreviewModal({ state, onClose, onMove, onDownload }) {
             }}
           />
           {state.items.length > 1 && (
-            <button className="previewNav next" type="button" onClick={() => onMove(1)} title="下一张">
+            <Tooltip text="下一张"><button className="previewNav next" type="button" onClick={() => onMove(1)} aria-label="下一张">
               <ChevronRight size={28} />
-            </button>
+            </button></Tooltip>
           )}
         </div>
       </div>
@@ -3501,7 +4301,7 @@ function Gallery({ items, loading, onDownload }) {
           <small>{formatTime(item.created_at)}，可切换页面或继续提交其它任务。</small>
           {item.previews?.length > 0 && (
             <div className="imageGrid uploadedImageGrid">
-              {item.previews.map((image) => <img key={image.url} src={image.url} alt={image.name || "uploaded"} />)}
+              {item.previews.map((image) => <img key={image.url} src={image.url} alt={image.name || "uploaded"} loading="lazy" decoding="async" />)}
             </div>
           )}
         </article>
@@ -3510,21 +4310,37 @@ function Gallery({ items, loading, onDownload }) {
   );
 }
 
-function ImageCard({ image, onDownload, onUseImage, onPreview }) {
+function ImageCard({ image, onDownload, onUseImage, onPreview, onToggleFavorite, onSaveTags }) {
   const [showPrompt, setShowPrompt] = useState(false);
-  const url = image.public_url || image.url;
+  const [showTags, setShowTags] = useState(false);
+  const [tagDraft, setTagDraft] = useState(imageTagsText(image));
+  const url = imageThumbUrl(image) || imageOriginalUrl(image);
   const displayTitle = imageDisplayTitle(image);
   const promptText = image.prompt_text || image.task_prompt || image.message_content || "";
+  useEffect(() => {
+    setTagDraft(imageTagsText(image));
+  }, [image?.id, JSON.stringify(image?.tags || [])]);
   return (
     <div className="imageCard">
-      <img src={url} alt="generated" />
+      <img src={url} alt="generated" loading="lazy" decoding="async" />
       {displayTitle ? (
         <div className="imageMeta">
-          <strong title={displayTitle}>{displayTitle}</strong>
+          <TooltipText as="strong" text={displayTitle}>{displayTitle}</TooltipText>
         </div>
       ) : null}
+      {Array.isArray(image.tags) && image.tags.length > 0 && (
+        <div className="imageTagList">
+          {image.tags.map((tag) => <span key={tag}>#{tag}</span>)}
+        </div>
+      )}
       <div className="imageActions">
-        <button type="button" onClick={onPreview || (() => window.open(url, "_blank", "noreferrer"))}>
+        {onToggleFavorite && (
+          <button className={image.favorite ? "favorite active" : "favorite"} type="button" onClick={() => onToggleFavorite(image)}>
+            <Heart size={14} />
+            {image.favorite ? "已收藏" : "收藏"}
+          </button>
+        )}
+        <button type="button" onClick={onPreview || (() => window.open(imageOriginalUrl(image), "_blank", "noreferrer"))}>
           <ExternalLink size={14} />
           预览
         </button>
@@ -3544,7 +4360,19 @@ function ImageCard({ image, onDownload, onUseImage, onPreview }) {
             提示词
           </button>
         )}
+        {onSaveTags && (
+          <button type="button" onClick={() => setShowTags((value) => !value)}>
+            <Heart size={14} />
+            标签
+          </button>
+        )}
       </div>
+      {showTags && (
+        <div className="imageTagEditor">
+          <input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="用逗号或空格分隔标签" />
+          <button type="button" onClick={() => onSaveTags(image, parseTagsText(tagDraft))}>保存标签</button>
+        </div>
+      )}
       {showPrompt && (
         <div className="imagePromptBox">
           <strong>原始提示词</strong>
@@ -3630,13 +4458,121 @@ function SettingsSaveAction({ feedback, label, onClick }) {
   );
 }
 
+function Tooltip({ text, children }) {
+  const [open, setOpen] = useState(false);
+  const [targetRect, setTargetRect] = useState(null);
+  const child = React.Children.only(children);
+  const tooltipText = String(text || "").trim();
+
+  function showTooltip(event) {
+    child.props.onMouseEnter?.(event);
+    if (!tooltipText) return;
+    setTargetRect(event.currentTarget.getBoundingClientRect());
+    setOpen(true);
+  }
+
+  function moveTooltip(event) {
+    child.props.onMouseMove?.(event);
+    if (!open || !tooltipText) return;
+    setTargetRect(event.currentTarget.getBoundingClientRect());
+  }
+
+  function hideTooltip(event) {
+    child.props.onMouseLeave?.(event);
+    setOpen(false);
+  }
+
+  function focusTooltip(event) {
+    child.props.onFocus?.(event);
+    if (!tooltipText) return;
+    setTargetRect(event.currentTarget.getBoundingClientRect());
+    setOpen(true);
+  }
+
+  function blurTooltip(event) {
+    child.props.onBlur?.(event);
+    setOpen(false);
+  }
+
+  return (
+    <>
+      {React.cloneElement(child, {
+        onMouseEnter: showTooltip,
+        onMouseMove: moveTooltip,
+        onMouseLeave: hideTooltip,
+        onFocus: focusTooltip,
+        onBlur: blurTooltip,
+        title: undefined,
+        "aria-label": child.props["aria-label"] || tooltipText || undefined,
+      })}
+      {open && tooltipText && <FloatingTooltip text={tooltipText} targetRect={targetRect} />}
+    </>
+  );
+}
+
+function TooltipText({ text, children, as: Tag = "span", className = "" }) {
+  const tooltipText = String(text || "").trim();
+  const content = <Tag className={className || undefined}>{children}</Tag>;
+  if (!tooltipText) return content;
+  return <Tooltip text={tooltipText}>{content}</Tooltip>;
+}
+
+function FloatingTooltip({ text, targetRect }) {
+  const bubbleRef = useRef(null);
+  const [size, setSize] = useState({ width: 320, height: 88 });
+
+  useEffect(() => {
+    const node = bubbleRef.current;
+    if (!node) return;
+    const rect = node.getBoundingClientRect();
+    setSize({
+      width: Math.ceil(rect.width),
+      height: Math.ceil(rect.height),
+    });
+  }, [text]);
+
+  if (!targetRect || typeof document === "undefined") return null;
+
+  const margin = 14;
+  const gap = 12;
+  const viewportWidth = window.innerWidth || 1024;
+  const viewportHeight = window.innerHeight || 768;
+  const width = Math.min(size.width || 320, viewportWidth - margin * 2);
+  const height = Math.min(size.height || 88, viewportHeight - margin * 2);
+  const x = Math.max(margin, Math.min(targetRect.left, viewportWidth - width - margin));
+  const belowY = targetRect.bottom + gap;
+  const aboveY = targetRect.top - height - gap;
+  const placeAbove = belowY + height + margin > viewportHeight && aboveY >= margin;
+  const y = placeAbove
+    ? aboveY
+    : Math.max(margin, Math.min(belowY, viewportHeight - height - margin));
+
+  return createPortal(
+    <div
+      ref={bubbleRef}
+      className="floatingTooltip"
+      role="tooltip"
+      data-placement={placeAbove ? "top" : "bottom"}
+      style={{
+        left: `${x}px`,
+        top: `${y}px`,
+        maxWidth: `${Math.max(180, viewportWidth - margin * 2)}px`,
+      }}
+    >
+      {text}
+    </div>,
+    document.body,
+  );
+}
+
 function HoverHelpLabel({ label, help = "", className = "" }) {
   if (!help) return <span className={className}>{label}</span>;
   return (
-    <span className={`hoverHelp ${className}`.trim()}>
-      <span className="hoverHelpText">{label}</span>
-      <span className="hoverHelpBubble" role="tooltip">{help}</span>
-    </span>
+    <Tooltip text={help}>
+      <span className={`hoverHelp ${className}`.trim()}>
+        <span className="hoverHelpText">{label}</span>
+      </span>
+    </Tooltip>
   );
 }
 
@@ -3710,7 +4646,7 @@ function UploadRow({ label, files, onChange, onRemove, multiple = false, hint = 
                 </select>
               </label>
             )}
-            <button type="button" onClick={() => onRemove?.(index)} title="删除图片"><X size={14} /></button>
+            <Tooltip text="删除图片"><button type="button" onClick={() => onRemove?.(index)} aria-label="删除图片"><X size={14} /></button></Tooltip>
           </div>
         )) : <small className="uploadEmpty">未选择</small>}
       </div>
@@ -3841,6 +4777,116 @@ async function copyTextToClipboard(text) {
   return true;
 }
 
+function imageOriginalUrl(image) {
+  return String(image?.public_url || image?.original_url || image?.url || "").trim();
+}
+
+function imageMediumUrl(image) {
+  return String(image?.medium_url || imageOriginalUrl(image)).trim();
+}
+
+function imageThumbUrl(image) {
+  return String(image?.thumb_url || imageMediumUrl(image) || imageOriginalUrl(image)).trim();
+}
+
+function normalizeImageUrlFields(image) {
+  const originalUrl = imageOriginalUrl(image);
+  const thumbUrl = String(image?.thumb_url || originalUrl).trim();
+  const mediumUrl = String(image?.medium_url || originalUrl).trim();
+  return {
+    url: thumbUrl || originalUrl,
+    public_url: originalUrl,
+    thumb_url: thumbUrl || originalUrl,
+    medium_url: mediumUrl || originalUrl,
+  };
+}
+
+function mergeTaskData(current, incoming) {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  return {
+    ...current,
+    ...incoming,
+    params: incoming.params ?? current.params,
+    response: incoming.response ?? current.response,
+    response_json: incoming.response_json ?? current.response_json,
+    images: incoming.images ?? current.images,
+    error_detail: incoming.error_detail ?? current.error_detail,
+  };
+}
+
+async function loadImageElement(src) {
+  return await new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("图片加载失败"));
+    image.src = src;
+  });
+}
+
+function cloneFileMetadata(source, target) {
+  if (source?.sourceImageKey) target.sourceImageKey = source.sourceImageKey;
+  if (source?.sourceImageLabel) target.sourceImageLabel = source.sourceImageLabel;
+  return target;
+}
+
+async function compressImageFile(file, options = {}) {
+  if (!(file instanceof File) || !String(file.type || "").startsWith("image/")) return file;
+  if (["image/gif", "image/svg+xml"].includes(file.type)) return file;
+  const maxEdge = Math.max(1, Number(options.maxEdge || 1600));
+  const quality = Math.min(0.96, Math.max(0.55, Number(options.quality || 0.82)));
+  let objectUrl = "";
+  let imageSource = null;
+  try {
+    if (typeof createImageBitmap === "function") {
+      imageSource = await createImageBitmap(file);
+    } else {
+      objectUrl = URL.createObjectURL(file);
+      imageSource = await loadImageElement(objectUrl);
+    }
+    const width = Number(imageSource.width || 0);
+    const height = Number(imageSource.height || 0);
+    if (!width || !height) return file;
+    const scale = Math.min(1, maxEdge / Math.max(width, height));
+    if (scale >= 0.999 && file.size <= Number(options.maxBytes || Number.MAX_SAFE_INTEGER)) {
+      return file;
+    }
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const context = canvas.getContext("2d", { alpha: true });
+    if (!context) return file;
+    context.drawImage(imageSource, 0, 0, targetWidth, targetHeight);
+    const keepPng = Boolean(options.keepPng);
+    const outputType = keepPng ? "image/png" : "image/webp";
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, keepPng ? undefined : quality));
+    if (!blob) return file;
+    if (blob.size >= file.size && scale >= 0.999) return file;
+    const suffix = outputType === "image/png" ? ".png" : outputType === "image/webp" ? ".webp" : ".jpg";
+    const nextName = String(file.name || "upload").replace(/\.[^.]+$/, "") + suffix;
+    return cloneFileMetadata(file, new File([blob], nextName, { type: outputType, lastModified: file.lastModified }));
+  } catch {
+    return file;
+  } finally {
+    if (imageSource && typeof imageSource.close === "function") {
+      imageSource.close();
+    }
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+}
+
+async function compressUploadBatch(files, options = {}) {
+  const result = [];
+  for (const file of files || []) {
+    result.push(await compressImageFile(file, options));
+  }
+  return result;
+}
+
 function imageDisplayTitle(image) {
   return String(image?.title || "").trim();
 }
@@ -3877,10 +4923,28 @@ function imageDownloadName(image) {
   return image?.filename || image?.file_path?.split(/[\\/]/).pop() || `generated-image${imageFileExtension(image)}`;
 }
 
+function sanitizeDownloadFolderName(value) {
+  const text = String(value || "").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
+  return text.slice(0, 80) || "图片批量下载";
+}
+
+function imageTagsText(image) {
+  return Array.isArray(image?.tags) ? image.tags.join(", ") : String(image?.tags || "");
+}
+
+function parseTagsText(value) {
+  return String(value || "")
+    .split(/[,，\s]+/)
+    .map((item) => item.trim().replace(/^#|^＃/, ""))
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .slice(0, 20);
+}
+
 function normalizeTaskImages(task) {
   return (task?.images || []).map((image) => ({
     ...image,
-    url: image.public_url || image.url,
+    ...normalizeImageUrlFields(image),
     filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "generated-image.png",
   }));
 }
@@ -3888,8 +4952,7 @@ function normalizeTaskImages(task) {
 function normalizeImageForClient(image) {
   return {
     ...image,
-    url: image.public_url || image.url,
-    public_url: image.public_url || image.url,
+    ...normalizeImageUrlFields(image),
     filename: image.file_path?.split(/[\\/]/).pop() || image.filename || "generated-image.png",
   };
 }
@@ -3925,6 +4988,21 @@ function formatTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
+}
+
+function normalizeGalleryGroups(items) {
+  if (
+    Array.isArray(items) &&
+    items.every((item) => item && typeof item === "object" && Array.isArray(item.preview_items))
+  ) {
+    return items.map((group) => ({
+      ...group,
+      preview_items: uniqueImages(group.preview_items || []),
+      items: uniqueImages(group.items || []),
+      time: formatTime(group.latest_time || group.time),
+    }));
+  }
+  return groupImages(items);
 }
 
 function groupImages(items) {

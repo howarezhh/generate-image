@@ -3,12 +3,16 @@
 .learnings/
 .install-state/
 backend/.venv/
+backend/local-server*.log
 __pycache__/
 *.pyc
 frontend/node_modules/
 frontend/dist/
+frontend/local-frontend*.log
 storage/*.db
 storage/*.db-*
+storage/codex-cookie.txt
+storage/tenants/
 storage/ui-*.png
 storage/uploads/*
 storage/outputs/*

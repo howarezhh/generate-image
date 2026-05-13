@@ -11,8 +11,15 @@ from urllib.parse import urljoin
 import httpx
 from fastapi import HTTPException, UploadFile
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .config import DEFAULT_API_BASE_URL, DEFAULT_API_KEY, current_output_dir, current_upload_dir
+
+
+VARIANT_MAX_EDGE = {
+    "thumb": 480,
+    "medium": 1280,
+}
 
 
 def normalize_base_url(base_url: str | None) -> str:
@@ -647,6 +654,88 @@ def summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             summary[key] = value
     return summary
+
+
+def public_url_for_storage_path(path: Path) -> str:
+    resolved = path.resolve()
+    upload_root = current_upload_dir().resolve()
+    output_root = current_output_dir().resolve()
+    try:
+        relative = resolved.relative_to(upload_root)
+        return f"/media/uploads/{relative.as_posix()}"
+    except ValueError:
+        pass
+    try:
+        relative = resolved.relative_to(output_root)
+        return f"/media/outputs/{relative.as_posix()}"
+    except ValueError:
+        pass
+    raise ValueError(f"unsupported storage path: {path}")
+
+
+def variant_target_path(path: Path, variant: str, extension: str = ".webp") -> Path:
+    return path.with_name(f"{path.stem}__{variant}{extension}")
+
+
+def ensure_variant_image(source: Path, image: Image.Image, variant: str, max_edge: int) -> Path:
+    if max(image.size) <= max_edge:
+        return source
+    target = variant_target_path(source, variant)
+    source_mtime = source.stat().st_mtime
+    if target.exists() and target.stat().st_mtime >= source_mtime:
+        return target
+    resized = image.copy()
+    resized.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    save_target = resized
+    if save_target.mode not in {"RGB", "RGBA"}:
+        save_target = save_target.convert("RGBA" if "A" in save_target.getbands() else "RGB")
+    try:
+        save_target.save(target, format="WEBP", quality=82, method=6)
+    except OSError:
+        fallback = target.with_suffix(".png")
+        fallback_target = save_target
+        if fallback_target.mode not in {"RGB", "RGBA"}:
+            fallback_target = fallback_target.convert("RGBA" if "A" in fallback_target.getbands() else "RGB")
+        fallback_target.save(fallback, format="PNG", optimize=True)
+        return fallback
+    return target
+
+
+def ensure_image_variants(
+    path: Path,
+    mime_type: str | None = None,
+    *,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    info = dict(existing or {})
+    if not path.exists():
+        return info
+    mime = mime_type or guess_mime(path)
+    info.setdefault("public_url", public_url_for_storage_path(path))
+    try:
+        with Image.open(path) as raw:
+            image = ImageOps.exif_transpose(raw)
+            image.load()
+            width, height = image.size
+            info["width"] = width
+            info["height"] = height
+            info["byte_size"] = int(path.stat().st_size)
+            thumb_target = ensure_variant_image(path, image, "thumb", VARIANT_MAX_EDGE["thumb"])
+            medium_target = ensure_variant_image(path, image, "medium", VARIANT_MAX_EDGE["medium"])
+    except (UnidentifiedImageError, OSError, ValueError):
+        info.setdefault("width", None)
+        info.setdefault("height", None)
+        info["byte_size"] = int(path.stat().st_size)
+        info.setdefault("thumb_path", str(path))
+        info.setdefault("thumb_url", info["public_url"])
+        info.setdefault("medium_path", str(path))
+        info.setdefault("medium_url", info["public_url"])
+        return info
+    info["thumb_path"] = str(thumb_target)
+    info["thumb_url"] = public_url_for_storage_path(thumb_target)
+    info["medium_path"] = str(medium_target)
+    info["medium_url"] = public_url_for_storage_path(medium_target)
+    return info
 
 
 async def save_upload(upload: UploadFile) -> tuple[Path, str]:

@@ -39,6 +39,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             stage text,
             params_json text not null,
             response_json text,
+            checkpoint_json text,
             error text,
             conversation_id integer,
             user_message_id integer,
@@ -46,6 +47,12 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             image_provider_id integer,
             image_provider_name text,
             cancel_requested integer not null default 0,
+            scheduled_for text,
+            queue_group text,
+            queue_position integer,
+            queue_total integer,
+            queue_label text,
+            variant_name text,
             created_at text not null,
             updated_at text not null
         );
@@ -60,6 +67,15 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             source text not null,
             file_path text not null,
             public_url text not null,
+            thumb_path text,
+            thumb_url text,
+            medium_path text,
+            medium_url text,
+            width integer,
+            height integer,
+            byte_size integer,
+            favorite integer not null default 0,
+            tags text not null default '[]',
             mime_type text not null,
             created_at text not null
         );
@@ -94,24 +110,77 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             created_at text not null,
             updated_at text not null
         );
+
+        create table if not exists style_locks (
+            id integer primary key autoincrement,
+            name text not null,
+            subject_lock text,
+            composition_lock text,
+            color_tone_lock text,
+            lighting_lock text,
+            texture_lock text,
+            negative_lock text,
+            notes text,
+            created_at text not null,
+            updated_at text not null
+        );
+
+        create table if not exists character_profiles (
+            id integer primary key autoincrement,
+            name text not null,
+            age text,
+            gender text,
+            appearance text,
+            wardrobe text,
+            personality text,
+            voice_style text,
+            signature_items text,
+            extra_prompt text,
+            notes text,
+            created_at text not null,
+            updated_at text not null
+        );
         """
     )
     ensure_column(conn, "conversations", "mode", "text")
     ensure_column(conn, "images", "title", "text")
     ensure_column(conn, "images", "bucket", "text")
+    ensure_column(conn, "images", "thumb_path", "text")
+    ensure_column(conn, "images", "thumb_url", "text")
+    ensure_column(conn, "images", "medium_path", "text")
+    ensure_column(conn, "images", "medium_url", "text")
+    ensure_column(conn, "images", "width", "integer")
+    ensure_column(conn, "images", "height", "integer")
+    ensure_column(conn, "images", "byte_size", "integer")
+    ensure_column(conn, "images", "favorite", "integer not null default 0")
+    ensure_column(conn, "images", "tags", "text not null default '[]'")
     ensure_column(conn, "conversations", "context_limit", "integer not null default 10")
     ensure_column(conn, "messages", "updated_at", "text")
     ensure_column(conn, "tasks", "progress", "integer not null default 0")
     ensure_column(conn, "tasks", "stage", "text")
+    ensure_column(conn, "tasks", "checkpoint_json", "text")
     ensure_column(conn, "tasks", "conversation_id", "integer")
     ensure_column(conn, "tasks", "user_message_id", "integer")
     ensure_column(conn, "tasks", "assistant_message_id", "integer")
     ensure_column(conn, "tasks", "image_provider_id", "integer")
     ensure_column(conn, "tasks", "image_provider_name", "text")
     ensure_column(conn, "tasks", "cancel_requested", "integer not null default 0")
+    ensure_column(conn, "tasks", "scheduled_for", "text")
+    ensure_column(conn, "tasks", "queue_group", "text")
+    ensure_column(conn, "tasks", "queue_position", "integer")
+    ensure_column(conn, "tasks", "queue_total", "integer")
+    ensure_column(conn, "tasks", "queue_label", "text")
+    ensure_column(conn, "tasks", "variant_name", "text")
     ensure_column(conn, "prompts", "source", "text not null default 'manual'")
     ensure_column(conn, "prompts", "mode", "text")
     ensure_column(conn, "prompts", "favorite", "integer not null default 0")
+    ensure_index(conn, "idx_tasks_status_updated_at", "tasks", ["status", "updated_at"])
+    ensure_index(conn, "idx_tasks_conversation_created_at", "tasks", ["conversation_id", "created_at"])
+    ensure_index(conn, "idx_tasks_status_scheduled_for", "tasks", ["status", "scheduled_for"])
+    ensure_index(conn, "idx_images_task_id", "images", ["task_id"])
+    ensure_index(conn, "idx_images_message_id", "images", ["message_id"])
+    ensure_index(conn, "idx_images_conversation_created_at", "images", ["conversation_id", "created_at"])
+    ensure_index(conn, "idx_conversations_updated_at", "conversations", ["updated_at"])
 
 
 @contextmanager
@@ -154,6 +223,11 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
         conn.execute(f"alter table {table} add column {column} {definition}")
 
 
+def ensure_index(conn: sqlite3.Connection, name: str, table: str, columns: list[str]) -> None:
+    column_clause = ", ".join(columns)
+    conn.execute(f"create index if not exists {name} on {table} ({column_clause})")
+
+
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
@@ -171,25 +245,51 @@ def create_task(
     conversation_id: int | None = None,
     user_message_id: int | None = None,
     assistant_message_id: int | None = None,
+    scheduled_for: str | None = None,
+    queue_group: str | None = None,
+    queue_position: int | None = None,
+    queue_total: int | None = None,
+    queue_label: str | None = None,
+    variant_name: str | None = None,
 ) -> int:
     stamp = now_iso()
+    if status == "scheduled":
+        progress = 0
+        stage = "等待定时执行"
+    elif status == "queued":
+        progress = 0
+        stage = "排队中"
+    else:
+        progress = 5
+        stage = "准备开始"
     with connect() as conn:
         cursor = conn.execute(
             """
             insert into tasks
-                (mode, prompt, status, progress, stage, params_json, conversation_id, user_message_id, assistant_message_id, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (
+                    mode, prompt, status, progress, stage, params_json,
+                    conversation_id, user_message_id, assistant_message_id,
+                    scheduled_for, queue_group, queue_position, queue_total, queue_label, variant_name,
+                    created_at, updated_at
+                )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 mode,
                 prompt,
                 status,
-                0 if status == "queued" else 5,
-                "排队中" if status == "queued" else "准备开始",
+                progress,
+                stage,
                 json_dumps(params),
                 conversation_id,
                 user_message_id,
                 assistant_message_id,
+                scheduled_for,
+                queue_group,
+                queue_position,
+                queue_total,
+                queue_label,
+                variant_name,
                 stamp,
                 stamp,
             ),
@@ -247,6 +347,15 @@ def add_image(
     source: str,
     file_path: Path,
     public_url: str,
+    thumb_path: str | None = None,
+    thumb_url: str | None = None,
+    medium_path: str | None = None,
+    medium_url: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    byte_size: int | None = None,
+    favorite: int = 0,
+    tags: str = "[]",
     mime_type: str,
     title: str | None = None,
     bucket: str | None = None,
@@ -258,8 +367,8 @@ def add_image(
         cursor = conn.execute(
             """
             insert into images
-                (task_id, conversation_id, message_id, title, bucket, source, file_path, public_url, mime_type, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (task_id, conversation_id, message_id, title, bucket, source, file_path, public_url, thumb_path, thumb_url, medium_path, medium_url, width, height, byte_size, favorite, tags, mime_type, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -270,6 +379,15 @@ def add_image(
                 source,
                 str(file_path),
                 public_url,
+                thumb_path,
+                thumb_url,
+                medium_path,
+                medium_url,
+                width,
+                height,
+                byte_size,
+                int(bool(favorite)),
+                tags,
                 mime_type,
                 now_iso(),
             ),

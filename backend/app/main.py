@@ -3,17 +3,20 @@ import copy
 import hashlib
 import hmac
 import html
+import io
 import json
 import re
 import sqlite3
 import time
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -41,6 +44,7 @@ from .config import (
 )
 from .openai_compat import (
     data_url_for_file,
+    ensure_image_variants,
     extract_images_from_responses,
     extract_text_from_responses,
     guess_mime,
@@ -48,6 +52,7 @@ from .openai_compat import (
     post_chat_completions,
     post_json,
     post_json_stream,
+    public_url_for_storage_path,
     safe_storage_folder,
     sanitize_response,
     save_upload,
@@ -68,6 +73,7 @@ TASK_EVENT_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
 TASK_EVENT_SNAPSHOTS: dict[str, dict[str, dict[str, Any]]] = {}
 IMAGE_PROVIDER_POOL_LOCK: asyncio.Lock | None = None
 IMAGE_PROVIDER_POOL_STATE: dict[str, dict[str, Any]] = {}
+TASK_SCHEDULER_LOOP: asyncio.Task[Any] | None = None
 ACCESS_COOKIE_NAME = "studio_access"
 ACCESS_PASSWORD = "hhs54666"
 ADDITIONAL_DEFAULT_ACCESS_PASSWORDS = ("hhs666666",)
@@ -76,7 +82,28 @@ ACCESS_USER_SETTINGS_KEY = "access_users"
 ACCESS_ERROR_MESSAGE = "密码错误，请联系管理员，管理员QQ为3286385052。"
 ACCESS_LOGIN_PATH = "/auth/login"
 ACCESS_ALLOWED_PATHS = {ACCESS_LOGIN_PATH, "/favicon.ico", "/favicon.svg"}
+MAX_BATCH_VARIANTS = 24
+SCHEDULER_POLL_INTERVAL_SECONDS = 1.5
 DEFAULT_ACCESS_PASSWORD = ACCESS_PASSWORD.lower()
+IMMUTABLE_PRIVATE_CACHE_CONTROL = "private, max-age=31536000, immutable"
+NO_STORE_CACHE_CONTROL = "no-store"
+PROVIDER_POOL_AUTO_RETRY_REASON = "all_providers_unavailable"
+PROVIDER_POOL_AUTO_RETRY_DELAYS = (1800, 3600, 7200, 18000)
+
+
+def add_vary_cookie(response: Any) -> None:
+    vary = response.headers.get("Vary", "")
+    if not any(part.strip().lower() == "cookie" for part in vary.split(",")):
+        response.headers["Vary"] = f"{vary}, Cookie" if vary else "Cookie"
+
+
+def apply_response_cache_headers(response: Any, path: str) -> Any:
+    if path.startswith("/media/") or path.startswith("/assets/"):
+        response.headers.setdefault("Cache-Control", IMMUTABLE_PRIVATE_CACHE_CONTROL)
+        add_vary_cookie(response)
+    elif path in {"/", "/index.html", ACCESS_LOGIN_PATH}:
+        response.headers.setdefault("Cache-Control", NO_STORE_CACHE_CONTROL)
+    return response
 
 
 def normalize_access_password(value: str) -> str:
@@ -234,6 +261,11 @@ class AppSettingsRequest(BaseModel):
     value: dict[str, Any] = Field(default_factory=dict)
 
 
+class ImageMetadataRequest(BaseModel):
+    favorite: int | None = Field(default=None, ge=0, le=1)
+    tags: list[str] | None = None
+
+
 class AccessUserRequest(BaseModel):
     password: str = Field(min_length=8, max_length=32)
 
@@ -243,6 +275,44 @@ class PromptRequest(BaseModel):
     source: str = "manual"
     mode: str | None = None
     favorite: int = 0
+
+
+class StyleLockRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    subject_lock: str = ""
+    composition_lock: str = ""
+    color_tone_lock: str = ""
+    lighting_lock: str = ""
+    texture_lock: str = ""
+    negative_lock: str = ""
+    notes: str = ""
+
+
+class CharacterProfileRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    age: str = ""
+    gender: str = ""
+    appearance: str = ""
+    wardrobe: str = ""
+    personality: str = ""
+    voice_style: str = ""
+    signature_items: str = ""
+    extra_prompt: str = ""
+    notes: str = ""
+
+
+class VariantPlanItem(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    prompt_suffix: str = ""
+    quality: str | None = None
+    size: str | None = None
+    background: str | None = None
+    output_format: str | None = None
+    output_compression: int | None = Field(default=None, ge=0, le=100)
+    n: int | None = Field(default=None, ge=1, le=10)
+    image_title: str | None = None
+    style_lock_id: int | None = None
+    delay_seconds: int = Field(default=0, ge=0, le=86400)
 
 
 class GenerateRequest(BaseModel):
@@ -260,6 +330,12 @@ class GenerateRequest(BaseModel):
     moderation: str = "auto"
     action: str = "generate"
     partial_images: int = Field(default=0, ge=0, le=3)
+    style_lock_id: int | None = None
+    character_profile_ids: list[int] = Field(default_factory=list)
+    schedule_at: str | None = None
+    schedule_spacing_seconds: int = Field(default=0, ge=0, le=86400)
+    batch_label: str | None = None
+    variant_plan: list[VariantPlanItem] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
 
 
@@ -299,6 +375,8 @@ class ChatRequest(BaseModel):
     reference_image_selection_modes: dict[str, str] = Field(default_factory=dict)
     upload_reference_roles: list[str] = Field(default_factory=list)
     upload_selection_modes: list[str] = Field(default_factory=list)
+    style_lock_id: int | None = None
+    character_profile_ids: list[int] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
     planner_config: ClientConfig | None = None
 
@@ -324,6 +402,8 @@ class StoryboardRequest(BaseModel):
     reference_image_selection_modes: dict[str, str] = Field(default_factory=dict)
     upload_reference_roles: list[str] = Field(default_factory=list)
     upload_selection_modes: list[str] = Field(default_factory=list)
+    style_lock_id: int | None = None
+    character_profile_ids: list[int] = Field(default_factory=list)
     config: ClientConfig = Field(default_factory=ClientConfig)
     planner_config: ClientConfig | None = None
 
@@ -560,13 +640,15 @@ def login_page_html(next_path: str = "/", error_message: str = "") -> str:
 async def require_project_password(request: Request, call_next: Callable[..., Any]):
     path = request.url.path or "/"
     if request.method == "OPTIONS" or path in ACCESS_ALLOWED_PATHS:
-        return await call_next(request)
+        response = await call_next(request)
+        return apply_response_cache_headers(response, path)
     scope = request_storage_scope(request)
     if scope is not None:
         token = set_storage_scope(scope)
         request.state.storage_scope = scope
         try:
-            return await call_next(request)
+            response = await call_next(request)
+            return apply_response_cache_headers(response, path)
         finally:
             reset_storage_scope(token)
     if path.startswith("/api/"):
@@ -600,10 +682,18 @@ def public_task_image(
     message_id: int | None = None,
 ) -> dict[str, Any]:
     file_path, public_url, mime_type = item
+    variants = ensure_image_variants(file_path, mime_type, existing={"public_url": public_url})
     image_id = db.add_image(
         source="api",
         file_path=file_path,
-        public_url=public_url,
+        public_url=str(variants.get("public_url") or public_url),
+        thumb_path=str(variants.get("thumb_path") or file_path),
+        thumb_url=str(variants.get("thumb_url") or public_url),
+        medium_path=str(variants.get("medium_path") or file_path),
+        medium_url=str(variants.get("medium_url") or public_url),
+        width=int(variants["width"]) if variants.get("width") is not None else None,
+        height=int(variants["height"]) if variants.get("height") is not None else None,
+        byte_size=int(variants["byte_size"]) if variants.get("byte_size") is not None else None,
         mime_type=mime_type,
         title=title,
         bucket=bucket,
@@ -611,44 +701,154 @@ def public_task_image(
         conversation_id=conversation_id,
         message_id=message_id,
     )
+    return serialize_image_record(
+        {
+            "id": image_id,
+            "source": "api",
+            "task_id": task_id,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "title": title,
+            "bucket": bucket,
+            "file_path": str(file_path),
+            "public_url": str(variants.get("public_url") or public_url),
+            "thumb_path": str(variants.get("thumb_path") or file_path),
+            "thumb_url": str(variants.get("thumb_url") or public_url),
+            "medium_path": str(variants.get("medium_path") or file_path),
+            "medium_url": str(variants.get("medium_url") or public_url),
+            "mime_type": mime_type,
+            "width": variants.get("width"),
+            "height": variants.get("height"),
+            "byte_size": variants.get("byte_size"),
+        }
+    )
+
+
+def serialize_path_image(path: Path, mime_type: str | None = None) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    mime = mime_type or guess_mime(path)
+    variants = ensure_image_variants(path, mime, existing={"public_url": public_url_for_storage_path(path)})
+    public_url = str(variants.get("public_url") or public_url_for_storage_path(path))
     return {
-        "id": image_id,
         "url": public_url,
         "public_url": public_url,
-        "source": "api",
-        "task_id": task_id,
-        "conversation_id": conversation_id,
-        "message_id": message_id,
-        "mime_type": mime_type,
-        "filename": file_path.name,
-        "title": title,
-        "bucket": bucket,
+        "thumb_url": str(variants.get("thumb_url") or public_url),
+        "medium_url": str(variants.get("medium_url") or public_url),
+        "file_path": str(path),
+        "thumb_path": str(variants.get("thumb_path") or path),
+        "medium_path": str(variants.get("medium_path") or path),
+        "filename": path.name,
+        "mime_type": mime,
+        "width": variants.get("width"),
+        "height": variants.get("height"),
+        "byte_size": variants.get("byte_size"),
+    }
+
+
+def persist_image_variants(conn: sqlite3.Connection, image_id: int, image: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        update images
+        set public_url = ?, thumb_path = ?, thumb_url = ?, medium_path = ?, medium_url = ?, width = ?, height = ?, byte_size = ?
+        where id = ?
+        """,
+        (
+            image.get("public_url"),
+            image.get("thumb_path"),
+            image.get("thumb_url"),
+            image.get("medium_path"),
+            image.get("medium_url"),
+            image.get("width"),
+            image.get("height"),
+            image.get("byte_size"),
+            image_id,
+        ),
+    )
+
+
+def ensure_image_payload(image: dict[str, Any], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    file_path = str(image.get("file_path") or "").strip()
+    if not file_path:
+        return image
+    path = Path(file_path)
+    if not path.exists():
+        return image
+    public_url = str(image.get("public_url") or public_url_for_storage_path(path))
+    variants = ensure_image_variants(
+        path,
+        str(image.get("mime_type") or guess_mime(path)),
+        existing={
+            "public_url": public_url,
+            "thumb_path": image.get("thumb_path"),
+            "thumb_url": image.get("thumb_url"),
+            "medium_path": image.get("medium_path"),
+            "medium_url": image.get("medium_url"),
+            "width": image.get("width"),
+            "height": image.get("height"),
+            "byte_size": image.get("byte_size"),
+        },
+    )
+    changed = False
+    for field in ("public_url", "thumb_path", "thumb_url", "medium_path", "medium_url", "width", "height", "byte_size"):
+        next_value = variants.get(field)
+        if next_value is None and field in {"width", "height", "byte_size"}:
+            continue
+        if image.get(field) != next_value:
+            image[field] = next_value
+            changed = True
+    if image.get("id") and changed:
+        image_id = int(image["id"])
+        if conn is not None:
+            persist_image_variants(conn, image_id, image)
+        else:
+            with db.connect() as inner_conn:
+                persist_image_variants(inner_conn, image_id, image)
+    return image
+
+
+def serialize_image_record(image: dict[str, Any] | sqlite3.Row, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    item = db.row_to_dict(image) if isinstance(image, sqlite3.Row) else dict(image)
+    item = ensure_image_payload(item, conn)
+    file_path = str(item.get("file_path") or "").strip()
+    filename = Path(file_path).name if file_path else str(item.get("filename") or "generated-image.png")
+    public_url = str(item.get("public_url") or "")
+    thumb_url = str(item.get("thumb_url") or public_url)
+    medium_url = str(item.get("medium_url") or public_url)
+    return {
+        "id": item.get("id"),
+        "url": public_url,
+        "public_url": public_url,
+        "thumb_url": thumb_url,
+        "medium_url": medium_url,
+        "source": item.get("source"),
+        "task_id": item.get("task_id"),
+        "conversation_id": item.get("conversation_id"),
+        "message_id": item.get("message_id"),
+        "mime_type": item.get("mime_type"),
+        "filename": filename,
+        "file_path": file_path,
+        "thumb_path": item.get("thumb_path"),
+        "medium_path": item.get("medium_path"),
+        "title": item.get("title"),
+        "bucket": item.get("bucket"),
+        "favorite": int(item.get("favorite") or 0),
+        "tags": parse_image_tags(item.get("tags")),
+        "created_at": item.get("created_at"),
+        "conversation_title": item.get("conversation_title"),
+        "message_content": item.get("message_content"),
+        "task_prompt": item.get("task_prompt"),
+        "task_mode": item.get("task_mode"),
+        "origin_source": item.get("origin_source"),
+        "width": item.get("width"),
+        "height": item.get("height"),
+        "byte_size": item.get("byte_size"),
     }
 
 
 def public_upload_image(path_value: str) -> dict[str, Any] | None:
     path = Path(path_value)
-    if not path.exists():
-        return None
-    upload_root = current_upload_dir()
-    output_root = current_output_dir()
-    public_url = None
-    try:
-        relative = path.relative_to(upload_root)
-        public_url = f"/media/uploads/{relative.as_posix()}"
-    except ValueError:
-        try:
-            relative = path.relative_to(output_root)
-            public_url = f"/media/outputs/{relative.as_posix()}"
-        except ValueError:
-            public_url = f"/media/uploads/{path.name}"
-    return {
-        "url": public_url,
-        "public_url": public_url,
-        "file_path": str(path),
-        "filename": path.name,
-        "mime_type": guess_mime(path),
-    }
+    return serialize_path_image(path)
 
 
 def public_input_image(
@@ -664,10 +864,18 @@ def public_input_image(
     public = public_upload_image(str(path))
     if not public:
         return None
+    variants = ensure_image_variants(path, mime_type, existing={"public_url": public["public_url"]})
     image_id = db.add_image(
         source=source,
         file_path=path,
         public_url=public["public_url"],
+        thumb_path=str(variants.get("thumb_path") or path),
+        thumb_url=str(variants.get("thumb_url") or public["public_url"]),
+        medium_path=str(variants.get("medium_path") or path),
+        medium_url=str(variants.get("medium_url") or public["public_url"]),
+        width=int(variants["width"]) if variants.get("width") is not None else None,
+        height=int(variants["height"]) if variants.get("height") is not None else None,
+        byte_size=int(variants["byte_size"]) if variants.get("byte_size") is not None else None,
         mime_type=mime_type,
         title=title,
         task_id=task_id,
@@ -684,7 +892,7 @@ def public_message_upload_image(image: dict[str, Any]) -> dict[str, Any] | None:
     file_path = str(image.get("file_path") or "").strip()
     if not file_path:
         return None
-    public = public_upload_image(file_path)
+    public = serialize_image_record(image)
     if not public:
         return None
     public.update(
@@ -736,12 +944,59 @@ def conversation_mode_label(mode: str | None) -> str:
 
 def task_status_label(status: str | None) -> str:
     return {
+        "scheduled": "待执行",
         "queued": "排队中",
         "running": "运行中",
         "done": "已完成",
         "failed": "失败",
         "canceled": "已停止",
     }.get(str(status or ""), "处理中")
+
+
+def normalize_image_tags(values: Any) -> list[str]:
+    raw_items: list[Any]
+    if isinstance(values, str):
+        raw_items = re.split(r"[,，\s]+", values)
+    elif isinstance(values, list):
+        raw_items = values
+    else:
+        raw_items = []
+    tags: list[str] = []
+    for item in raw_items:
+        tag = re.sub(r"\s+", " ", str(item or "").strip())
+        tag = tag.strip("#＃,，")
+        if not tag:
+            continue
+        tag = tag[:32]
+        if tag not in tags:
+            tags.append(tag)
+        if len(tags) >= 20:
+            break
+    return tags
+
+
+def parse_image_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return normalize_image_tags(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return normalize_image_tags(value)
+        return normalize_image_tags(parsed)
+    return []
+
+
+def normalize_reference_image_ids(values: Any) -> list[int]:
+    clean_ids: list[int] = []
+    for value in values or []:
+        try:
+            image_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if image_id > 0 and image_id not in clean_ids:
+            clean_ids.append(image_id)
+    return clean_ids
 
 
 def load_app_settings_value() -> dict[str, Any]:
@@ -1125,6 +1380,240 @@ def normalize_image_title(value: Any, fallback: str = "") -> str:
     return text[:80] or fallback
 
 
+def normalize_free_text(value: Any, limit: int = 1000) -> str:
+    text = fix_mojibake(str(value or "")).replace("\u3000", " ").strip()
+    return text[:limit]
+
+
+def normalize_profile_id_list(values: Any, limit: int = 6) -> list[int]:
+    ids: list[int] = []
+    for value in values if isinstance(values, list) else []:
+        try:
+            profile_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if profile_id > 0 and profile_id not in ids:
+            ids.append(profile_id)
+        if len(ids) >= limit:
+            break
+    return ids
+
+
+def normalize_schedule_at(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "定时执行时间格式不正确，请使用浏览器日期时间控件提交的时间。"},
+        ) from exc
+    if stamp.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        stamp = stamp.replace(tzinfo=local_tz)
+    return stamp.astimezone(timezone.utc).isoformat()
+
+
+def schedule_time_label(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    return stamp.astimezone().strftime("%m-%d %H:%M")
+
+
+def scheduled_task_stage(
+    scheduled_for: str | None,
+    *,
+    queue_position: int | None = None,
+    queue_total: int | None = None,
+    waiting_reason: str | None = None,
+) -> str:
+    queue_text = ""
+    if queue_total and queue_total > 1 and queue_position:
+        queue_text = f"第 {queue_position}/{queue_total} 个"
+    prefix = f"{queue_text}批量任务" if queue_text else "任务"
+    if waiting_reason:
+        return f"{prefix}等待执行：{waiting_reason}"
+    time_text = schedule_time_label(scheduled_for)
+    return f"{prefix}将于 {time_text} 执行" if time_text else "等待定时执行"
+
+
+def retry_delay_label(seconds: int) -> str:
+    value = max(int(seconds), 0)
+    if value % 3600 == 0 and value > 0:
+        return f"{value // 3600}小时"
+    if value % 60 == 0 and value > 0:
+        return f"{value // 60}分钟"
+    return f"{value}秒"
+
+
+def provider_pool_auto_retry_stage(scheduled_for: str, retry_index: int, total_retries: int, delay_seconds: int) -> str:
+    time_text = schedule_time_label(scheduled_for)
+    delay_text = retry_delay_label(delay_seconds)
+    return f"全部生图提供商暂不可用，已进入自动重试队列：第 {retry_index}/{total_retries} 次将于 {time_text} 执行（{delay_text}后）"
+
+
+def serialize_style_lock_row(row: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    item = db.row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    return {
+        **item,
+        "name": normalize_image_title(item.get("name"), fallback="未命名风格锁"),
+        "subject_lock": normalize_free_text(item.get("subject_lock"), 600),
+        "composition_lock": normalize_free_text(item.get("composition_lock"), 600),
+        "color_tone_lock": normalize_free_text(item.get("color_tone_lock"), 600),
+        "lighting_lock": normalize_free_text(item.get("lighting_lock"), 600),
+        "texture_lock": normalize_free_text(item.get("texture_lock"), 600),
+        "negative_lock": normalize_free_text(item.get("negative_lock"), 600),
+        "notes": normalize_free_text(item.get("notes"), 1000),
+    }
+
+
+def serialize_character_profile_row(row: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    item = db.row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    return {
+        **item,
+        "name": normalize_image_title(item.get("name"), fallback="未命名角色"),
+        "age": normalize_free_text(item.get("age"), 120),
+        "gender": normalize_free_text(item.get("gender"), 120),
+        "appearance": normalize_free_text(item.get("appearance"), 800),
+        "wardrobe": normalize_free_text(item.get("wardrobe"), 800),
+        "personality": normalize_free_text(item.get("personality"), 600),
+        "voice_style": normalize_free_text(item.get("voice_style"), 400),
+        "signature_items": normalize_free_text(item.get("signature_items"), 400),
+        "extra_prompt": normalize_free_text(item.get("extra_prompt"), 800),
+        "notes": normalize_free_text(item.get("notes"), 1000),
+    }
+
+
+def load_style_lock(style_lock_id: int | None) -> dict[str, Any] | None:
+    if not style_lock_id:
+        return None
+    with db.connect() as conn:
+        row = conn.execute("select * from style_locks where id = ?", (int(style_lock_id),)).fetchone()
+    return serialize_style_lock_row(row) if row else None
+
+
+def load_character_profiles(profile_ids: list[int] | Any) -> list[dict[str, Any]]:
+    ids = normalize_profile_id_list(profile_ids)
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"select * from character_profiles where id in ({placeholders}) order by id asc",
+            ids,
+        ).fetchall()
+    by_id = {int(row["id"]): serialize_character_profile_row(row) for row in rows}
+    return [by_id[item] for item in ids if item in by_id]
+
+
+def style_lock_prompt_block(style_lock: dict[str, Any] | None) -> str:
+    if not style_lock:
+        return ""
+    lines: list[str] = [f"风格锁定：{style_lock.get('name') or '未命名风格锁'}"]
+    mapping = [
+        ("主体保持", style_lock.get("subject_lock")),
+        ("构图保持", style_lock.get("composition_lock")),
+        ("色调保持", style_lock.get("color_tone_lock")),
+        ("光线保持", style_lock.get("lighting_lock")),
+        ("材质质感保持", style_lock.get("texture_lock")),
+        ("需要规避", style_lock.get("negative_lock")),
+    ]
+    for label, value in mapping:
+        text = normalize_free_text(value, 800)
+        if text:
+            lines.append(f"- {label}：{text}")
+    return "\n".join(lines)
+
+
+def character_profiles_prompt_block(character_profiles: list[dict[str, Any]]) -> str:
+    if not character_profiles:
+        return ""
+    lines = ["角色档案锁定："]
+    for index, profile in enumerate(character_profiles, start=1):
+        parts = [f"{index}. {profile.get('name') or f'角色{index}'}"]
+        if profile.get("age"):
+            parts.append(f"年龄={profile['age']}")
+        if profile.get("gender"):
+            parts.append(f"性别={profile['gender']}")
+        for label, key in [
+            ("外观", "appearance"),
+            ("服装", "wardrobe"),
+            ("性格", "personality"),
+            ("标志物", "signature_items"),
+            ("额外提示", "extra_prompt"),
+        ]:
+            text = normalize_free_text(profile.get(key), 800)
+            if text:
+                parts.append(f"{label}={text}")
+        lines.append("；".join(parts))
+    return "\n".join(lines)
+
+
+def planner_constraint_block(
+    character_profiles: list[dict[str, Any]] | None = None,
+    style_lock: dict[str, Any] | None = None,
+) -> str:
+    blocks = [
+        character_profiles_prompt_block(character_profiles or []),
+        style_lock_prompt_block(style_lock),
+    ]
+    blocks = [block for block in blocks if block]
+    if not blocks:
+        return ""
+    return "你还必须遵守以下长期一致性约束：\n" + "\n".join(blocks)
+
+
+def apply_locked_prompt(
+    prompt: str,
+    *,
+    character_profiles: list[dict[str, Any]] | None = None,
+    style_lock: dict[str, Any] | None = None,
+    variant_prompt_suffix: str = "",
+) -> str:
+    sections = [normalize_free_text(prompt, 4000)]
+    extra = normalize_free_text(variant_prompt_suffix, 1200)
+    if extra:
+        sections.append(f"本次变体附加要求：{extra}")
+    constraint = planner_constraint_block(character_profiles, style_lock)
+    if constraint:
+        sections.append(f"最终执行时必须严格保持以下约束：\n{constraint}")
+    return "\n\n".join(part for part in sections if part).strip()
+
+
+def normalize_variant_plan(values: Any) -> list[dict[str, Any]]:
+    variants: list[dict[str, Any]] = []
+    for index, item in enumerate(values if isinstance(values, list) else [], start=1):
+        if len(variants) >= MAX_BATCH_VARIANTS:
+            break
+        if not isinstance(item, dict):
+            continue
+        try:
+            payload = VariantPlanItem(**item).model_dump()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"message": f"第 {index} 个批量变体配置无效，请检查名称、数量和参数格式。"}) from exc
+        payload["name"] = normalize_image_title(payload.get("name") or f"变体{index}", fallback=f"变体{index}")
+        payload["prompt_suffix"] = normalize_free_text(payload.get("prompt_suffix"), 1200)
+        payload["image_title"] = normalize_image_title(payload.get("image_title") or "")
+        variants.append(payload)
+    return variants
+
+
+def task_batch_group_id(mode: str, prompt: str) -> str:
+    seed = f"{mode}:{prompt}:{db.now_iso()}:{time.time_ns()}"
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def add_seconds_to_iso(value: str, seconds: int) -> str:
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return (stamp + timedelta(seconds=max(int(seconds), 0))).astimezone(timezone.utc).isoformat()
+
+
 def normalize_filename_stem(value: Any, fallback: str = "image") -> str:
     stem = normalize_image_title(value, fallback=fallback)
     stem = stem.rstrip(". ").strip()
@@ -1175,26 +1664,35 @@ def build_direct_mode_base_title(
     return normalize_image_title(f"{build_timestamp_label(created_at)} {conversation_title}", fallback=build_timestamp_label(created_at))
 
 
-def summarize_task(row: Any) -> dict[str, Any]:
+def summarize_task(row: Any, *, include_response: bool = True) -> dict[str, Any]:
     item = db.row_to_dict(row)
     raw_response_json = item.get("response_json")
+    checkpoint_json = item.get("checkpoint_json")
     if isinstance(item.get("params_json"), str):
         try:
             item["params"] = json.loads(item["params_json"])
         except json.JSONDecodeError:
             item["params"] = {}
-    if isinstance(raw_response_json, str):
+    if include_response and isinstance(raw_response_json, str):
         try:
             item["response"] = json.loads(raw_response_json)
         except json.JSONDecodeError:
             item["response"] = None
         if len(raw_response_json) > 2000:
             item["response_json"] = f"[response omitted, {len(raw_response_json)} chars]"
+    elif isinstance(raw_response_json, str):
+        item["response"] = None
+        item["response_json"] = f"[response omitted, {len(raw_response_json)} chars]"
     if isinstance(item.get("error"), str) and item["error"]:
         try:
             item["error_detail"] = json.loads(item["error"])
         except json.JSONDecodeError:
             item["error_detail"] = item["error"]
+    if isinstance(checkpoint_json, str):
+        try:
+            item["checkpoint"] = json.loads(checkpoint_json)
+        except json.JSONDecodeError:
+            item["checkpoint"] = None
     item["prompt_text"] = prompt_text_for_task(item)
     return item
 
@@ -1242,7 +1740,7 @@ def task_with_images(task_id: int) -> dict[str, Any]:
         if not row:
             raise HTTPException(status_code=404, detail="task not found")
         images = [
-            db.row_to_dict(image)
+            serialize_image_record(image, conn)
             for image in conn.execute(
                 "select * from images where task_id = ? order by id asc",
                 (task_id,),
@@ -1302,8 +1800,299 @@ def summarize_task_like(task: dict[str, Any]) -> dict[str, Any]:
             item["error_detail"] = json.loads(item["error"])
         except json.JSONDecodeError:
             item["error_detail"] = item["error"]
+    if isinstance(item.get("checkpoint_json"), str):
+        try:
+            item["checkpoint"] = json.loads(item["checkpoint_json"] or "{}")
+        except json.JSONDecodeError:
+            item["checkpoint"] = None
     item["prompt_text"] = prompt_text_for_task(item)
     return item
+
+
+def compact_checkpoint_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: compact_checkpoint_payload(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [compact_checkpoint_payload(item) for item in value]
+    return value
+
+
+def serialize_upload_items(items: list[tuple[Path, str]]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for path, mime_type in items:
+        payload.append({"file_path": str(path), "mime_type": mime_type})
+    return payload
+
+
+def restore_upload_items(items: list[dict[str, Any]] | Any) -> list[tuple[Path, str]]:
+    restored: list[tuple[Path, str]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        path = Path(str(item.get("file_path") or ""))
+        if not path.exists():
+            continue
+        restored.append((path, str(item.get("mime_type") or guess_mime(path))))
+    return restored
+
+
+def task_checkpoint_dict(task: dict[str, Any] | None) -> dict[str, Any]:
+    if not task:
+        return {}
+    checkpoint = task.get("checkpoint")
+    return checkpoint if isinstance(checkpoint, dict) else {}
+
+
+def existing_task_output_images(task: dict[str, Any] | None, *, completed_count: int | None = None) -> list[dict[str, Any]]:
+    images = [copy.deepcopy(image) for image in (task or {}).get("images", []) if image.get("source") == "api"]
+    if completed_count is None:
+        return images
+    return images[: max(int(completed_count), 0)]
+
+
+def strip_auto_retry_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(checkpoint, dict):
+        return {}
+    sanitized = copy.deepcopy(checkpoint)
+    sanitized.pop("auto_retry", None)
+    return sanitized
+
+
+def is_all_providers_unavailable_detail(detail: Any) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    message = str(detail.get("message") or "").strip()
+    providers = detail.get("providers")
+    return bool(message and "所有提供商都暂时不可用" in message and isinstance(providers, list))
+
+
+def is_all_providers_unavailable_exception(exc: HTTPException) -> bool:
+    return int(exc.status_code or 0) == 503 and is_all_providers_unavailable_detail(exc.detail)
+
+
+def schedule_provider_pool_auto_retry(task_id: int, exc: HTTPException) -> dict[str, Any] | None:
+    task = task_with_images(task_id)
+    checkpoint = task_checkpoint_dict(task)
+    auto_retry = checkpoint.get("auto_retry") if isinstance(checkpoint.get("auto_retry"), dict) else {}
+    scheduled_count = max(int(auto_retry.get("scheduled_count") or 0), 0)
+    if scheduled_count >= len(PROVIDER_POOL_AUTO_RETRY_DELAYS):
+        return None
+    delay_seconds = PROVIDER_POOL_AUTO_RETRY_DELAYS[scheduled_count]
+    next_retry_index = scheduled_count + 1
+    scheduled_for = add_seconds_to_iso(db.now_iso(), delay_seconds)
+    detail = copy.deepcopy(exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)})
+    auto_retry_state = {
+        "reason": PROVIDER_POOL_AUTO_RETRY_REASON,
+        "scheduled_count": next_retry_index,
+        "max_retries": len(PROVIDER_POOL_AUTO_RETRY_DELAYS),
+        "next_retry_at": scheduled_for,
+        "next_delay_seconds": delay_seconds,
+        "retry_delays_seconds": list(PROVIDER_POOL_AUTO_RETRY_DELAYS),
+        "last_error": detail,
+        "last_failure_at": db.now_iso(),
+    }
+    next_checkpoint = compact_checkpoint_payload(
+        {
+            **checkpoint,
+            "updated_at": db.now_iso(),
+            "auto_retry": auto_retry_state,
+        }
+    )
+    stage = provider_pool_auto_retry_stage(scheduled_for, next_retry_index, len(PROVIDER_POOL_AUTO_RETRY_DELAYS), delay_seconds)
+    db.update_task(
+        task_id,
+        status="scheduled",
+        scheduled_for=scheduled_for,
+        stage=stage,
+        checkpoint_json=db.json_dumps(next_checkpoint),
+        error=None,
+        cancel_requested=0,
+    )
+    return {
+        "retry_index": next_retry_index,
+        "max_retries": len(PROVIDER_POOL_AUTO_RETRY_DELAYS),
+        "scheduled_for": scheduled_for,
+        "delay_seconds": delay_seconds,
+        "stage": stage,
+        "reason": PROVIDER_POOL_AUTO_RETRY_REASON,
+    }
+
+
+def persist_task_checkpoint(
+    task_id: int,
+    *,
+    mode: str,
+    step: str,
+    progress: int | None = None,
+    stage: str | None = None,
+    can_resume: bool = False,
+    **data: Any,
+) -> dict[str, Any]:
+    if "auto_retry" not in data:
+        existing_task = db.get_task(task_id)
+        if existing_task and isinstance(existing_task.get("checkpoint_json"), str):
+            try:
+                existing_checkpoint = json.loads(existing_task["checkpoint_json"] or "{}")
+            except json.JSONDecodeError:
+                existing_checkpoint = {}
+            if isinstance(existing_checkpoint, dict) and isinstance(existing_checkpoint.get("auto_retry"), dict):
+                data["auto_retry"] = copy.deepcopy(existing_checkpoint["auto_retry"])
+    checkpoint = compact_checkpoint_payload(
+        {
+            "version": 1,
+            "mode": mode,
+            "step": step,
+            "can_resume": can_resume,
+            "updated_at": db.now_iso(),
+            **data,
+        }
+    )
+    fields: dict[str, Any] = {"checkpoint_json": db.json_dumps(checkpoint)}
+    if progress is not None:
+        fields["progress"] = progress
+    if stage is not None:
+        fields["stage"] = stage
+    db.update_task(task_id, **fields)
+    return checkpoint
+
+
+def merge_task_checkpoint_state(task_id: int, **data: Any) -> dict[str, Any] | None:
+    task = db.get_task(task_id)
+    if not task:
+        return None
+    raw_checkpoint = task.get("checkpoint_json")
+    checkpoint: dict[str, Any] = {}
+    if isinstance(raw_checkpoint, str) and raw_checkpoint.strip():
+        try:
+            parsed = json.loads(raw_checkpoint or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            checkpoint = parsed
+    if not isinstance(checkpoint, dict):
+        checkpoint = {}
+    base_checkpoint = {
+        "version": int(checkpoint.get("version") or 1),
+        "mode": str(checkpoint.get("mode") or task.get("mode") or ""),
+        "step": str(data.get("step") or checkpoint.get("step") or "runtime_update"),
+        "can_resume": bool(data["can_resume"]) if "can_resume" in data else bool(checkpoint.get("can_resume")),
+    }
+    next_checkpoint = compact_checkpoint_payload(
+        {
+            **base_checkpoint,
+            **checkpoint,
+            "updated_at": db.now_iso(),
+            **data,
+        }
+    )
+    db.update_task(task_id, checkpoint_json=db.json_dumps(next_checkpoint))
+    return next_checkpoint
+
+
+def requeue_task_for_manual_retry(task: dict[str, Any], checkpoint: dict[str, Any]) -> dict[str, Any]:
+    task_id = int(task["id"])
+    can_resume = bool(checkpoint.get("can_resume"))
+    if not can_resume and str(task.get("mode") or "") == "storyboard":
+        storyboard = checkpoint.get("storyboard") if isinstance(checkpoint.get("storyboard"), dict) else {}
+        shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
+        can_resume = any(isinstance(shot, dict) and shot.get("status") == "done" for shot in shots)
+    stage = "已加入重试队列，准备按当前进度继续" if can_resume else "已加入重试队列，准备重新执行当前任务"
+    progress = min(max(int(task.get("progress") or 5), 5), 95)
+    fields: dict[str, Any] = {
+        "status": "scheduled",
+        "progress": progress,
+        "stage": stage,
+        "error": None,
+        "response_json": None,
+        "cancel_requested": 0,
+        "scheduled_for": None,
+        "image_provider_id": None,
+        "image_provider_name": None,
+    }
+    sanitized_checkpoint = strip_auto_retry_checkpoint(checkpoint)
+    if sanitized_checkpoint:
+        fields["checkpoint_json"] = db.json_dumps(
+            compact_checkpoint_payload(
+                {
+                    **sanitized_checkpoint,
+                    "updated_at": db.now_iso(),
+                    "stage": stage,
+                    "progress": progress,
+                    "last_status": "scheduled",
+                    "last_error": None,
+                    "manual_retry_requested_at": db.now_iso(),
+                }
+            )
+        )
+    db.update_task(task_id, **fields)
+    return task_with_images(task_id)
+
+
+def clone_image_record_to_task(
+    image: dict[str, Any],
+    *,
+    task_id: int | None,
+    conversation_id: int | None,
+    message_id: int | None,
+) -> dict[str, Any] | None:
+    file_path = Path(str(image.get("file_path") or ""))
+    if not file_path.exists():
+        return None
+    image_id = db.add_image(
+        source=str(image.get("source") or "api"),
+        file_path=file_path,
+        public_url=str(image.get("public_url") or image.get("url") or ""),
+        thumb_path=str(image.get("thumb_path") or file_path),
+        thumb_url=str(image.get("thumb_url") or image.get("public_url") or image.get("url") or ""),
+        medium_path=str(image.get("medium_path") or file_path),
+        medium_url=str(image.get("medium_url") or image.get("public_url") or image.get("url") or ""),
+        width=int(image["width"]) if image.get("width") is not None else None,
+        height=int(image["height"]) if image.get("height") is not None else None,
+        byte_size=int(image["byte_size"]) if image.get("byte_size") is not None else None,
+        mime_type=str(image.get("mime_type") or "image/png"),
+        title=image.get("title"),
+        bucket=image.get("bucket"),
+        task_id=task_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    copied = {
+        **image,
+        "id": image_id,
+        "task_id": task_id,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+    }
+    return serialize_image_record(copied)
+
+
+def restore_completed_output_images(
+    old_task: dict[str, Any],
+    *,
+    new_task_id: int,
+    conversation_id: int | None,
+    message_id: int | None,
+    completed_count: int,
+) -> list[dict[str, Any]]:
+    restored: list[dict[str, Any]] = []
+    if completed_count <= 0:
+        return restored
+    source_images = [image for image in old_task.get("images", []) if image.get("source") == "api"]
+    for image in source_images[:completed_count]:
+        copied = clone_image_record_to_task(
+            image,
+            task_id=new_task_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+        if copied:
+            copied["prompt_text"] = image.get("prompt_text")
+            restored.append(copied)
+    return restored
 
 
 def update_message_meta(message_id: int, updates: dict[str, Any], response_id: str | None = None) -> None:
@@ -1369,19 +2158,29 @@ def deletable_media_paths(rows: list[Any], delete_ids: list[int]) -> list[str]:
     paths: list[str] = []
     with db.connect() as conn:
         for row in rows:
-            path = str(row["file_path"])
-            if ids:
-                count = conn.execute(
-                    f"select count(*) as count from images where file_path = ? and id not in ({placeholders})",
-                    [path, *ids],
-                ).fetchone()["count"]
-            else:
-                count = conn.execute(
-                    "select count(*) as count from images where file_path = ?",
-                    (path,),
-                ).fetchone()["count"]
-            if int(count) == 0:
-                paths.append(path)
+            for field in ("file_path", "thumb_path", "medium_path"):
+                path = str(row[field] or "").strip() if field in row.keys() else ""
+                if not path or path in paths:
+                    continue
+                if ids:
+                    count = conn.execute(
+                        f"""
+                        select count(*) as count from images
+                        where (file_path = ? or thumb_path = ? or medium_path = ?)
+                          and id not in ({placeholders})
+                        """,
+                        [path, path, path, *ids],
+                    ).fetchone()["count"]
+                else:
+                    count = conn.execute(
+                        """
+                        select count(*) as count from images
+                        where file_path = ? or thumb_path = ? or medium_path = ?
+                        """,
+                        (path, path, path),
+                    ).fetchone()["count"]
+                if int(count) == 0:
+                    paths.append(path)
     return paths
 
 
@@ -1423,6 +2222,37 @@ def parse_message_meta(item: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def load_recent_messages(
+    conversation_id: int,
+    limit: int,
+    *,
+    exclude_message_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    clean_limit = max(int(limit or 0), 0)
+    if clean_limit <= 0:
+        return []
+    excluded = [message_id for message_id in normalize_reference_image_ids(exclude_message_ids or []) if message_id > 0]
+    where_clause = "where conversation_id = ?"
+    query_values: list[Any] = [conversation_id]
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        where_clause += f" and id not in ({placeholders})"
+        query_values.extend(excluded)
+    query_values.append(clean_limit)
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"""
+            select id, role, content, meta_json, created_at
+            from messages
+            {where_clause}
+            order by id desc
+            limit ?
+            """,
+            query_values,
+        ).fetchall()
+    return list(reversed([db.row_to_dict(row) for row in rows]))
+
+
 def build_context_prompt(history: list[dict[str, Any]], prompt: str) -> str:
     if not history:
         return prompt
@@ -1449,9 +2279,12 @@ def build_chat_planner_prompt(
     has_images: bool,
     image_candidates: list[dict[str, Any]] | None = None,
     attach_reference_images: bool = True,
+    character_profiles: list[dict[str, Any]] | None = None,
+    style_lock: dict[str, Any] | None = None,
 ) -> str:
     context = build_context_prompt(history, prompt)
     image_candidates = image_candidates or []
+    consistency_note = planner_constraint_block(character_profiles, style_lock)
     if image_candidates:
         source_note = "用户本轮已经明确指定了参考图片。" if has_images else "用户本轮没有指定参考图片。"
         lines = [f"{source_note} 已指定参考图如下；如果你决定执行图片修改，应使用这些参考图，不要自行选择其它历史图片："]
@@ -1489,6 +2322,8 @@ def build_chat_planner_prompt(
 8. 若 action=edit，edit_target_image_refs 必须填写“被直接修改”的目标图 ref；若是历史生成图，同时在 edit_target_image_ids 里填写对应 image_id。若有辅助参考图但不是直接修改对象，它们只能出现在 reference_image_refs 里，不能混进 edit_target_image_refs。
 9. image_prompt 必须把用户意图改写成适合 image_generation 的单张图片提示词，并明确保留不应变化的主体、构图、风格或参考图特征。
 10. 若 should_generate=true，必须顺便给这张图片生成一个简短中文名称 image_name；名称要便于用户识别、适合直接作为图片名，禁止带文件扩展名。
+
+{consistency_note}
 
 {image_note}
 
@@ -1568,9 +2403,12 @@ def build_storyboard_planner_prompt(
     image_candidates: list[dict[str, Any]] | None,
     shot_limit: int,
     attach_reference_images: bool = True,
+    character_profiles: list[dict[str, Any]] | None = None,
+    style_lock: dict[str, Any] | None = None,
 ) -> str:
     context = build_context_prompt(history, prompt)
     image_candidates = image_candidates or []
+    consistency_note = planner_constraint_block(character_profiles, style_lock)
     if image_candidates:
         lines = ["用户本轮已经明确指定了以下角色/场景参考图；第一镜头必须优先使用这些锚点规划。"]
         for index, image in enumerate(image_candidates, start=1):
@@ -1603,6 +2441,8 @@ def build_storyboard_planner_prompt(
 9. 第 2 个及后续镜头必须使用 action=edit，并默认以上一镜头输出画面作为直接编辑目标；若还要补充用户显式参考图作为辅助锚点，可在该镜头里填写 reference_image_refs。
 10. 你需要为每个镜头生成中文名字，名字要短、能作为文件名，必须包含镜头顺序含义，但不要包含文件扩展名。
 11. 最多输出 {shot_limit} 个镜头；如果用户没有指定数量，优先 3-5 个镜头。
+
+{consistency_note}
 
 {image_note}
 
@@ -1832,16 +2672,7 @@ def build_selected_image_candidates(
 
 
 def load_selected_reference_images(image_ids: list[int], limit: int = 3, conversation_id: int | None = None) -> list[dict[str, Any]]:
-    clean_ids: list[int] = []
-    for value in image_ids:
-        try:
-            image_id = int(value)
-        except (TypeError, ValueError):
-            continue
-        if image_id > 0 and image_id not in clean_ids:
-            clean_ids.append(image_id)
-        if len(clean_ids) >= limit:
-            break
+    clean_ids = normalize_reference_image_ids(image_ids)[: max(int(limit or 0), 0)]
     if not clean_ids:
         return []
     placeholders = ",".join("?" for _ in clean_ids)
@@ -1865,6 +2696,42 @@ def load_selected_reference_images(image_ids: list[int], limit: int = 3, convers
         ).fetchall()
     by_id = {int(row["id"]): db.row_to_dict(row) for row in rows}
     return [by_id[image_id] for image_id in clean_ids if image_id in by_id and Path(by_id[image_id]["file_path"]).exists()]
+
+
+def require_selected_reference_images(
+    image_ids: list[int] | Any,
+    *,
+    limit: int,
+    conversation_id: int | None,
+    label: str,
+) -> list[dict[str, Any]]:
+    clean_ids = normalize_reference_image_ids(image_ids)
+    max_count = max(int(limit or 0), 0)
+    if len(clean_ids) > max_count:
+        message = f"{label}最多只能选择 {max_count} 张，请先移除多余参考图后再继续。"
+        if max_count <= 0:
+            message = f"{label}已达到上限，请先移除一张或减少上传图片后再继续。"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": message,
+                "requested_image_ids": clean_ids,
+                "limit": max_count,
+            },
+        )
+    selected = load_selected_reference_images(clean_ids, limit=max_count, conversation_id=conversation_id)
+    loaded_ids = {int(item["id"]) for item in selected if item.get("id") is not None}
+    missing_ids = [image_id for image_id in clean_ids if image_id not in loaded_ids]
+    if missing_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"{label}里有图片已不存在、不属于当前会话，或原文件已丢失，无法继续保证上下文完整性。",
+                "missing_image_ids": missing_ids,
+                "requested_image_ids": clean_ids,
+            },
+        )
+    return selected
 
 
 def load_conversation_image_candidates(conversation_id: int, limit: int = 8) -> list[dict[str, Any]]:
@@ -2148,17 +3015,27 @@ def resolve_storyboard_shot_inputs(
     return action, uploads, notes, merged_references, target_candidates
 
 
-def load_seed_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def load_seed_images_from_payload(
+    payload: dict[str, Any],
+    *,
+    strict: bool = False,
+    label: str = "参考图快照",
+) -> list[dict[str, Any]]:
     raw_items = payload.get("seed_images") if isinstance(payload.get("seed_images"), list) else []
     candidates: list[dict[str, Any]] = []
+    missing_refs: list[str] = []
     for index, item in enumerate(raw_items, start=1):
         if not isinstance(item, dict):
             continue
         path_value = str(item.get("file_path") or "").strip()
         if not path_value:
+            if strict:
+                missing_refs.append(str(item.get("ref") or f"seed:{index}"))
             continue
         path = Path(path_value)
         if not path.exists():
+            if strict:
+                missing_refs.append(str(item.get("ref") or f"seed:{index}"))
             continue
         role = normalize_reference_role(item.get("role"), index)
         selection_mode = normalize_reference_selection_mode(item.get("selection_mode"), default="reference")
@@ -2178,6 +3055,14 @@ def load_seed_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any
                 "selection_mode": selection_mode,
                 "selection_mode_label": reference_selection_mode_label(selection_mode),
             }
+        )
+    if strict and missing_refs:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"{label}缺失，当前无法保证把原始背景上下文完整传给模型。",
+                "missing_refs": missing_refs,
+            },
         )
     return candidates
 
@@ -2209,6 +3094,38 @@ def load_seed_images_from_task_images(images: list[dict[str, Any]]) -> list[dict
             }
         )
     return candidates
+
+
+def recover_task_image_candidates(
+    task: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    conversation_id: int | None,
+    label: str,
+) -> list[dict[str, Any]]:
+    snapshot_candidates = load_seed_images_from_payload(params, strict=True, label=label)
+    if snapshot_candidates:
+        return snapshot_candidates
+    uploaded = [
+        (Path(str(image.get("file_path") or "")), str(image.get("mime_type") or "image/png"))
+        for image in task.get("images", [])
+        if image.get("source") == "input" and Path(str(image.get("file_path") or "")).exists()
+    ]
+    selected_reference_images = require_selected_reference_images(
+        params.get("reference_image_ids") or [],
+        limit=max(0, 3 - len(uploaded)),
+        conversation_id=conversation_id,
+        label=label,
+    )
+    return [
+        *build_uploaded_image_candidates(uploaded, params.get("upload_reference_roles"), params.get("upload_selection_modes")),
+        *build_selected_image_candidates(
+            selected_reference_images,
+            params.get("reference_image_roles"),
+            params.get("reference_image_selection_modes"),
+            start_order=len(uploaded) + 1,
+        ),
+    ]
 
 
 def build_image_generation_tool(
@@ -2415,42 +3332,42 @@ async def call_responses_image_generation(
 
 
 def update_timeout_retry_stage(task_id: int, quality: str) -> None:
-    db.update_task(
+    update_task_stage(
         task_id,
+        f"上游网关超时，已自动切换到{quality}清晰度稳定重试",
         progress=52,
-        stage=f"上游网关超时，已自动切换到{quality}清晰度稳定重试",
     )
 
 
 def handle_image_stream_event(task_id: int, event: dict[str, Any]) -> None:
     event_type = str(event.get("type") or "")
     if event_type.endswith(".in_progress") or event_type == "response.in_progress":
-        db.update_task(task_id, progress=45, stage="上游已开始处理图像请求")
+        update_task_stage(task_id, "上游已开始处理图像请求", progress=45)
     elif event_type == "response.image_generation_call.partial_image":
         index = event.get("partial_image_index")
         label = f"上游返回局部预览 {index}" if index is not None else "上游返回局部预览"
-        db.update_task(task_id, progress=68, stage=label)
+        update_task_stage(task_id, label, progress=68)
     elif event_type == "response.output_item.done":
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         if item.get("type") == "image_generation_call":
-            db.update_task(task_id, progress=88, stage="上游已返回最终图片")
+            update_task_stage(task_id, "上游已返回最终图片", progress=88)
     elif event_type == "response.completed":
-        db.update_task(task_id, progress=92, stage="上游响应完成，正在保存图片")
+        update_task_stage(task_id, "上游响应完成，正在保存图片", progress=92)
 
 
 def handle_storyboard_stream_event(task_id: int, shot_index: int, total: int, shot_name: str, event: dict[str, Any]) -> None:
     event_type = str(event.get("type") or "")
     prefix = f"镜头 {shot_index}/{total}：{shot_name}"
     if event_type.endswith(".in_progress") or event_type == "response.in_progress":
-        db.update_task(task_id, stage=f"{prefix} 上游已开始处理")
+        update_task_stage(task_id, f"{prefix} 上游已开始处理")
     elif event_type == "response.image_generation_call.partial_image":
-        db.update_task(task_id, stage=f"{prefix} 上游返回局部预览")
+        update_task_stage(task_id, f"{prefix} 上游返回局部预览")
     elif event_type == "response.output_item.done":
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         if item.get("type") == "image_generation_call":
-            db.update_task(task_id, stage=f"{prefix} 上游已返回最终图片")
+            update_task_stage(task_id, f"{prefix} 上游已返回最终图片")
     elif event_type == "response.completed":
-        db.update_task(task_id, stage=f"{prefix} 上游响应完成，正在保存图片")
+        update_task_stage(task_id, f"{prefix} 上游响应完成，正在保存图片")
 
 
 def responses_payload_for_planner(
@@ -2653,25 +3570,35 @@ async def acquire_image_provider_slot(
         state["assigned_count"] = int(state["assigned_count"]) + 1
 
     waiting_text = resolve_provider_stage_text(waiting_stage, provider, f"已分配生图提供商：{provider['name']}，等待空闲通道")
-    db.update_task(
+    update_task_stage(
         task_id,
-        image_provider_id=int(provider["id"]),
-        image_provider_name=str(provider["name"]),
-        stage=waiting_text if waiting else resolve_provider_stage_text(running_stage or waiting_stage, provider, f"已分配生图提供商：{provider['name']}"),
+        waiting_text if waiting else resolve_provider_stage_text(running_stage or waiting_stage, provider, f"已分配生图提供商：{provider['name']}"),
+        provider=provider,
     )
-    publish_task_snapshot(task_id)
 
-    await state["semaphore"].acquire()
-    async with pool_lock:
-        state["running_count"] = int(state["running_count"]) + 1
+    acquired = False
+    running_incremented = False
+    try:
+        await state["semaphore"].acquire()
+        acquired = True
+        async with pool_lock:
+            state["running_count"] = int(state["running_count"]) + 1
+            running_incremented = True
+    except BaseException:
+        if acquired:
+            state["semaphore"].release()
+        async with pool_lock:
+            if running_incremented:
+                state["running_count"] = max(0, int(state["running_count"]) - 1)
+            state["assigned_count"] = max(0, int(state["assigned_count"]) - 1)
+        publish_task_snapshot(task_id)
+        raise
 
-    db.update_task(
+    update_task_stage(
         task_id,
-        image_provider_id=int(provider["id"]),
-        image_provider_name=str(provider["name"]),
-        stage=resolve_provider_stage_text(running_stage, provider, f"正在使用生图提供商：{provider['name']}"),
+        resolve_provider_stage_text(running_stage, provider, f"正在使用生图提供商：{provider['name']}"),
+        provider=provider,
     )
-    publish_task_snapshot(task_id)
     return {"provider": provider, "state": state}
 
 
@@ -2704,6 +3631,16 @@ def update_task_stage(
         values["image_provider_id"] = int(provider["id"])
         values["image_provider_name"] = str(provider["name"])
     db.update_task(task_id, **values)
+    checkpoint_updates: dict[str, Any] = {
+        "stage": stage,
+        "last_status": "running",
+    }
+    if progress is not None:
+        checkpoint_updates["progress"] = progress
+    if provider:
+        checkpoint_updates["image_provider_id"] = int(provider["id"])
+        checkpoint_updates["image_provider_name"] = str(provider["name"])
+    merge_task_checkpoint_state(task_id, **checkpoint_updates)
     publish_task_snapshot(task_id)
 
 
@@ -2861,11 +3798,14 @@ def create_direct_mode_user_message(
     conversation_id: int,
     prompt: str,
     uploads: list[tuple[Path, str]] | None = None,
+    meta_updates: dict[str, Any] | None = None,
 ) -> int:
     stamp = db.now_iso()
     meta = {
         "uploads": [str(path) for path, _mime in (uploads or [])],
     }
+    if isinstance(meta_updates, dict):
+        meta.update(compact_checkpoint_payload(meta_updates))
     with db.connect() as conn:
         cursor = conn.execute(
             """
@@ -2926,6 +3866,235 @@ def ensure_task_slot() -> None:
         )
 
 
+def conversation_has_active_task(conversation_id: int | None, *, exclude_task_id: int | None = None) -> bool:
+    if not conversation_id:
+        return False
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            select id
+            from tasks
+            where conversation_id = ?
+              and status in ('queued', 'running')
+              and (? is null or id != ?)
+            order by id desc
+            limit 1
+            """,
+            (conversation_id, exclude_task_id, exclude_task_id),
+        ).fetchone()
+    return row is not None
+
+
+def schedule_existing_task(task: dict[str, Any]) -> None:
+    task_id = int(task["id"])
+    task = task_with_images(task_id)
+    mode = str(task.get("mode") or "")
+    params = copy.deepcopy(task.get("params") or {})
+    checkpoint = task_checkpoint_dict(task)
+    conversation_id = int(task["conversation_id"]) if task.get("conversation_id") else None
+    user_message_id = int(task["user_message_id"]) if task.get("user_message_id") else None
+    assistant_message_id = int(task["assistant_message_id"]) if task.get("assistant_message_id") else None
+    if mode == "generate":
+        request = GenerateRequest(**normalize_text_fields(params))
+        completed_count = min(max(int(checkpoint.get("completed_count") or 0), 0), int(request.n))
+        schedule_task(
+            task_id,
+            run_generate_task(
+                task_id,
+                request,
+                compact_params(params),
+                conversation_id=conversation_id,
+                user_message_id=user_message_id,
+                resume_checkpoint=checkpoint,
+                restored_images=existing_task_output_images(task, completed_count=completed_count),
+            ),
+        )
+        return
+    if mode == "edit":
+        input_images = [
+            (Path(str(image.get("file_path") or "")), str(image.get("mime_type") or "image/png"))
+            for image in task.get("images", [])
+            if image.get("source") == "input" and Path(str(image.get("file_path") or "")).exists()
+        ]
+        if not input_images:
+            raise HTTPException(status_code=400, detail="该编辑任务缺少可执行的输入图")
+        saved_mask = next(
+            (
+                (Path(str(image.get("file_path") or "")), str(image.get("mime_type") or "image/png"))
+                for image in task.get("images", [])
+                if image.get("source") == "mask" and Path(str(image.get("file_path") or "")).exists()
+            ),
+            None,
+        )
+        schedule_task(
+            task_id,
+            run_edit_task(
+                task_id,
+                params,
+                str(params.get("prompt") or task.get("prompt") or ""),
+                input_images,
+                saved_mask,
+                conversation_id=conversation_id,
+                user_message_id=user_message_id,
+                resume_checkpoint=checkpoint,
+                restored_images=existing_task_output_images(
+                    task,
+                    completed_count=min(max(int(checkpoint.get("completed_count") or 0), 0), clamp_image_count(params.get("n", 1))),
+                ),
+            ),
+        )
+        return
+    if mode in {"chat", "storyboard"}:
+        if not conversation_id or not user_message_id:
+            raise HTTPException(status_code=400, detail="该会话任务缺少必要的会话信息")
+        request_model = ChatRequest if mode == "chat" else StoryboardRequest
+        request = request_model(**normalize_text_fields(params))
+        with db.connect() as conn:
+            conversation = ensure_conversation_message_allowed(conn, conversation_id, mode)
+            conversation_title = str(conversation["title"] or "")
+            context_limit = int(params.get("context_limit") if params.get("context_limit") is not None else conversation["context_limit"])
+            context_limit = max(0, min(context_limit, 50))
+        recent_messages = load_recent_messages(
+            conversation_id,
+            context_limit,
+            exclude_message_ids=[user_message_id, assistant_message_id] if assistant_message_id else [user_message_id],
+        )
+        image_candidates = recover_task_image_candidates(
+            task,
+            params,
+            conversation_id=conversation_id,
+            label=f"{conversation_mode_label(mode)}任务参考图",
+        )
+        if mode == "chat":
+            schedule_task(
+                task_id,
+                run_chat_task(
+                    task_id,
+                    conversation_id,
+                    user_message_id,
+                    request,
+                    image_candidates,
+                    None,
+                    conversation_title,
+                    recent_messages,
+                    context_limit,
+                    assistant_message_id=assistant_message_id,
+                    resume_checkpoint=checkpoint,
+                    restored_images=existing_task_output_images(
+                        task,
+                        completed_count=min(max(int(checkpoint.get("completed_count") or 0), 0), max(int(checkpoint.get("total_count") or 0), 1)),
+                    ),
+                ),
+            )
+            return
+        if params.get("retry_of") or checkpoint.get("storyboard") or any(image.get("source") == "api" for image in task.get("images", [])):
+            schedule_task(task_id, run_storyboard_retry_task(task_id, task, compact_params(params)))
+            return
+        schedule_task(
+            task_id,
+            run_storyboard_task(
+                task_id,
+                conversation_id,
+                user_message_id,
+                request,
+                image_candidates,
+                None,
+                conversation_title,
+                recent_messages,
+                context_limit,
+                compact_params(params),
+            ),
+        )
+        return
+    raise HTTPException(status_code=400, detail="暂不支持该任务模式的定时执行")
+
+
+async def dispatch_scheduled_tasks_once() -> None:
+    available_slots = max(provider_pool_capacity() - active_task_count(), 0)
+    if available_slots <= 0:
+        return
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            select *
+            from tasks
+            where status = 'scheduled'
+              and (scheduled_for is null or scheduled_for = '' or scheduled_for <= ?)
+            order by coalesce(scheduled_for, created_at) asc, id asc
+            limit ?
+            """,
+            (db.now_iso(), max(available_slots * 3, 6)),
+        ).fetchall()
+    for row in rows:
+        if available_slots <= 0:
+            break
+        task_id = int(row["id"])
+        task = task_with_images(task_id)
+        conversation_id = int(task["conversation_id"]) if task.get("conversation_id") else None
+        if conversation_has_active_task(conversation_id, exclude_task_id=task_id):
+            waiting_stage = scheduled_task_stage(
+                task.get("scheduled_for"),
+                queue_position=task.get("queue_position"),
+                queue_total=task.get("queue_total"),
+                waiting_reason="等待同会话前序任务完成",
+            )
+            if str(task.get("stage") or "") != waiting_stage:
+                db.update_task(task_id, stage=waiting_stage)
+                merge_task_checkpoint_state(
+                    task_id,
+                    stage=waiting_stage,
+                    last_status="scheduled",
+                )
+                publish_task_snapshot(task_id)
+            continue
+        try:
+            db.update_task(task_id, stage="定时任务已到点，准备启动")
+            merge_task_checkpoint_state(
+                task_id,
+                stage="定时任务已到点，准备启动",
+                last_status="scheduled",
+            )
+            publish_task_snapshot(task_id)
+            schedule_existing_task(task)
+            available_slots -= 1
+        except HTTPException as exc:
+            db.fail_task(task_id, compact_error_detail(exc.detail))
+            merge_task_checkpoint_state(
+                task_id,
+                stage="失败",
+                last_status="failed",
+                last_error=exc.detail,
+            )
+            publish_task_snapshot(task_id)
+            publish_task_event(task_id, "failed", {"task_id": task_id, "error": exc.detail}, snapshot=False)
+        except Exception as exc:
+            db.fail_task(task_id, str(exc))
+            merge_task_checkpoint_state(
+                task_id,
+                stage="失败",
+                last_status="failed",
+                last_error=str(exc),
+            )
+            publish_task_snapshot(task_id)
+            publish_task_event(task_id, "failed", {"task_id": task_id, "error": str(exc)}, snapshot=False)
+
+
+async def scheduled_task_dispatch_loop() -> None:
+    while True:
+        try:
+            await dispatch_scheduled_tasks_once()
+        except Exception:
+            pass
+        await asyncio.sleep(SCHEDULER_POLL_INTERVAL_SECONDS)
+
+
+def ensure_scheduled_task_loop() -> None:
+    global TASK_SCHEDULER_LOOP
+    if TASK_SCHEDULER_LOOP and not TASK_SCHEDULER_LOOP.done():
+        return
+    TASK_SCHEDULER_LOOP = asyncio.create_task(scheduled_task_dispatch_loop())
+
+
 def schedule_task(task_id: int, coro: Any) -> None:
     scope = current_storage_scope()
     runtime_key = task_runtime_key(task_id, scope)
@@ -2941,11 +4110,19 @@ def schedule_task(task_id: int, coro: Any) -> None:
     RUNNING_TASKS[runtime_key] = task
 
     def cleanup(done: asyncio.Task[Any]) -> None:
-        RUNNING_TASKS.pop(runtime_key, None)
-        if done.cancelled():
+        is_current = RUNNING_TASKS.get(runtime_key) is done
+        if is_current:
+            RUNNING_TASKS.pop(runtime_key, None)
+        if done.cancelled() and is_current:
             token = set_storage_scope(scope)
             try:
                 db.cancel_task(task_id)
+                merge_task_checkpoint_state(
+                    task_id,
+                    stage="已停止",
+                    last_status="canceled",
+                    last_error="用户已停止任务",
+                )
             finally:
                 reset_storage_scope(token)
 
@@ -2957,26 +4134,81 @@ async def run_with_slot(task_id: int, worker: Any) -> None:
         task = db.get_task(task_id)
         if task and task.get("cancel_requested"):
             db.cancel_task(task_id)
+            merge_task_checkpoint_state(
+                task_id,
+                stage="已停止",
+                last_status="canceled",
+                last_error="用户已停止任务",
+            )
             publish_task_snapshot(task_id)
             publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
             return
         db.update_task(task_id, status="running", progress=8, stage="任务已启动")
+        merge_task_checkpoint_state(
+            task_id,
+            stage="任务已启动",
+            progress=8,
+            last_status="running",
+            last_error=None,
+        )
         publish_task_snapshot(task_id)
         await worker()
     except asyncio.CancelledError:
         db.cancel_task(task_id)
+        merge_task_checkpoint_state(
+            task_id,
+            stage="已停止",
+            last_status="canceled",
+            last_error="用户已停止任务",
+        )
         publish_task_snapshot(task_id)
         publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
         raise
     except HTTPException as exc:
+        if is_all_providers_unavailable_exception(exc):
+            retry_state = schedule_provider_pool_auto_retry(task_id, exc)
+            if retry_state:
+                publish_task_snapshot(task_id)
+                publish_task_event(
+                    task_id,
+                    "retry_scheduled",
+                    {
+                        "task_id": task_id,
+                        "reason": PROVIDER_POOL_AUTO_RETRY_REASON,
+                        **retry_state,
+                    },
+                    snapshot=False,
+                )
+                return
         db.fail_task(task_id, compact_error_detail(exc.detail))
+        merge_task_checkpoint_state(
+            task_id,
+            stage="失败",
+            last_status="failed",
+            last_error=exc.detail,
+        )
         publish_task_snapshot(task_id)
         publish_task_event(task_id, "failed", {"task_id": task_id, "error": exc.detail}, snapshot=False)
     except Exception as exc:
         db.fail_task(task_id, str(exc))
+        merge_task_checkpoint_state(
+            task_id,
+            stage="失败",
+            last_status="failed",
+            last_error=str(exc),
+        )
         publish_task_snapshot(task_id)
         publish_task_event(task_id, "failed", {"task_id": task_id, "error": str(exc)}, snapshot=False)
     else:
+        merge_task_checkpoint_state(
+            task_id,
+            stage="已完成",
+            progress=100,
+            can_resume=False,
+            last_status="done",
+            last_error=None,
+            completed_at=db.now_iso(),
+        )
         publish_task_snapshot(task_id)
         publish_task_event(task_id, "done", {"task_id": task_id}, snapshot=False)
 
@@ -3009,16 +4241,36 @@ def startup() -> None:
             db.init_db()
             ensure_default_provider()
             with db.connect() as conn:
-                conn.execute(
-                    """
-                    update tasks
-                    set status = 'failed', stage = '服务重启后任务已中断', error = ?, updated_at = ?
-                    where status in ('queued', 'running')
-                    """,
-                    ("服务重启后，内存中的后台任务已中断，请重新创建任务。", db.now_iso()),
-                )
+                rows = conn.execute(
+                    "select id, mode, checkpoint_json from tasks where status in ('queued', 'running')"
+                ).fetchall()
+                for row in rows:
+                    checkpoint = {}
+                    if isinstance(row["checkpoint_json"], str):
+                        try:
+                            parsed = json.loads(row["checkpoint_json"] or "{}")
+                            if isinstance(parsed, dict):
+                                checkpoint = parsed
+                        except json.JSONDecodeError:
+                            checkpoint = {}
+                    stage = "服务重启后检测到未完成任务，正在自动恢复"
+                    if isinstance(checkpoint.get("stage"), str) and checkpoint.get("stage"):
+                        stage = f"服务重启后自动恢复：{checkpoint['stage']}"
+                    conn.execute(
+                        """
+                        update tasks
+                        set status = 'scheduled',
+                            scheduled_for = ?,
+                            stage = ?,
+                            error = null,
+                            updated_at = ?
+                        where id = ?
+                        """,
+                        (db.now_iso(), stage, db.now_iso(), int(row["id"])),
+                    )
         finally:
             reset_storage_scope(token)
+    ensure_scheduled_task_loop()
 
 
 @app.get(ACCESS_LOGIN_PATH, response_class=HTMLResponse, response_model=None)
@@ -3241,6 +4493,152 @@ def put_app_settings(request: AppSettingsRequest) -> dict[str, Any]:
     return get_app_settings()
 
 
+@app.get("/api/style-locks")
+def list_style_locks() -> dict[str, Any]:
+    with db.connect() as conn:
+        rows = conn.execute("select * from style_locks order by updated_at desc, id desc").fetchall()
+    return {"items": [serialize_style_lock_row(row) for row in rows]}
+
+
+@app.post("/api/style-locks")
+def create_style_lock(request: StyleLockRequest) -> dict[str, Any]:
+    stamp = db.now_iso()
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            insert into style_locks
+                (name, subject_lock, composition_lock, color_tone_lock, lighting_lock, texture_lock, negative_lock, notes, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalize_image_title(request.name, fallback="未命名风格锁"),
+                normalize_free_text(request.subject_lock, 600),
+                normalize_free_text(request.composition_lock, 600),
+                normalize_free_text(request.color_tone_lock, 600),
+                normalize_free_text(request.lighting_lock, 600),
+                normalize_free_text(request.texture_lock, 600),
+                normalize_free_text(request.negative_lock, 600),
+                normalize_free_text(request.notes, 1000),
+                stamp,
+                stamp,
+            ),
+        )
+        row = conn.execute("select * from style_locks where id = ?", (int(cursor.lastrowid),)).fetchone()
+    return serialize_style_lock_row(row)
+
+
+@app.put("/api/style-locks/{style_lock_id}")
+def update_style_lock(style_lock_id: int, request: StyleLockRequest) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            update style_locks
+            set name = ?, subject_lock = ?, composition_lock = ?, color_tone_lock = ?, lighting_lock = ?, texture_lock = ?, negative_lock = ?, notes = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                normalize_image_title(request.name, fallback="未命名风格锁"),
+                normalize_free_text(request.subject_lock, 600),
+                normalize_free_text(request.composition_lock, 600),
+                normalize_free_text(request.color_tone_lock, 600),
+                normalize_free_text(request.lighting_lock, 600),
+                normalize_free_text(request.texture_lock, 600),
+                normalize_free_text(request.negative_lock, 600),
+                normalize_free_text(request.notes, 1000),
+                db.now_iso(),
+                style_lock_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="style lock not found")
+        row = conn.execute("select * from style_locks where id = ?", (style_lock_id,)).fetchone()
+    return serialize_style_lock_row(row)
+
+
+@app.delete("/api/style-locks/{style_lock_id}")
+def delete_style_lock(style_lock_id: int) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = conn.execute("delete from style_locks where id = ?", (style_lock_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="style lock not found")
+    return {"ok": True}
+
+
+@app.get("/api/character-profiles")
+def list_character_profiles() -> dict[str, Any]:
+    with db.connect() as conn:
+        rows = conn.execute("select * from character_profiles order by updated_at desc, id desc").fetchall()
+    return {"items": [serialize_character_profile_row(row) for row in rows]}
+
+
+@app.post("/api/character-profiles")
+def create_character_profile(request: CharacterProfileRequest) -> dict[str, Any]:
+    stamp = db.now_iso()
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            insert into character_profiles
+                (name, age, gender, appearance, wardrobe, personality, voice_style, signature_items, extra_prompt, notes, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalize_image_title(request.name, fallback="未命名角色"),
+                normalize_free_text(request.age, 120),
+                normalize_free_text(request.gender, 120),
+                normalize_free_text(request.appearance, 800),
+                normalize_free_text(request.wardrobe, 800),
+                normalize_free_text(request.personality, 600),
+                normalize_free_text(request.voice_style, 400),
+                normalize_free_text(request.signature_items, 400),
+                normalize_free_text(request.extra_prompt, 800),
+                normalize_free_text(request.notes, 1000),
+                stamp,
+                stamp,
+            ),
+        )
+        row = conn.execute("select * from character_profiles where id = ?", (int(cursor.lastrowid),)).fetchone()
+    return serialize_character_profile_row(row)
+
+
+@app.put("/api/character-profiles/{profile_id}")
+def update_character_profile(profile_id: int, request: CharacterProfileRequest) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            update character_profiles
+            set name = ?, age = ?, gender = ?, appearance = ?, wardrobe = ?, personality = ?, voice_style = ?, signature_items = ?, extra_prompt = ?, notes = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                normalize_image_title(request.name, fallback="未命名角色"),
+                normalize_free_text(request.age, 120),
+                normalize_free_text(request.gender, 120),
+                normalize_free_text(request.appearance, 800),
+                normalize_free_text(request.wardrobe, 800),
+                normalize_free_text(request.personality, 600),
+                normalize_free_text(request.voice_style, 400),
+                normalize_free_text(request.signature_items, 400),
+                normalize_free_text(request.extra_prompt, 800),
+                normalize_free_text(request.notes, 1000),
+                db.now_iso(),
+                profile_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="character profile not found")
+        row = conn.execute("select * from character_profiles where id = ?", (profile_id,)).fetchone()
+    return serialize_character_profile_row(row)
+
+
+@app.delete("/api/character-profiles/{profile_id}")
+def delete_character_profile(profile_id: int) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = conn.execute("delete from character_profiles where id = ?", (profile_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="character profile not found")
+    return {"ok": True}
+
+
 @app.get("/api/providers")
 def list_providers() -> dict[str, Any]:
     items = load_provider_rows()
@@ -3383,63 +4781,188 @@ def delete_prompt(prompt_id: int) -> dict[str, Any]:
 
 @app.post("/api/images/generate")
 async def generate_image(request: GenerateRequest) -> dict[str, Any]:
-    ensure_task_slot()
     db.add_prompt(request.prompt, source="auto", mode="generate")
     conversation_id: int | None = None
-    user_message_id: int | None = None
     if request.conversation_id:
         with db.connect() as conn:
             conversation = ensure_conversation_message_allowed(conn, int(request.conversation_id), "generate")
             conversation_id = int(conversation["id"])
+    raw_variants = normalize_variant_plan([item.model_dump() for item in request.variant_plan])
+    variant_entries = raw_variants or [
+        {
+            "name": "",
+            "prompt_suffix": "",
+            "quality": None,
+            "size": None,
+            "background": None,
+            "output_format": None,
+            "output_compression": None,
+            "n": None,
+            "image_title": "",
+            "style_lock_id": None,
+            "delay_seconds": 0,
+        }
+    ]
+    schedule_at = normalize_schedule_at(request.schedule_at)
+    should_schedule = bool(schedule_at or request.schedule_spacing_seconds > 0 or len(variant_entries) > 1)
+    if not should_schedule:
+        ensure_task_slot()
+
+    batch_group = task_batch_group_id("generate", request.prompt) if should_schedule else None
+    queue_total = len(variant_entries) if len(variant_entries) > 1 else None
+    queue_label = normalize_image_title(request.batch_label or "批量变体任务", fallback="批量变体任务") if should_schedule else None
+    scheduled_base = schedule_at or (db.now_iso() if should_schedule else None)
+    created_tasks: list[dict[str, Any]] = []
+    user_message_ids: list[int] = []
+
+    for index, variant in enumerate(variant_entries, start=1):
+        variant_name = normalize_image_title(variant.get("name") or "")
+        scheduled_for = (
+            add_seconds_to_iso(
+                str(scheduled_base),
+                int(request.schedule_spacing_seconds) * (index - 1) + int(variant.get("delay_seconds") or 0),
+            )
+            if scheduled_base
+            else None
+        )
+        request_payload = request.model_dump()
+        request_payload.update(
+            {
+                "image_title": normalize_image_title(variant.get("image_title") or request.image_title or variant_name or ""),
+                "quality": variant.get("quality") or request.quality,
+                "size": variant.get("size") or request.size,
+                "background": variant.get("background") or request.background,
+                "output_format": variant.get("output_format") or request.output_format,
+                "output_compression": variant.get("output_compression") if variant.get("output_compression") is not None else request.output_compression,
+                "n": int(variant.get("n") or request.n),
+                "style_lock_id": int(variant.get("style_lock_id") or request.style_lock_id or 0) or None,
+                "variant_plan": [],
+                "schedule_at": None,
+                "schedule_spacing_seconds": 0,
+                "batch_label": None,
+            }
+        )
+        task_request = GenerateRequest(**request_payload)
         user_message_id = create_direct_mode_user_message(
             conversation_id=conversation_id,
             prompt=request.prompt,
+            meta_updates={
+                "variant_name": variant_name,
+                "variant_prompt_suffix": variant.get("prompt_suffix"),
+                "style_lock_id": task_request.style_lock_id,
+                "character_profile_ids": task_request.character_profile_ids,
+                "scheduled_for": scheduled_for,
+            },
+        ) if conversation_id else None
+        payload = compact_params(
+            {
+                "endpoint": "/v1/responses",
+                "tool": "image_generation",
+                "model": task_request.model,
+                "image_model": task_request.image_model,
+                "prompt": request.prompt,
+                "image_title": normalize_image_title(task_request.image_title or ""),
+                "size": task_request.size,
+                "quality": task_request.quality,
+                "n": task_request.n,
+                "background": task_request.background,
+                "output_format": task_request.output_format,
+                "output_compression": task_request.output_compression,
+                "moderation": task_request.moderation,
+                "action": task_request.action,
+                "partial_images": task_request.partial_images,
+                "conversation_id": conversation_id,
+                "style_lock_id": task_request.style_lock_id,
+                "character_profile_ids": task_request.character_profile_ids,
+                "variant_name": variant_name,
+                "variant_prompt_suffix": normalize_free_text(variant.get("prompt_suffix"), 1200),
+                "batch_label": queue_label,
+            }
         )
-    payload = compact_params(
-        {
-            "endpoint": "/v1/responses",
-            "tool": "image_generation",
-            "model": request.model,
-            "image_model": request.image_model,
-            "prompt": request.prompt,
-            "image_title": normalize_image_title(request.image_title or ""),
-            "size": request.size,
-            "quality": request.quality,
-            "n": request.n,
-            "background": request.background,
-            "output_format": request.output_format,
-            "output_compression": request.output_compression,
-            "moderation": request.moderation,
-            "action": request.action,
-            "partial_images": request.partial_images,
-            "conversation_id": conversation_id,
-        }
-    )
-    task_id = db.create_task("generate", request.prompt, payload, conversation_id=conversation_id, user_message_id=user_message_id)
-    schedule_task(task_id, run_generate_task(task_id, request, payload, conversation_id=conversation_id, user_message_id=user_message_id))
-    return {"task": db.get_task(task_id), "user_message_id": user_message_id}
+        task_id = db.create_task(
+            "generate",
+            request.prompt,
+            payload,
+            status="scheduled" if should_schedule else "queued",
+            conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            scheduled_for=scheduled_for,
+            queue_group=batch_group,
+            queue_position=index if queue_total else None,
+            queue_total=queue_total,
+            queue_label=queue_label,
+            variant_name=variant_name or None,
+        )
+        if should_schedule:
+            db.update_task(
+                task_id,
+                stage=scheduled_task_stage(scheduled_for, queue_position=index if queue_total else None, queue_total=queue_total),
+            )
+            publish_task_snapshot(task_id)
+        else:
+            schedule_task(task_id, run_generate_task(task_id, task_request, payload, conversation_id=conversation_id, user_message_id=user_message_id))
+        user_message_ids.append(int(user_message_id or 0))
+        created_tasks.append(db.get_task(task_id) or task_with_images(task_id))
+
+    if should_schedule:
+        return {"tasks": created_tasks, "user_message_ids": [item for item in user_message_ids if item]}
+    return {"task": created_tasks[0], "user_message_id": user_message_ids[0] if user_message_ids else None}
 
 
-async def run_generate_task(task_id: int, request: GenerateRequest, payload: dict[str, Any], *, conversation_id: int | None = None, user_message_id: int | None = None) -> None:
+async def run_generate_task(
+    task_id: int,
+    request: GenerateRequest,
+    payload: dict[str, Any],
+    *,
+    conversation_id: int | None = None,
+    user_message_id: int | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
+    restored_images: list[dict[str, Any]] | None = None,
+) -> None:
     async def worker() -> None:
+        style_lock = load_style_lock(request.style_lock_id)
+        character_profiles = load_character_profiles(request.character_profile_ids)
+        variant_prompt_suffix = normalize_free_text(payload.get("variant_prompt_suffix"), 1200)
+        effective_prompt = apply_locked_prompt(
+            request.prompt,
+            character_profiles=character_profiles,
+            style_lock=style_lock,
+            variant_prompt_suffix=variant_prompt_suffix,
+        )
         conversation_title = conversation_title_for_naming(conversation_id, fallback=request.prompt[:20] or f"task-{task_id}")
-        base_title = build_direct_mode_base_title(
+        checkpoint = resume_checkpoint if isinstance(resume_checkpoint, dict) else {}
+        base_title = str(checkpoint.get("base_title") or "").strip() or build_direct_mode_base_title(
             request.image_title,
             conversation_id=conversation_id,
             prompt=request.prompt,
             created_at=db.now_iso(),
         )
-        bucket = task_image_folder(task_id, conversation_title or request.prompt[:48] or f"task-{task_id}")
+        bucket = str(checkpoint.get("bucket") or "").strip() or task_image_folder(task_id, conversation_title or request.prompt[:48] or f"task-{task_id}")
         responses: list[dict[str, Any]] = []
-        saved_images: list[dict[str, Any]] = []
+        saved_images: list[dict[str, Any]] = list(restored_images or [])
         provider_attempts: list[dict[str, Any]] = []
         last_provider: dict[str, Any] | None = None
-        for index in range(request.n):
+        completed_count = min(max(int(checkpoint.get("completed_count") or len(saved_images)), 0), int(request.n))
+        persist_task_checkpoint(
+            task_id,
+            mode="generate",
+            step="prepared",
+            progress=12,
+            stage=f"准备继续生成第 {completed_count + 1}/{request.n} 张" if completed_count else "准备开始生成图片",
+            can_resume=completed_count > 0,
+            base_title=base_title,
+            bucket=bucket,
+            completed_count=completed_count,
+            total_count=request.n,
+        )
+        if completed_count >= request.n and saved_images:
+            db.update_task(task_id, progress=96, stage="已恢复全部已完成结果，正在整理任务结果")
+        for index in range(completed_count, request.n):
             response, provider, attempt_log = await execute_with_provider_failover(
                 task_id,
                 lambda _provider, provider_config: call_responses_image_generation(
                     model=request.model,
-                    prompt=request.prompt,
+                    prompt=effective_prompt,
                     image_model=request.image_model,
                     size=request.size,
                     quality=request.quality,
@@ -3477,10 +5000,18 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                         message_id=user_message_id,
                     )
                 )
-            db.update_task(
+            progress = min(25 + int((index + 1) / max(request.n, 1) * 60), 90)
+            persist_task_checkpoint(
                 task_id,
-                progress=min(25 + int((index + 1) / max(request.n, 1) * 60), 90),
+                mode="generate",
+                step="image_saved",
+                progress=progress,
                 stage=f"已通过 {provider['name']} 保存第 {index + 1}/{request.n} 张结果",
+                can_resume=(index + 1) < request.n,
+                base_title=base_title,
+                bucket=bucket,
+                completed_count=len(saved_images),
+                total_count=request.n,
             )
         if not saved_images:
             raise HTTPException(
@@ -3493,10 +5024,25 @@ async def run_generate_task(task_id: int, request: GenerateRequest, payload: dic
                     "provider_attempts": provider_attempts,
                 },
             )
-        db.update_task(task_id, progress=96, stage="正在整理任务结果")
+        persist_task_checkpoint(
+            task_id,
+            mode="generate",
+            step="finalizing",
+            progress=96,
+            stage="正在整理任务结果",
+            can_resume=False,
+            base_title=base_title,
+            bucket=bucket,
+            completed_count=len(saved_images),
+            total_count=request.n,
+        )
         raw = {
             "endpoint": "/v1/responses",
             "tool": "image_generation",
+            "image_prompt": effective_prompt,
+            "style_lock": style_lock,
+            "character_profiles": character_profiles,
+            "variant_name": payload.get("variant_name"),
             "image_provider": {"id": last_provider["id"], "name": last_provider["name"]} if last_provider else None,
             "provider_attempts": provider_attempts,
             "responses": responses,
@@ -3512,7 +5058,6 @@ async def edit_image(
     images: list[UploadFile] = File(...),
     mask: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
-    ensure_task_slot()
     params = normalize_text_fields(parse_params(params_json), keys=("prompt", "image_title"))
     prompt = str(params.get("prompt") or "")
     if not prompt:
@@ -3522,6 +5067,27 @@ async def edit_image(
     upload_selection_modes = normalize_edit_upload_selection_modes(params.get("upload_selection_modes"), len(images))
     params["upload_selection_modes"] = upload_selection_modes
     db.add_prompt(prompt, source="auto", mode="edit")
+    raw_variants = normalize_variant_plan(params.get("variant_plan"))
+    variant_entries = raw_variants or [
+        {
+            "name": "",
+            "prompt_suffix": "",
+            "quality": None,
+            "size": None,
+            "background": None,
+            "output_format": None,
+            "output_compression": None,
+            "n": None,
+            "image_title": "",
+            "style_lock_id": None,
+            "delay_seconds": 0,
+        }
+    ]
+    schedule_at = normalize_schedule_at(params.get("schedule_at"))
+    schedule_spacing_seconds = max(0, int(params.get("schedule_spacing_seconds") or 0))
+    should_schedule = bool(schedule_at or schedule_spacing_seconds > 0 or len(variant_entries) > 1)
+    if not should_schedule:
+        ensure_task_slot()
 
     saved_images = [await save_upload(upload) for upload in images]
     saved_mask: tuple[Path, str] | None = None
@@ -3539,41 +5105,94 @@ async def edit_image(
             conversation = ensure_conversation_message_allowed(conn, int(conversation_id), "edit")
             conversation_id = int(conversation["id"])
     uploads_for_message = [*saved_images, *([saved_mask] if saved_mask else [])]
-    user_message_id = create_direct_mode_user_message(
-        conversation_id=conversation_id,
-        prompt=prompt,
-        uploads=uploads_for_message,
-    ) if conversation_id else None
+    batch_group = task_batch_group_id("edit", prompt) if should_schedule else None
+    queue_total = len(variant_entries) if len(variant_entries) > 1 else None
+    queue_label = normalize_image_title(params.get("batch_label") or "批量改图任务", fallback="批量改图任务") if should_schedule else None
+    scheduled_base = schedule_at or (db.now_iso() if should_schedule else None)
+    created_tasks: list[dict[str, Any]] = []
+    user_message_ids: list[int] = []
 
-    payload = compact_params(
-        {
-            "endpoint": "/v1/responses",
-            "tool": "image_generation",
-            "model": params.get("model", "gpt-5.4"),
-            "image_model": params.get("image_model", "gpt-image-2"),
-            "prompt": prompt,
-            "image_title": normalize_image_title(params.get("image_title") or ""),
-            "size": params.get("size", "2560x1440"),
-            "quality": params.get("quality", "high"),
-            "n": clamp_image_count(params.get("n", 1)),
-            "background": params.get("background", "auto"),
-            "output_format": params.get("output_format", "png"),
-            "output_compression": params.get("output_compression"),
-            "moderation": params.get("moderation", "auto"),
-            "input_fidelity": params.get("input_fidelity", "auto"),
-            "action": "edit",
-            "partial_images": params.get("partial_images"),
-            "upload_selection_modes": upload_selection_modes,
-            "conversation_id": conversation_id,
-        }
-    )
-    task_id = db.create_task("edit", prompt, payload, conversation_id=conversation_id, user_message_id=user_message_id)
-    for item in saved_images:
-        public_input_image(item, source="input", title=prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
-    if saved_mask:
-        public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
-    schedule_task(task_id, run_edit_task(task_id, params, prompt, saved_images, saved_mask, conversation_id=conversation_id, user_message_id=user_message_id))
-    return {"task": db.get_task(task_id), "user_message_id": user_message_id}
+    for index, variant in enumerate(variant_entries, start=1):
+        variant_name = normalize_image_title(variant.get("name") or "")
+        scheduled_for = (
+            add_seconds_to_iso(
+                str(scheduled_base),
+                schedule_spacing_seconds * (index - 1) + int(variant.get("delay_seconds") or 0),
+            )
+            if scheduled_base
+            else None
+        )
+        task_params = compact_params(
+            {
+                "endpoint": "/v1/responses",
+                "tool": "image_generation",
+                "model": params.get("model", "gpt-5.4"),
+                "image_model": params.get("image_model", "gpt-image-2"),
+                "prompt": prompt,
+                "image_title": normalize_image_title(variant.get("image_title") or params.get("image_title") or variant_name or ""),
+                "size": variant.get("size") or params.get("size", "2560x1440"),
+                "quality": variant.get("quality") or params.get("quality", "high"),
+                "n": clamp_image_count(variant.get("n") or params.get("n", 1)),
+                "background": variant.get("background") or params.get("background", "auto"),
+                "output_format": variant.get("output_format") or params.get("output_format", "png"),
+                "output_compression": variant.get("output_compression") if variant.get("output_compression") is not None else params.get("output_compression"),
+                "moderation": params.get("moderation", "auto"),
+                "input_fidelity": params.get("input_fidelity", "auto"),
+                "action": "edit",
+                "partial_images": params.get("partial_images"),
+                "upload_selection_modes": upload_selection_modes,
+                "conversation_id": conversation_id,
+                "style_lock_id": int(variant.get("style_lock_id") or params.get("style_lock_id") or 0) or None,
+                "character_profile_ids": normalize_profile_id_list(params.get("character_profile_ids")),
+                "variant_name": variant_name,
+                "variant_prompt_suffix": normalize_free_text(variant.get("prompt_suffix"), 1200),
+                "batch_label": queue_label,
+            }
+        )
+        user_message_id = create_direct_mode_user_message(
+            conversation_id=conversation_id,
+            prompt=prompt,
+            uploads=uploads_for_message,
+            meta_updates={
+                "variant_name": variant_name,
+                "variant_prompt_suffix": variant.get("prompt_suffix"),
+                "style_lock_id": task_params.get("style_lock_id"),
+                "character_profile_ids": task_params.get("character_profile_ids"),
+                "scheduled_for": scheduled_for,
+            },
+        ) if conversation_id else None
+        task_id = db.create_task(
+            "edit",
+            prompt,
+            task_params,
+            status="scheduled" if should_schedule else "queued",
+            conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            scheduled_for=scheduled_for,
+            queue_group=batch_group,
+            queue_position=index if queue_total else None,
+            queue_total=queue_total,
+            queue_label=queue_label,
+            variant_name=variant_name or None,
+        )
+        for item in saved_images:
+            public_input_image(item, source="input", title=prompt, task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
+        if saved_mask:
+            public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=task_id, conversation_id=conversation_id, message_id=user_message_id)
+        if should_schedule:
+            db.update_task(
+                task_id,
+                stage=scheduled_task_stage(scheduled_for, queue_position=index if queue_total else None, queue_total=queue_total),
+            )
+            publish_task_snapshot(task_id)
+        else:
+            schedule_task(task_id, run_edit_task(task_id, task_params, prompt, saved_images, saved_mask, conversation_id=conversation_id, user_message_id=user_message_id))
+        user_message_ids.append(int(user_message_id or 0))
+        created_tasks.append(db.get_task(task_id) or task_with_images(task_id))
+
+    if should_schedule:
+        return {"tasks": created_tasks, "user_message_ids": [item for item in user_message_ids if item]}
+    return {"task": created_tasks[0], "user_message_id": user_message_ids[0] if user_message_ids else None}
 
 
 async def run_edit_task(
@@ -3585,19 +5204,31 @@ async def run_edit_task(
     *,
     conversation_id: int | None = None,
     user_message_id: int | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
+    restored_images: list[dict[str, Any]] | None = None,
 ) -> None:
     async def worker() -> None:
+        style_lock = load_style_lock(params.get("style_lock_id"))
+        character_profiles = load_character_profiles(params.get("character_profile_ids"))
+        variant_prompt_suffix = normalize_free_text(params.get("variant_prompt_suffix"), 1200)
+        effective_prompt = apply_locked_prompt(
+            prompt,
+            character_profiles=character_profiles,
+            style_lock=style_lock,
+            variant_prompt_suffix=variant_prompt_suffix,
+        )
         conversation_title = conversation_title_for_naming(conversation_id, fallback=prompt[:20] or f"task-{task_id}")
-        base_title = build_direct_mode_base_title(
+        checkpoint = resume_checkpoint if isinstance(resume_checkpoint, dict) else {}
+        base_title = str(checkpoint.get("base_title") or "").strip() or build_direct_mode_base_title(
             str(params.get("image_title") or ""),
             conversation_id=conversation_id,
             prompt=prompt,
             created_at=db.now_iso(),
         )
-        bucket = task_image_folder(task_id, conversation_title or prompt[:48] or f"task-{task_id}")
+        bucket = str(checkpoint.get("bucket") or "").strip() or task_image_folder(task_id, conversation_title or prompt[:48] or f"task-{task_id}")
         output_format = str(params.get("output_format", "png"))
         responses: list[dict[str, Any]] = []
-        saved_output_images: list[dict[str, Any]] = []
+        saved_output_images: list[dict[str, Any]] = list(restored_images or [])
         count = clamp_image_count(params.get("n", 1))
         provider_attempts: list[dict[str, Any]] = []
         last_provider: dict[str, Any] | None = None
@@ -3605,12 +5236,27 @@ async def run_edit_task(
             saved_images,
             params.get("upload_selection_modes") if isinstance(params.get("upload_selection_modes"), list) else None,
         )
-        for index in range(count):
+        completed_count = min(max(int(checkpoint.get("completed_count") or len(saved_output_images)), 0), count)
+        persist_task_checkpoint(
+            task_id,
+            mode="edit",
+            step="prepared",
+            progress=12,
+            stage=f"准备继续编辑第 {completed_count + 1}/{count} 张" if completed_count else "准备开始编辑图片",
+            can_resume=completed_count > 0,
+            base_title=base_title,
+            bucket=bucket,
+            completed_count=completed_count,
+            total_count=count,
+        )
+        if completed_count >= count and saved_output_images:
+            db.update_task(task_id, progress=96, stage="已恢复全部已完成编辑结果，正在整理任务结果")
+        for index in range(completed_count, count):
             response, provider, attempt_log = await execute_with_provider_failover(
                 task_id,
                 lambda _provider, client_config: call_responses_image_generation(
                     model=str(params.get("model", "gpt-5.4")),
-                    prompt=prompt,
+                    prompt=effective_prompt,
                     image_model=str(params.get("image_model", "gpt-image-2")),
                     size=str(params.get("size", "2560x1440")),
                     quality=str(params.get("quality", "high")),
@@ -3652,10 +5298,18 @@ async def run_edit_task(
                         message_id=user_message_id,
                     )
                 )
-            db.update_task(
+            progress = min(25 + int((index + 1) / max(count, 1) * 60), 90)
+            persist_task_checkpoint(
                 task_id,
-                progress=min(25 + int((index + 1) / max(count, 1) * 60), 90),
+                mode="edit",
+                step="image_saved",
+                progress=progress,
                 stage=f"已通过 {provider['name']} 保存第 {index + 1}/{count} 张编辑结果",
+                can_resume=(index + 1) < count,
+                base_title=base_title,
+                bucket=bucket,
+                completed_count=len(saved_output_images),
+                total_count=count,
             )
         if not saved_output_images:
             raise HTTPException(
@@ -3668,10 +5322,25 @@ async def run_edit_task(
                     "provider_attempts": provider_attempts,
                 },
             )
-        db.update_task(task_id, progress=96, stage="正在整理任务结果")
+        persist_task_checkpoint(
+            task_id,
+            mode="edit",
+            step="finalizing",
+            progress=96,
+            stage="正在整理任务结果",
+            can_resume=False,
+            base_title=base_title,
+            bucket=bucket,
+            completed_count=len(saved_output_images),
+            total_count=count,
+        )
         raw = {
             "endpoint": "/v1/responses",
             "tool": "image_generation",
+            "image_prompt": effective_prompt,
+            "style_lock": style_lock,
+            "character_profiles": character_profiles,
+            "variant_name": params.get("variant_name"),
             "image_provider": {"id": last_provider["id"], "name": last_provider["name"]} if last_provider else None,
             "provider_attempts": provider_attempts,
             "selected_reference_image_refs": candidate_refs(reference_candidates),
@@ -3688,21 +5357,12 @@ async def run_edit_task(
 def list_tasks(limit: int = 30) -> dict[str, Any]:
     with db.connect() as conn:
         tasks = [
-            summarize_task(row)
+            summarize_task(row, include_response=False)
             for row in conn.execute(
                 "select * from tasks order by id desc limit ?",
                 (limit,),
             ).fetchall()
         ]
-        for task in tasks:
-            images = [
-                db.row_to_dict(image)
-                for image in conn.execute(
-                    "select * from images where task_id = ? order by id asc",
-                    (task["id"],),
-                ).fetchall()
-            ]
-            task["images"] = enrich_images_with_prompt(images, task)
     pool = image_provider_pool_snapshot()
     return {
         "items": tasks,
@@ -3786,6 +5446,12 @@ def cancel_task(task_id: int) -> dict[str, Any]:
     if running:
         running.cancel()
     db.cancel_task(task_id)
+    merge_task_checkpoint_state(
+        task_id,
+        stage="已停止",
+        last_status="canceled",
+        last_error="用户已停止任务",
+    )
     publish_task_snapshot(task_id)
     publish_task_event(task_id, "canceled", {"task_id": task_id}, snapshot=False)
     return {"task": task_with_images(task_id)}
@@ -3933,7 +5599,7 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
             ).fetchall()
         ]
         images = [
-            db.row_to_dict(row)
+            serialize_image_record(row, conn)
             for row in conn.execute(
                 "select * from images where conversation_id = ? and source = 'api' order by id asc",
                 (conversation_id,),
@@ -3957,7 +5623,7 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
             ).fetchall()
         ]
         tasks = [
-            summarize_task(row)
+            summarize_task(row, include_response=False)
             for row in conn.execute(
                 "select * from tasks where conversation_id = ? order by id asc",
                 (conversation_id,),
@@ -4004,19 +5670,25 @@ def get_conversation(conversation_id: int) -> dict[str, Any]:
                 uploaded_images.append(item)
         reference_ids = meta.get("reference_image_ids", []) if isinstance(meta, dict) else []
         for image in load_selected_reference_images(reference_ids, limit=3, conversation_id=conversation_id):
+            serialized_reference = serialize_image_record(image)
             uploaded_images.append(
                 {
-                    "id": image["id"],
-                    "url": image["public_url"],
-                    "public_url": image["public_url"],
-                    "file_path": image["file_path"],
-                    "filename": Path(image["file_path"]).name,
-                    "mime_type": image["mime_type"],
+                    "id": serialized_reference["id"],
+                    "url": serialized_reference["thumb_url"] or serialized_reference["public_url"],
+                    "public_url": serialized_reference["public_url"],
+                    "thumb_url": serialized_reference["thumb_url"],
+                    "medium_url": serialized_reference["medium_url"],
+                    "file_path": serialized_reference["file_path"],
+                    "filename": serialized_reference["filename"],
+                    "mime_type": serialized_reference["mime_type"],
                     "source": "input_reference",
                     "origin_source": image.get("source") or "api",
-                    "title": image.get("title"),
+                    "title": serialized_reference.get("title"),
                     "task_mode": image.get("task_mode"),
-                    "prompt_text": image.get("task_prompt") or image.get("message_content") or image.get("title"),
+                    "prompt_text": image.get("task_prompt") or image.get("message_content") or serialized_reference.get("title"),
+                    "width": serialized_reference.get("width"),
+                    "height": serialized_reference.get("height"),
+                    "byte_size": serialized_reference.get("byte_size"),
                 }
             )
         message["uploaded_images"] = uploaded_images
@@ -4065,7 +5737,12 @@ async def storyboard_message(
         conversation_title = conversation["title"]
         context_limit = max(0, min(int(params.context_limit), 50))
     uploaded = [await save_upload(upload) for upload in images or []]
-    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)), conversation_id=conversation_id)
+    selected_reference_images = require_selected_reference_images(
+        params.reference_image_ids,
+        limit=max(0, 3 - len(uploaded)),
+        conversation_id=conversation_id,
+        label="分镜参考图",
+    )
     selected_reference_uploads = [
         (Path(item["file_path"]), item.get("mime_type") or "image/png")
         for item in selected_reference_images
@@ -4082,20 +5759,7 @@ async def storyboard_message(
     db.add_prompt(params.prompt, source="auto", mode="storyboard")
 
     with db.connect() as conn:
-        recent_messages = [
-            db.row_to_dict(row)
-            for row in conn.execute(
-                """
-                select id, role, content, meta_json, created_at
-                from messages
-                where conversation_id = ?
-                order by id desc
-                limit ?
-                """,
-                (conversation_id, context_limit),
-            ).fetchall()
-        ]
-        recent_messages = list(reversed(recent_messages))
+        recent_messages = load_recent_messages(conversation_id, context_limit)
         cursor = conn.execute(
             """
             insert into messages (conversation_id, role, content, meta_json, created_at)
@@ -4115,6 +5779,8 @@ async def storyboard_message(
                         "upload_selection_modes": params.upload_selection_modes,
                         "context_limit": context_limit,
                         "mode": "storyboard",
+                        "style_lock_id": params.style_lock_id,
+                        "character_profile_ids": params.character_profile_ids,
                     }
                 ),
                 db.now_iso(),
@@ -4150,6 +5816,8 @@ async def storyboard_message(
             "reference_image_selection_modes": params.reference_image_selection_modes,
             "upload_reference_roles": params.upload_reference_roles,
             "upload_selection_modes": params.upload_selection_modes,
+            "style_lock_id": params.style_lock_id,
+            "character_profile_ids": params.character_profile_ids,
             "seed_images": serialize_seed_images(image_candidates),
             "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
@@ -4196,6 +5864,8 @@ async def run_storyboard_task(
     task_payload: dict[str, Any],
 ) -> None:
     async def worker() -> None:
+        style_lock = load_style_lock(params.style_lock_id)
+        character_profiles = load_character_profiles(params.character_profile_ids)
         db.update_task(task_id, progress=12, stage="AI 正在规划连续分镜")
         planner_reference_images = [
             (item["path"], item.get("mime_type") or "image/png")
@@ -4207,6 +5877,8 @@ async def run_storyboard_task(
             image_candidates,
             params.shot_limit,
             attach_reference_images=params.planner_endpoint != "chat_completions",
+            character_profiles=character_profiles,
+            style_lock=style_lock,
         )
         with db.connect() as conn:
             cursor = conn.execute(
@@ -4224,6 +5896,16 @@ async def run_storyboard_task(
             )
             assistant_message_id = int(cursor.lastrowid)
         db.update_task(task_id, assistant_message_id=assistant_message_id)
+        persist_task_checkpoint(
+            task_id,
+            mode="storyboard",
+            step="planner_started",
+            progress=12,
+            stage="AI 正在规划连续分镜",
+            can_resume=False,
+            assistant_message_id=assistant_message_id,
+            context_limit=context_limit,
+        )
         publish_task_event(
             task_id,
             "assistant_start",
@@ -4274,6 +5956,8 @@ async def run_storyboard_task(
             "plan": plan,
             "context_limit": context_limit,
             "image_candidates": sanitize_reference_candidates(image_candidates),
+            "style_lock": style_lock,
+            "character_profiles": character_profiles,
         }
         raw_for_meta["storyboard"] = raw_for_meta_storyboard
 
@@ -4284,6 +5968,20 @@ async def run_storyboard_task(
             )
         update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
         update_message_meta(assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
+        persist_task_checkpoint(
+            task_id,
+            mode="storyboard",
+            step="planner_done",
+            progress=24,
+            stage="AI 已规划镜头，准备逐张生成" if plan["should_generate"] else "AI 已判断需要继续完善分镜",
+            can_resume=bool(plan["should_generate"]),
+            assistant_message_id=assistant_message_id,
+            planner_response_id=planner_response_id,
+            storyboard=storyboard_state,
+            raw_for_meta=raw_for_meta,
+            completed_count=0,
+            total_count=len(plan["shots"]),
+        )
         publish_task_snapshot(task_id)
         publish_task_event(
             task_id,
@@ -4332,6 +6030,21 @@ async def run_storyboard_task(
             update_storyboard_task_state(task_id, task_payload, storyboard_state)
             progress = min(30 + int((index - 1) / max(total, 1) * 62), 88)
             db.update_task(task_id, progress=progress, stage=f"准备生成镜头 {index}/{total}：{shot_name}")
+            persist_task_checkpoint(
+                task_id,
+                mode="storyboard",
+                step="image_waiting",
+                progress=progress,
+                stage=f"准备生成镜头 {index}/{total}：{shot_name}",
+                can_resume=len(saved_images) > 0,
+                assistant_message_id=assistant_message_id,
+                planner_response_id=planner_response_id,
+                storyboard=storyboard_state,
+                raw_for_meta=raw_for_meta,
+                completed_count=len(saved_images),
+                total_count=total,
+                current_shot_index=index,
+            )
             publish_task_snapshot(task_id)
             continuity_prompt = "\n".join(
                 part
@@ -4345,6 +6058,11 @@ async def run_storyboard_task(
                     str(shot.get("planner_prompt") or shot.get("prompt") or ""),
                 ]
                 if str(part or "").strip()
+            )
+            continuity_prompt = apply_locked_prompt(
+                continuity_prompt,
+                character_profiles=character_profiles,
+                style_lock=style_lock,
             )
             action, edit_inputs, input_image_notes, shot_reference_candidates, shot_target_candidates = resolve_storyboard_shot_inputs(
                 previous_image,
@@ -4434,6 +6152,21 @@ async def run_storyboard_task(
                     progress=min(32 + int(index / max(total, 1) * 60), 92),
                     stage=f"已通过 {provider['name']} 保存镜头 {index}/{total}：{shot_name}",
                 )
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_saved",
+                    progress=min(32 + int(index / max(total, 1) * 60), 92),
+                    stage=f"已通过 {provider['name']} 保存镜头 {index}/{total}：{shot_name}",
+                    can_resume=index < total,
+                    assistant_message_id=assistant_message_id,
+                    planner_response_id=planner_response_id,
+                    storyboard=storyboard_state,
+                    raw_for_meta=raw_for_meta,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                )
                 publish_storyboard_image_saved(
                     task_id,
                     conversation_id=conversation_id,
@@ -4452,6 +6185,21 @@ async def run_storyboard_task(
                 raw_for_meta["image_error"] = exc.detail
                 raw_for_meta["provider_attempts"] = provider_attempts
                 update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_waiting",
+                    progress=min(30 + int((index - 1) / max(total, 1) * 62), 88),
+                    stage=f"镜头 {index}/{total} 生成失败，可按当前进度重试",
+                    can_resume=len(saved_images) > 0,
+                    assistant_message_id=assistant_message_id,
+                    planner_response_id=planner_response_id,
+                    storyboard=storyboard_state,
+                    raw_for_meta=raw_for_meta,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                )
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
             except Exception as exc:
                 shot["status"] = "failed"
@@ -4462,6 +6210,21 @@ async def run_storyboard_task(
                 raw_for_meta["image_error"] = str(exc)
                 raw_for_meta["provider_attempts"] = provider_attempts
                 update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_waiting",
+                    progress=min(30 + int((index - 1) / max(total, 1) * 62), 88),
+                    stage=f"镜头 {index}/{total} 生成失败，可按当前进度重试",
+                    can_resume=len(saved_images) > 0,
+                    assistant_message_id=assistant_message_id,
+                    planner_response_id=planner_response_id,
+                    storyboard=storyboard_state,
+                    raw_for_meta=raw_for_meta,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                )
                 raise
 
         raw_for_meta["image_status"] = "done"
@@ -4472,6 +6235,20 @@ async def run_storyboard_task(
             raw_for_meta["image_provider"] = {"id": last_provider["id"], "name": last_provider["name"]}
         update_message_meta(assistant_message_id, raw_for_meta, planner_response_id)
         db.update_task(task_id, progress=96, stage="正在整理分镜结果")
+        persist_task_checkpoint(
+            task_id,
+            mode="storyboard",
+            step="finalizing",
+            progress=96,
+            stage="正在整理分镜结果",
+            can_resume=False,
+            assistant_message_id=assistant_message_id,
+            planner_response_id=planner_response_id,
+            storyboard=storyboard_state,
+            raw_for_meta=raw_for_meta,
+            completed_count=len(saved_images),
+            total_count=total,
+        )
         db.finish_task(
             task_id,
             {
@@ -4491,6 +6268,7 @@ async def run_storyboard_task(
 async def retry_task(task_id: int) -> dict[str, Any]:
     ensure_task_slot()
     old_task = task_with_images(task_id)
+    checkpoint = task_checkpoint_dict(old_task)
     if old_task.get("status") not in {"failed", "canceled"}:
         raise HTTPException(status_code=400, detail="当前仅支持重试失败或已停止的任务")
     conversation_id = old_task.get("conversation_id")
@@ -4498,96 +6276,53 @@ async def retry_task(task_id: int) -> dict[str, Any]:
         with db.connect() as conn:
             ensure_conversation_task_retry_allowed(conn, int(conversation_id), int(old_task["id"]))
     mode = str(old_task.get("mode") or "")
+    params = copy.deepcopy(old_task.get("params") or {})
     if mode == "generate":
-        params = copy.deepcopy(old_task.get("params") or {})
-        request = GenerateRequest(**normalize_text_fields(params))
-        retry_payload = compact_params({**params, "retry_of": task_id})
-        retry_id = db.create_task(
-            "generate",
-            f"重试：{old_task.get('prompt') or '普通生图任务'}",
-            retry_payload,
-            conversation_id=old_task.get("conversation_id"),
-            user_message_id=old_task.get("user_message_id"),
-        )
-        schedule_task(
-            retry_id,
-            run_generate_task(
-                retry_id,
-                request,
-                retry_payload,
-                conversation_id=old_task.get("conversation_id"),
-                user_message_id=old_task.get("user_message_id"),
-            ),
-        )
-        return {"task": db.get_task(retry_id)}
-    if mode == "edit":
-        params = copy.deepcopy(old_task.get("params") or {})
+        GenerateRequest(**normalize_text_fields(params))
+    elif mode == "edit":
         prompt = str(params.get("prompt") or old_task.get("prompt") or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="该编辑任务缺少可重试的原始提示词")
-        input_images: list[tuple[Path, str]] = []
-        saved_mask: tuple[Path, str] | None = None
-        for image in old_task.get("images", []):
-            if image.get("source") not in {"input", "mask"}:
-                continue
-            path = Path(str(image.get("file_path") or ""))
-            if not path.exists():
-                continue
-            item = (path, str(image.get("mime_type") or "image/png"))
-            if image.get("source") == "mask":
-                saved_mask = item
-            else:
-                input_images.append(item)
-        if not input_images:
+        input_image_exists = any(
+            image.get("source") == "input" and Path(str(image.get("file_path") or "")).exists()
+            for image in old_task.get("images", [])
+        )
+        if not input_image_exists:
             raise HTTPException(status_code=400, detail="该编辑任务缺少可重试的原始输入图")
-        params["upload_selection_modes"] = normalize_edit_upload_selection_modes(params.get("upload_selection_modes"), len(input_images))
-        retry_payload = compact_params({**params, "retry_of": task_id})
-        retry_id = db.create_task(
-            "edit",
-            f"重试：{prompt}",
-            retry_payload,
-            conversation_id=old_task.get("conversation_id"),
-            user_message_id=old_task.get("user_message_id"),
-        )
-        for item in input_images:
-            public_input_image(item, source="input", title=prompt, task_id=retry_id, conversation_id=old_task.get("conversation_id"), message_id=old_task.get("user_message_id"))
-        if saved_mask:
-            public_input_image(saved_mask, source="mask", title=f"{prompt} mask", task_id=retry_id, conversation_id=old_task.get("conversation_id"), message_id=old_task.get("user_message_id"))
-        schedule_task(
-            retry_id,
-            run_edit_task(
-                retry_id,
-                params,
-                prompt,
-                input_images,
-                saved_mask,
-                conversation_id=old_task.get("conversation_id"),
-                user_message_id=old_task.get("user_message_id"),
-            ),
-        )
-        return {"task": db.get_task(retry_id)}
-    if mode != "storyboard":
-        raise HTTPException(status_code=400, detail="当前仅支持重试普通生图、编辑和分镜连续生图任务")
-    params = copy.deepcopy(old_task.get("params") or {})
-    storyboard = params.get("storyboard") if isinstance(params.get("storyboard"), dict) else {}
-    shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
-    if not shots:
-        raise HTTPException(status_code=400, detail="该分镜任务没有可重试的镜头状态")
-    for shot in shots:
-        if isinstance(shot, dict) and shot.get("status") in {"running", "failed"}:
-            shot["status"] = "pending"
-            shot.pop("error", None)
-    retry_payload = compact_params({**params, "retry_of": task_id})
-    retry_id = db.create_task(
-        "storyboard",
-        f"重试：{old_task.get('prompt') or '分镜任务'}",
-        retry_payload,
-        conversation_id=old_task.get("conversation_id"),
-        user_message_id=old_task.get("user_message_id"),
-        assistant_message_id=old_task.get("assistant_message_id"),
-    )
-    schedule_task(retry_id, run_storyboard_retry_task(retry_id, old_task, retry_payload))
-    return {"task": db.get_task(retry_id)}
+    elif mode == "chat":
+        prompt = str(params.get("prompt") or old_task.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="该对话任务缺少可重试的原始提示词")
+    elif mode == "storyboard":
+        storyboard = params.get("storyboard") if isinstance(params.get("storyboard"), dict) else {}
+        shots = storyboard.get("shots") if isinstance(storyboard.get("shots"), list) else []
+        checkpoint_step = str(checkpoint.get("step") or "").strip().lower()
+        if not shots and checkpoint_step not in {"planner_started", "planner_done"}:
+            raise HTTPException(status_code=400, detail="该分镜任务没有可重试的镜头状态")
+    else:
+        raise HTTPException(status_code=400, detail="当前仅支持重试普通生图、编辑、对话和分镜连续生图任务")
+    previous_state = {
+        "status": old_task.get("status"),
+        "progress": old_task.get("progress"),
+        "stage": old_task.get("stage"),
+        "error": old_task.get("error"),
+        "response_json": old_task.get("response_json"),
+        "cancel_requested": old_task.get("cancel_requested"),
+        "scheduled_for": old_task.get("scheduled_for"),
+        "image_provider_id": old_task.get("image_provider_id"),
+        "image_provider_name": old_task.get("image_provider_name"),
+        "checkpoint_json": old_task.get("checkpoint_json"),
+    }
+    retried_task = requeue_task_for_manual_retry(old_task, checkpoint)
+    try:
+        schedule_existing_task(retried_task)
+    except HTTPException:
+        db.update_task(task_id, **previous_state)
+        raise
+    except Exception:
+        db.update_task(task_id, **previous_state)
+        raise
+    return {"task": task_with_images(task_id)}
 
 
 async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -4597,7 +6332,10 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
         total = len(shots)
         output_format = str(payload.get("output_format", "png"))
         client_config = ClientConfig(**payload.get("config", {})) if isinstance(payload.get("config"), dict) else ClientConfig()
-        seed_candidates = load_seed_images_from_payload(payload)
+        style_lock = load_style_lock(payload.get("style_lock_id"))
+        character_profiles = load_character_profiles(payload.get("character_profile_ids"))
+        same_task_resume = int(old_task.get("id") or 0) == task_id
+        seed_candidates = load_seed_images_from_payload(payload, strict=True, label="分镜任务参考图快照")
         if not seed_candidates:
             seed_candidates = load_seed_images_from_task_images(old_task.get("images", []))
         old_images = [image for image in old_task.get("images", []) if image.get("source") == "api"]
@@ -4625,34 +6363,53 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
             image = image_for_shot(shot)
             if image and image.get("file_path") and Path(image["file_path"]).exists():
                 public_url = image.get("public_url") or image.get("url") or ""
-                copied_image_id = db.add_image(
-                    source="api",
-                    file_path=Path(image["file_path"]),
-                    public_url=public_url,
-                    mime_type=image.get("mime_type") or "image/png",
-                    title=str(shot.get("name") or image.get("title") or ""),
-                    bucket=image.get("bucket"),
-                    task_id=task_id,
-                    conversation_id=conversation_id,
-                    message_id=assistant_message_id,
-                )
-                shot["image_id"] = copied_image_id
-                shot["url"] = public_url
-                copied_image = {
-                    **image,
-                    "id": copied_image_id,
-                    "task_id": task_id,
-                    "conversation_id": conversation_id,
-                    "message_id": assistant_message_id,
-                    "public_url": public_url,
-                    "url": public_url,
-                }
-                saved_images.append(copied_image)
+                if same_task_resume:
+                    shot["image_id"] = image.get("id")
+                    shot["url"] = public_url
+                    saved_images.append(copy.deepcopy(image))
+                else:
+                    copied_image_id = db.add_image(
+                        source="api",
+                        file_path=Path(image["file_path"]),
+                        public_url=public_url,
+                        mime_type=image.get("mime_type") or "image/png",
+                        title=str(shot.get("name") or image.get("title") or ""),
+                        bucket=image.get("bucket"),
+                        task_id=task_id,
+                        conversation_id=conversation_id,
+                        message_id=assistant_message_id,
+                    )
+                    shot["image_id"] = copied_image_id
+                    shot["url"] = public_url
+                    copied_image = {
+                        **image,
+                        "id": copied_image_id,
+                        "task_id": task_id,
+                        "conversation_id": conversation_id,
+                        "message_id": assistant_message_id,
+                        "public_url": public_url,
+                        "url": public_url,
+                    }
+                    saved_images.append(copied_image)
                 previous_image = (Path(image["file_path"]), image.get("mime_type") or "image/png")
 
         bucket = task_image_folder(task_id, f"重试分镜-{old_task.get('prompt') or task_id}")
         db.update_task(task_id, progress=12, stage=f"准备从第 {done_count + 1}/{total} 个镜头继续")
         update_storyboard_task_state(task_id, payload, storyboard)
+        persist_task_checkpoint(
+            task_id,
+            mode="storyboard",
+            step="image_waiting",
+            progress=12,
+            stage=f"准备从第 {done_count + 1}/{total} 个镜头继续",
+            can_resume=done_count > 0,
+            assistant_message_id=assistant_message_id,
+            storyboard=storyboard,
+            completed_count=len(saved_images),
+            total_count=total,
+            bucket=bucket,
+            retry_of=old_task.get("id"),
+        )
         publish_task_snapshot(task_id)
         provider_attempts: list[dict[str, Any]] = []
         last_provider: dict[str, Any] | None = None
@@ -4685,11 +6442,31 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                             "suggestion": "请从原对话重新提交分镜需求，或选择一张参考图后重试。",
                         },
                     )
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_running",
+                    progress=min(25 + int((index - 1) / max(total, 1) * 65), 88),
+                    stage=f"准备重试镜头 {index}/{total}：{shot_name}",
+                    can_resume=len(saved_images) > 0,
+                    assistant_message_id=assistant_message_id,
+                    storyboard=storyboard,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                    bucket=bucket,
+                    retry_of=old_task.get("id"),
+                    provider_attempts=provider_attempts,
+                )
                 response, provider, attempt_log = await execute_with_provider_failover(
                     task_id,
                     lambda _provider, client_config: call_responses_image_generation(
                         model=str(payload.get("model", "gpt-5.4")),
-                        prompt=str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or ""),
+                        prompt=apply_locked_prompt(
+                            str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or ""),
+                            character_profiles=character_profiles,
+                            style_lock=style_lock,
+                        ),
                         image_model=str(payload.get("image_model", "gpt-image-2")),
                         size=str(payload.get("size", "2560x1440")),
                         quality=str(payload.get("quality", "high")),
@@ -4741,6 +6518,22 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                 image_record["prompt_text"] = str(shot.get("execution_prompt") or shot.get("planner_prompt") or shot.get("prompt") or old_task.get("prompt") or "")
                 update_storyboard_task_state(task_id, payload, storyboard)
                 db.update_task(task_id, progress=min(30 + int(index / max(total, 1) * 62), 92), stage=f"已通过 {provider['name']} 重试保存镜头 {index}/{total}：{shot_name}")
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_saved",
+                    progress=min(30 + int(index / max(total, 1) * 62), 92),
+                    stage=f"已通过 {provider['name']} 重试保存镜头 {index}/{total}：{shot_name}",
+                    can_resume=index < total,
+                    assistant_message_id=assistant_message_id,
+                    storyboard=storyboard,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                    bucket=bucket,
+                    retry_of=old_task.get("id"),
+                    provider_attempts=provider_attempts,
+                )
                 publish_storyboard_image_saved(
                     task_id,
                     conversation_id=old_task.get("conversation_id"),
@@ -4754,14 +6547,61 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
                 shot["status"] = "failed"
                 shot["error"] = exc.detail
                 update_storyboard_task_state(task_id, payload, storyboard)
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_waiting",
+                    progress=min(25 + int((index - 1) / max(total, 1) * 65), 88),
+                    stage=f"重试镜头 {index}/{total} 失败，可按当前进度继续",
+                    can_resume=len(saved_images) > 0,
+                    assistant_message_id=assistant_message_id,
+                    storyboard=storyboard,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                    bucket=bucket,
+                    retry_of=old_task.get("id"),
+                    provider_attempts=provider_attempts,
+                )
                 publish_task_snapshot(task_id)
                 raise
             except Exception as exc:
                 shot["status"] = "failed"
                 shot["error"] = str(exc)
                 update_storyboard_task_state(task_id, payload, storyboard)
+                persist_task_checkpoint(
+                    task_id,
+                    mode="storyboard",
+                    step="image_waiting",
+                    progress=min(25 + int((index - 1) / max(total, 1) * 65), 88),
+                    stage=f"重试镜头 {index}/{total} 失败，可按当前进度继续",
+                    can_resume=len(saved_images) > 0,
+                    assistant_message_id=assistant_message_id,
+                    storyboard=storyboard,
+                    completed_count=len(saved_images),
+                    total_count=total,
+                    current_shot_index=index,
+                    bucket=bucket,
+                    retry_of=old_task.get("id"),
+                    provider_attempts=provider_attempts,
+                )
                 publish_task_snapshot(task_id)
                 raise
+        persist_task_checkpoint(
+            task_id,
+            mode="storyboard",
+            step="finalizing",
+            progress=96,
+            stage="正在整理分镜重试结果",
+            can_resume=False,
+            assistant_message_id=assistant_message_id,
+            storyboard=storyboard,
+            completed_count=len(saved_images),
+            total_count=total,
+            bucket=bucket,
+            retry_of=old_task.get("id"),
+            provider_attempts=provider_attempts,
+        )
         db.finish_task(
             task_id,
             {
@@ -4778,40 +6618,399 @@ async def run_storyboard_retry_task(task_id: int, old_task: dict[str, Any], payl
     await run_with_slot(task_id, worker)
 
 
-@app.get("/api/gallery")
-def gallery(limit: int = 200) -> dict[str, Any]:
-    with db.connect() as conn:
-        rows = conn.execute(
-            """
-            select i.*,
-                c.title as conversation_title,
-                c.context_limit as conversation_context_limit,
-                m.content as message_content,
-                t.prompt as task_prompt,
-                t.mode as task_mode
-            from images i
-            left join conversations c on c.id = i.conversation_id
-            left join messages m on m.id = i.message_id
-            left join tasks t on t.id = i.task_id
-            where i.source not in ('mask', 'input_reference')
-            order by datetime(i.created_at) desc, i.id desc
-            limit ?
-            """,
-            (limit,),
-        ).fetchall()
-    items = [db.row_to_dict(row) for row in rows]
-    task_ids = [item["task_id"] for item in items if item.get("task_id")]
+def gallery_group_key(conversation_id: int | None, task_id: int | None) -> str:
+    if conversation_id:
+        return f"conversation-{conversation_id}"
+    if task_id:
+        return f"task-{task_id}"
+    return "group-unknown"
+
+
+def gallery_group_title(row: dict[str, Any]) -> str:
+    return str(row.get("conversation_title") or row.get("task_prompt") or row.get("title") or "独立生成")
+
+
+def gallery_group_mode(row: dict[str, Any]) -> str:
+    return str(row.get("conversation_mode") or row.get("task_mode") or "").strip()
+
+
+def safe_archive_name(value: str | None, fallback: str = "批量下载") -> str:
+    text = normalize_image_title(value, fallback=fallback)
+    text = INVALID_FILENAME_CHARS.sub("_", text).strip(" ._")
+    return text[:80] or fallback
+
+
+def unique_archive_path(used: set[str], folder: str, filename: str) -> str:
+    clean_folder = safe_archive_name(folder, "批量下载")
+    clean_filename = INVALID_FILENAME_CHARS.sub("_", filename or "image.png").strip(" ._") or "image.png"
+    stem = Path(clean_filename).stem or "image"
+    suffix = Path(clean_filename).suffix or ".png"
+    candidate = f"{clean_folder}/{clean_filename}"
+    index = 2
+    while candidate in used:
+        candidate = f"{clean_folder}/{stem}-{index}{suffix}"
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+def image_archive_filename(image: dict[str, Any], index: int) -> str:
+    title = normalize_image_title(image.get("title"), fallback="")
+    if not title:
+        title = normalize_image_title(Path(str(image.get("file_path") or "")).stem, fallback=f"图片-{index}")
+    suffix = Path(str(image.get("file_path") or "")).suffix
+    if not suffix:
+        mime = str(image.get("mime_type") or "").lower()
+        suffix = ".jpg" if "jpeg" in mime or "jpg" in mime else ".webp" if "webp" in mime else ".png"
+    return f"{title}{suffix}"
+
+
+def selected_download_images(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: int | None = None,
+    task_id: int | None = None,
+    tag: str = "",
+    favorite: int | None = None,
+    mode: str = "",
+) -> list[dict[str, Any]]:
+    clauses = ["i.source not in ('mask', 'input_reference')"]
+    values: list[Any] = []
+    if conversation_id is not None:
+        clauses.append("i.conversation_id = ?")
+        values.append(conversation_id)
+    if task_id is not None:
+        clauses.append("i.task_id = ?")
+        values.append(task_id)
+    if favorite is not None:
+        clauses.append("i.favorite = ?")
+        values.append(1 if int(favorite) else 0)
+    if mode.strip():
+        clauses.append("coalesce(c.mode, t.mode, '') = ?")
+        values.append(mode.strip())
+    where = " and ".join(clauses)
+    rows = conn.execute(
+        f"""
+        select i.*,
+               c.title as conversation_title,
+               c.mode as conversation_mode,
+               m.content as message_content,
+               t.prompt as task_prompt,
+               t.mode as task_mode
+        from images i
+        left join conversations c on c.id = i.conversation_id
+        left join messages m on m.id = i.message_id
+        left join tasks t on t.id = i.task_id
+        where {where}
+        order by datetime(i.created_at) asc, i.id asc
+        """,
+        values,
+    ).fetchall()
+    images = [serialize_image_record(row, conn) for row in rows]
+    filter_tag = normalize_image_tags([tag])[0] if normalize_image_tags([tag]) else ""
+    if filter_tag:
+        images = [image for image in images if filter_tag in parse_image_tags(image.get("tags"))]
+    task_ids = [int(image["task_id"]) for image in images if image.get("task_id")]
     task_map: dict[int, dict[str, Any]] = {}
     if task_ids:
         placeholders = ",".join("?" for _ in task_ids)
-        with db.connect() as conn:
-            task_rows = conn.execute(f"select * from tasks where id in ({placeholders})", task_ids).fetchall()
-        task_map = {int(row["id"]): summarize_task(row) for row in task_rows}
+        task_rows = conn.execute(f"select * from tasks where id in ({placeholders})", task_ids).fetchall()
+        task_map = {int(row["id"]): summarize_task(row, include_response=False) for row in task_rows}
+    for image in images:
+        task = task_map.get(int(image["task_id"])) if image.get("task_id") else None
+        if task:
+            enrich_images_with_prompt([image], task)
+    return images
+
+
+def load_gallery_group_items(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: int | None = None,
+    task_id: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if conversation_id is None and task_id is None:
+        return []
+    where_clause = "i.conversation_id = ?" if conversation_id is not None else "i.conversation_id is null and i.task_id = ?"
+    where_value = conversation_id if conversation_id is not None else task_id
+    order_clause = "order by datetime(i.created_at) desc, i.id desc" if limit is not None else "order by datetime(i.created_at) asc, i.id asc"
+    limit_clause = "limit ?" if limit is not None else ""
+    values: list[Any] = [where_value]
+    if limit is not None:
+        values.append(limit)
+    rows = conn.execute(
+        f"""
+        select i.*,
+               c.title as conversation_title,
+               c.mode as conversation_mode,
+               m.content as message_content,
+               t.prompt as task_prompt,
+               t.mode as task_mode
+        from images i
+        left join conversations c on c.id = i.conversation_id
+        left join messages m on m.id = i.message_id
+        left join tasks t on t.id = i.task_id
+        where i.source not in ('mask', 'input_reference')
+          and {where_clause}
+        {order_clause}
+        {limit_clause}
+        """,
+        values,
+    ).fetchall()
+    ordered_rows = list(reversed(rows)) if limit is not None else list(rows)
+    items = [serialize_image_record(row, conn) for row in ordered_rows]
+    task_ids = [int(item["task_id"]) for item in items if item.get("task_id")]
+    task_map: dict[int, dict[str, Any]] = {}
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        task_rows = conn.execute(f"select * from tasks where id in ({placeholders})", task_ids).fetchall()
+        task_map = {int(row["id"]): summarize_task(row, include_response=False) for row in task_rows}
     for item in items:
         task = task_map.get(int(item["task_id"])) if item.get("task_id") else None
         if task:
             enrich_images_with_prompt([item], task)
-    return {"items": items}
+    return items
+
+
+def build_gallery_group_payload(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row | dict[str, Any],
+    *,
+    preview_limit: int = 6,
+    include_items: bool = False,
+) -> dict[str, Any]:
+    item = db.row_to_dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+    conversation_id = int(item["conversation_id"]) if item.get("conversation_id") is not None else None
+    task_id = int(item["task_id"]) if item.get("task_id") is not None else None
+    preview_items = load_gallery_group_items(
+        conn,
+        conversation_id=conversation_id,
+        task_id=task_id,
+        limit=max(1, min(preview_limit, 12)),
+    )
+    group = {
+        "key": gallery_group_key(conversation_id, task_id),
+        "conversation_id": conversation_id,
+        "task_id": task_id,
+        "title": gallery_group_title(item),
+        "mode": gallery_group_mode(item),
+        "latest_time": item.get("latest_created_at"),
+        "time": item.get("latest_created_at"),
+        "total_count": int(item.get("total_count") or len(preview_items)),
+        "preview_items": preview_items,
+        "has_more": int(item.get("total_count") or len(preview_items)) > len(preview_items),
+        "detail_loaded": False,
+    }
+    if include_items:
+        items = load_gallery_group_items(conn, conversation_id=conversation_id, task_id=task_id, limit=None)
+        group["items"] = items
+        group["detail_loaded"] = True
+        group["has_more"] = len(items) > len(preview_items)
+    return group
+
+
+@app.get("/api/gallery")
+def gallery(group_limit: int = 40, preview_limit: int = 6) -> dict[str, Any]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            select
+                grouped.conversation_id,
+                grouped.task_id,
+                grouped.total_count,
+                grouped.latest_created_at,
+                c.title as conversation_title,
+                c.mode as conversation_mode,
+                t.prompt as task_prompt,
+                t.mode as task_mode
+            from (
+                select
+                    i.conversation_id as conversation_id,
+                    case when i.conversation_id is null then i.task_id else null end as task_id,
+                    count(*) as total_count,
+                    max(i.created_at) as latest_created_at
+                from images i
+                where i.source not in ('mask', 'input_reference')
+                group by i.conversation_id, case when i.conversation_id is null then i.task_id else null end
+            ) grouped
+            left join conversations c on c.id = grouped.conversation_id
+            left join tasks t on t.id = grouped.task_id
+            order by datetime(grouped.latest_created_at) desc
+            limit ?
+            """,
+            (max(1, min(group_limit, 120)),),
+        ).fetchall()
+        groups = [build_gallery_group_payload(conn, row, preview_limit=preview_limit, include_items=False) for row in rows]
+    return {"items": groups}
+
+
+@app.get("/api/gallery/group")
+def gallery_group_detail(conversation_id: int | None = None, task_id: int | None = None, preview_limit: int = 6) -> dict[str, Any]:
+    if conversation_id is None and task_id is None:
+        raise HTTPException(status_code=400, detail="conversation_id 或 task_id 至少需要一个")
+    with db.connect() as conn:
+        if conversation_id is not None:
+            row = conn.execute(
+                """
+                select
+                    c.id as conversation_id,
+                    null as task_id,
+                    c.title as conversation_title,
+                    c.mode as conversation_mode,
+                    null as task_prompt,
+                    null as task_mode,
+                    (
+                        select count(*) from images i
+                        where i.conversation_id = c.id and i.source not in ('mask', 'input_reference')
+                    ) as total_count,
+                    (
+                        select max(i.created_at) from images i
+                        where i.conversation_id = c.id and i.source not in ('mask', 'input_reference')
+                    ) as latest_created_at
+                from conversations c
+                where c.id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                select
+                    null as conversation_id,
+                    t.id as task_id,
+                    null as conversation_title,
+                    null as conversation_mode,
+                    t.prompt as task_prompt,
+                    t.mode as task_mode,
+                    (
+                        select count(*) from images i
+                        where i.conversation_id is null and i.task_id = t.id and i.source not in ('mask', 'input_reference')
+                    ) as total_count,
+                    (
+                        select max(i.created_at) from images i
+                        where i.conversation_id is null and i.task_id = t.id and i.source not in ('mask', 'input_reference')
+                    ) as latest_created_at
+                from tasks t
+                where t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        if not row or not row["total_count"]:
+            raise HTTPException(status_code=404, detail="gallery group not found")
+        group = build_gallery_group_payload(conn, row, preview_limit=preview_limit, include_items=True)
+    return {"group": group}
+
+
+@app.put("/api/images/{image_id}/metadata")
+def update_image_metadata(image_id: int, request: ImageMetadataRequest) -> dict[str, Any]:
+    tags = normalize_image_tags(request.tags) if request.tags is not None else None
+    assignments: list[str] = []
+    values: list[Any] = []
+    if request.favorite is not None:
+        assignments.append("favorite = ?")
+        values.append(1 if int(request.favorite) else 0)
+    if tags is not None:
+        assignments.append("tags = ?")
+        values.append(db.json_dumps(tags))
+    if not assignments:
+        with db.connect() as conn:
+            row = conn.execute("select * from images where id = ?", (image_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="image not found")
+            return {"image": serialize_image_record(row, conn)}
+    values.append(image_id)
+    with db.connect() as conn:
+        cursor = conn.execute(f"update images set {', '.join(assignments)} where id = ?", values)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="image not found")
+        row = conn.execute(
+            """
+            select i.*,
+                   c.title as conversation_title,
+                   c.mode as conversation_mode,
+                   m.content as message_content,
+                   t.prompt as task_prompt,
+                   t.mode as task_mode
+            from images i
+            left join conversations c on c.id = i.conversation_id
+            left join messages m on m.id = i.message_id
+            left join tasks t on t.id = i.task_id
+            where i.id = ?
+            """,
+            (image_id,),
+        ).fetchone()
+        image = serialize_image_record(row, conn)
+    return {"image": image}
+
+
+@app.get("/api/images/download")
+def download_images_zip(
+    conversation_id: int | None = None,
+    task_id: int | None = None,
+    tag: str = "",
+    favorite: int | None = None,
+    mode: str = "",
+    folder_name: str = "批量下载",
+) -> Response:
+    folder = safe_archive_name(folder_name, "批量下载")
+    with db.connect() as conn:
+        images = selected_download_images(
+            conn,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            tag=tag,
+            favorite=favorite,
+            mode=mode,
+        )
+    files = []
+    for image in images:
+        path = Path(str(image.get("file_path") or ""))
+        if path.is_file():
+            files.append((image, path))
+    if not files:
+        raise HTTPException(status_code=404, detail="没有找到可下载的图片")
+    buffer = io.BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, (image, path) in enumerate(files, start=1):
+            archive_name = unique_archive_path(used_names, folder, image_archive_filename(image, index))
+            archive.write(path, archive_name)
+        manifest = {
+            "folder": folder,
+            "total": len(files),
+            "filters": {
+                "conversation_id": conversation_id,
+                "task_id": task_id,
+                "tag": tag,
+                "favorite": favorite,
+                "mode": mode,
+            },
+            "images": [
+                {
+                    "id": image.get("id"),
+                    "title": image.get("title"),
+                    "tags": image.get("tags"),
+                    "favorite": image.get("favorite"),
+                    "task_id": image.get("task_id"),
+                    "conversation_id": image.get("conversation_id"),
+                    "filename": path.name,
+                }
+                for image, path in files
+            ],
+        }
+        archive.writestr(f"{folder}/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    buffer.seek(0)
+    filename = f"{folder}.zip"
+    quoted = quote(filename)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"download.zip\"; filename*=UTF-8''{quoted}",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/api/conversations/{conversation_id}/messages")
@@ -4831,7 +7030,12 @@ async def chat_message(
         context_limit = params.context_limit if params.context_limit is not None else conversation["context_limit"]
         context_limit = max(0, min(int(context_limit), 50))
     uploaded = [await save_upload(upload) for upload in images or []]
-    selected_reference_images = load_selected_reference_images(params.reference_image_ids, limit=max(0, 3 - len(uploaded)), conversation_id=conversation_id)
+    selected_reference_images = require_selected_reference_images(
+        params.reference_image_ids,
+        limit=max(0, 3 - len(uploaded)),
+        conversation_id=conversation_id,
+        label="对话参考图",
+    )
     selected_reference_uploads = [
         (Path(item["file_path"]), item.get("mime_type") or "image/png")
         for item in selected_reference_images
@@ -4848,20 +7052,7 @@ async def chat_message(
     db.add_prompt(params.prompt, source="auto", mode="chat")
 
     with db.connect() as conn:
-        recent_messages = [
-            db.row_to_dict(row)
-            for row in conn.execute(
-                """
-                select id, role, content, meta_json, created_at
-                from messages
-                where conversation_id = ?
-                order by id desc
-                limit ?
-                """,
-                (conversation_id, context_limit),
-            ).fetchall()
-        ]
-        recent_messages = list(reversed(recent_messages))
+        recent_messages = load_recent_messages(conversation_id, context_limit)
         cursor = conn.execute(
             """
             insert into messages (conversation_id, role, content, meta_json, created_at)
@@ -4880,6 +7071,8 @@ async def chat_message(
                         "upload_reference_roles": params.upload_reference_roles,
                         "upload_selection_modes": params.upload_selection_modes,
                         "context_limit": context_limit,
+                        "style_lock_id": params.style_lock_id,
+                        "character_profile_ids": params.character_profile_ids,
                     }
                 ),
                 db.now_iso(),
@@ -4915,6 +7108,8 @@ async def chat_message(
             "reference_image_selection_modes": params.reference_image_selection_modes,
             "upload_reference_roles": params.upload_reference_roles,
             "upload_selection_modes": params.upload_selection_modes,
+            "style_lock_id": params.style_lock_id,
+            "character_profile_ids": params.character_profile_ids,
             "seed_images": serialize_seed_images(image_candidates),
             "planner_config": params.planner_config.model_dump() if params.planner_config else None,
         }
@@ -4957,46 +7152,59 @@ async def run_chat_task(
     conversation_title: str,
     recent_messages: list[dict[str, Any]],
     context_limit: int,
+    assistant_message_id: int | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
+    restored_images: list[dict[str, Any]] | None = None,
 ) -> None:
     async def worker() -> None:
-        db.update_task(task_id, progress=12, stage="AI 正在理解意图")
+        style_lock = load_style_lock(params.style_lock_id)
+        character_profiles = load_character_profiles(params.character_profile_ids)
+        checkpoint = resume_checkpoint if isinstance(resume_checkpoint, dict) else {}
+        checkpoint_step = str(checkpoint.get("step") or "").strip().lower()
+        resume_from_planner = checkpoint_step in {"planner_done", "image_waiting", "image_running", "image_saved", "finalizing"}
         planner_reference_images = [
             (item["path"], item.get("mime_type") or "image/png")
             for item in image_candidates
         ]
-        planner_prompt = build_chat_planner_prompt(
-            recent_messages,
-            params.prompt,
-            bool(image_candidates),
-            image_candidates=image_candidates,
-            attach_reference_images=params.planner_endpoint != "chat_completions",
-        )
-        with db.connect() as conn:
-            cursor = conn.execute(
-                """
-                insert into messages (conversation_id, role, content, meta_json, created_at)
-                values (?, ?, ?, ?, ?)
-                """,
-                (
-                    conversation_id,
-                    "assistant",
-                    "AI 正在理解你的需求...",
-                    db.json_dumps({"planner_status": "streaming", "context_limit": context_limit}),
-                    db.now_iso(),
-                ),
+        active_assistant_message_id = int(checkpoint.get("assistant_message_id") or assistant_message_id or 0) or None
+        if active_assistant_message_id is None:
+            with db.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    insert into messages (conversation_id, role, content, meta_json, created_at)
+                    values (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_id,
+                        "assistant",
+                        "AI 正在理解你的需求...",
+                        db.json_dumps({"planner_status": "streaming", "context_limit": context_limit}),
+                        db.now_iso(),
+                    ),
+                )
+                active_assistant_message_id = int(cursor.lastrowid)
+        else:
+            update_message_meta(
+                active_assistant_message_id,
+                {
+                    "planner_status": "streaming" if not resume_from_planner else "done",
+                    "context_limit": context_limit,
+                },
             )
-            assistant_message_id = int(cursor.lastrowid)
-        db.update_task(task_id, assistant_message_id=assistant_message_id)
+            if not resume_from_planner:
+                update_message_content(active_assistant_message_id, "AI 正在理解你的需求...")
+
+        db.update_task(task_id, assistant_message_id=active_assistant_message_id)
         publish_task_event(
             task_id,
             "assistant_start",
             {
                 "message": {
-                    "id": assistant_message_id,
+                    "id": active_assistant_message_id,
                     "conversation_id": conversation_id,
                     "role": "assistant",
-                    "content": "AI 正在理解你的需求...",
-                    "meta": {"planner_status": "streaming", "context_limit": context_limit},
+                    "content": "AI 正在理解你的需求..." if not resume_from_planner else str(checkpoint.get("reply") or "AI 正在继续上次进度..."),
+                    "meta": {"planner_status": "streaming" if not resume_from_planner else "done", "context_limit": context_limit},
                     "image_status": "",
                     "images": [],
                     "uploaded_images": [],
@@ -5004,18 +7212,84 @@ async def run_chat_task(
             },
             snapshot=True,
         )
-        planner_response = await call_chat_planner(
-            model=params.planner_model or params.model,
-            prompt=planner_prompt,
-            config=params.planner_config or params.config,
-            uploaded=planner_reference_images,
-            image_contexts=image_candidates,
-            previous_response_id=None,
-            on_stream_event=make_planner_reply_stream_handler(task_id, assistant_message_id, "AI 正在理解你的需求..."),
-            planner_endpoint=params.planner_endpoint,
-        )
-        planner_text = extract_text_from_responses(planner_response)
-        plan = parse_planner_json(planner_text)
+
+        plan = copy.deepcopy(checkpoint.get("plan")) if isinstance(checkpoint.get("plan"), dict) else None
+        raw_for_meta = copy.deepcopy(checkpoint.get("raw_for_meta")) if isinstance(checkpoint.get("raw_for_meta"), dict) else {}
+        planner_response_id = str(checkpoint.get("planner_response_id") or "").strip() or None
+        provider_attempts: list[dict[str, Any]] = copy.deepcopy(checkpoint.get("provider_attempts")) if isinstance(checkpoint.get("provider_attempts"), list) else []
+
+        if not resume_from_planner or not plan:
+            persist_task_checkpoint(
+                task_id,
+                mode="chat",
+                step="planner_started",
+                progress=12,
+                stage="AI 正在理解意图",
+                can_resume=False,
+                assistant_message_id=active_assistant_message_id,
+                context_limit=context_limit,
+            )
+            planner_prompt = build_chat_planner_prompt(
+                recent_messages,
+                params.prompt,
+                bool(image_candidates),
+                image_candidates=image_candidates,
+                attach_reference_images=params.planner_endpoint != "chat_completions",
+                character_profiles=character_profiles,
+                style_lock=style_lock,
+            )
+            planner_response = await call_chat_planner(
+                model=params.planner_model or params.model,
+                prompt=planner_prompt,
+                config=params.planner_config or params.config,
+                uploaded=planner_reference_images,
+                image_contexts=image_candidates,
+                previous_response_id=None,
+                on_stream_event=make_planner_reply_stream_handler(task_id, active_assistant_message_id, "AI 正在理解你的需求..."),
+                planner_endpoint=params.planner_endpoint,
+            )
+            planner_text = extract_text_from_responses(planner_response)
+            plan = parse_planner_json(planner_text)
+            planner_response_id = planner_response.get("id")
+            raw_for_meta = {
+                "endpoint": "/v1/responses",
+                "planner": sanitize_response(planner_response),
+                "plan": plan,
+                "context_limit": context_limit,
+                "image_candidates": sanitize_reference_candidates(image_candidates),
+                "style_lock": style_lock,
+                "character_profiles": character_profiles,
+            }
+            with db.connect() as conn:
+                conn.execute(
+                    """
+                    update conversations
+                    set previous_response_id = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
+                )
+            update_message_content(active_assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
+            update_message_meta(active_assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
+            publish_task_event(
+                task_id,
+                "assistant_reply",
+                {"message_id": active_assistant_message_id, "content": plan["reply"] or "我理解了。"},
+                snapshot=True,
+            )
+        else:
+            raw_for_meta.setdefault("endpoint", "/v1/responses")
+            raw_for_meta.setdefault("plan", plan)
+            raw_for_meta.setdefault("context_limit", context_limit)
+            raw_for_meta.setdefault("image_candidates", sanitize_reference_candidates(image_candidates))
+            update_message_meta(active_assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
+            publish_task_event(
+                task_id,
+                "assistant_reply",
+                {"message_id": active_assistant_message_id, "content": str(plan.get("reply") or checkpoint.get("reply") or "我理解了。")},
+                snapshot=True,
+            )
+
         requested_reference_candidates = resolve_selected_candidates(
             image_candidates,
             plan["reference_image_ids"],
@@ -5032,43 +7306,29 @@ async def run_chat_task(
             target_candidates = list(user_target_candidates)
         if not target_candidates and user_target_candidates and params.action != "generate":
             target_candidates = list(user_target_candidates)
-        planner_response_id = planner_response.get("id")
+
         db.update_task(
             task_id,
             progress=34,
             stage="AI 已完成意图判断，准备生图" if plan["should_generate"] else "AI 已判断无需生图",
         )
 
-        raw_for_meta: dict[str, Any] = {
-            "endpoint": "/v1/responses",
-            "planner": sanitize_response(planner_response),
-            "plan": plan,
-            "context_limit": context_limit,
-            "image_candidates": sanitize_reference_candidates(image_candidates),
-        }
-
-        with db.connect() as conn:
-            conn.execute(
-                """
-                update conversations
-                set previous_response_id = ?, updated_at = ?
-                where id = ?
-                """,
-                (planner_response_id or previous_response_id, db.now_iso(), conversation_id),
-            )
-        update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
-        update_message_meta(assistant_message_id, {**raw_for_meta, "planner_status": "done"}, planner_response_id)
-        publish_task_event(
-            task_id,
-            "assistant_reply",
-            {"message_id": assistant_message_id, "content": plan["reply"] or "我理解了。"},
-            snapshot=True,
-        )
-
         if not plan["should_generate"]:
+            persist_task_checkpoint(
+                task_id,
+                mode="chat",
+                step="planner_done",
+                progress=34,
+                stage="AI 已判断无需生图",
+                can_resume=False,
+                assistant_message_id=active_assistant_message_id,
+                planner_response_id=planner_response_id,
+                plan=plan,
+                raw_for_meta=raw_for_meta,
+            )
             raw_for_task = {
                 "user_message_id": user_message_id,
-                "assistant_message_id": assistant_message_id,
+                "assistant_message_id": active_assistant_message_id,
                 "text": plan["reply"],
                 "images": [],
                 "fallback": False,
@@ -5077,8 +7337,15 @@ async def run_chat_task(
             db.finish_task(task_id, raw_for_task)
             return
 
-        image_prompt = plan["image_prompt"] or params.prompt
-        action = plan["action"] if plan["action"] in {"generate", "edit", "auto"} else params.action
+        base_image_prompt = str(checkpoint.get("image_prompt") or raw_for_meta.get("image_prompt") or plan.get("image_prompt") or params.prompt).strip() or params.prompt
+        image_prompt = apply_locked_prompt(
+            base_image_prompt,
+            character_profiles=character_profiles,
+            style_lock=style_lock,
+        )
+        action = str(checkpoint.get("resolved_action") or raw_for_meta.get("resolved_action") or plan["action"] or params.action).strip().lower()
+        if action not in {"generate", "edit", "auto"}:
+            action = params.action
         if target_candidates:
             action = "edit"
         if action == "auto":
@@ -5100,19 +7367,31 @@ async def run_chat_task(
                     plan["reason"] = "edit requested without unambiguous direct edit targets"
             if not plan["should_generate"]:
                 db.update_task(task_id, progress=36, stage="需要你确认具体要修改的图片")
-                update_message_content(assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
-                update_message_meta(assistant_message_id, {**raw_for_meta, "plan": plan, "planner_status": "done"}, planner_response_id)
+                update_message_content(active_assistant_message_id, plan["reply"] or "我理解了。", planner_response_id)
+                update_message_meta(active_assistant_message_id, {**raw_for_meta, "plan": plan, "planner_status": "done"}, planner_response_id)
                 publish_task_event(
                     task_id,
                     "assistant_reply",
-                    {"message_id": assistant_message_id, "content": plan["reply"] or "我理解了。"},
+                    {"message_id": active_assistant_message_id, "content": plan["reply"] or "我理解了。"},
                     snapshot=True,
+                )
+                persist_task_checkpoint(
+                    task_id,
+                    mode="chat",
+                    step="planner_done",
+                    progress=36,
+                    stage="需要你确认具体要修改的图片",
+                    can_resume=False,
+                    assistant_message_id=active_assistant_message_id,
+                    planner_response_id=planner_response_id,
+                    plan=plan,
+                    raw_for_meta={**raw_for_meta, "plan": plan},
                 )
                 db.finish_task(
                     task_id,
                     {
                         "user_message_id": user_message_id,
-                        "assistant_message_id": assistant_message_id,
+                        "assistant_message_id": active_assistant_message_id,
                         "text": plan["reply"],
                         "images": [],
                         "fallback": False,
@@ -5120,6 +7399,7 @@ async def run_chat_task(
                     },
                 )
                 return
+
         used_reference_candidates = merge_candidate_lists(
             target_candidates if action == "edit" else [],
             requested_reference_candidates,
@@ -5139,7 +7419,7 @@ async def run_chat_task(
         raw_for_meta["edit_target_image_ids"] = candidate_ids(target_candidates)
         raw_for_meta["resolved_action"] = action
         raw_for_meta["tool"] = "image_generation"
-        image_name = normalize_image_title(plan.get("image_name") or "")
+        image_name = normalize_image_title(checkpoint.get("image_name") or raw_for_meta.get("image_name") or plan.get("image_name") or "")
         if not image_name:
             image_name = build_direct_mode_base_title(
                 "",
@@ -5149,8 +7429,57 @@ async def run_chat_task(
             )
         raw_for_meta["image_name"] = image_name
         raw_for_meta["image_prompt"] = image_prompt
-        update_message_meta(assistant_message_id, {**raw_for_meta, "image_status": "waiting"}, planner_response_id)
-        provider_attempts: list[dict[str, Any]] = []
+        images_out: list[dict[str, Any]] = list(restored_images or [])
+        total_images_hint = max(int(checkpoint.get("total_count") or len(images_out) or 1), 1)
+
+        persist_task_checkpoint(
+            task_id,
+            mode="chat",
+            step="image_waiting",
+            progress=52,
+            stage=f"AI 已准备按 {action} 继续生成图片",
+            can_resume=True,
+            assistant_message_id=active_assistant_message_id,
+            planner_response_id=planner_response_id,
+            plan=plan,
+            raw_for_meta=raw_for_meta,
+            image_prompt=image_prompt,
+            image_name=image_name,
+            resolved_action=action,
+            completed_count=len(images_out),
+            total_count=total_images_hint,
+            provider_attempts=provider_attempts,
+        )
+        update_message_meta(active_assistant_message_id, {**raw_for_meta, "image_status": "waiting"}, planner_response_id)
+
+        if len(images_out) >= total_images_hint and images_out:
+            persist_task_checkpoint(
+                task_id,
+                mode="chat",
+                step="finalizing",
+                progress=96,
+                stage="已恢复已完成图片，正在整理对话结果",
+                can_resume=False,
+                assistant_message_id=active_assistant_message_id,
+                planner_response_id=planner_response_id,
+                plan=plan,
+                raw_for_meta=raw_for_meta,
+                completed_count=len(images_out),
+                total_count=total_images_hint,
+                provider_attempts=provider_attempts,
+            )
+            raw_for_meta["image_status"] = "done"
+            raw_for_task = {
+                "user_message_id": user_message_id,
+                "assistant_message_id": active_assistant_message_id,
+                "text": plan["reply"],
+                "images": images_out,
+                "fallback": False,
+                "raw": raw_for_meta,
+            }
+            db.finish_task(task_id, raw_for_task)
+            return
+
         try:
             image_response, provider, attempt_log = await execute_with_provider_failover(
                 task_id,
@@ -5184,7 +7513,7 @@ async def run_chat_task(
             raw_for_meta["image_provider"] = {"id": provider["id"], "name": provider["name"]}
             raw_for_meta["provider_attempts"] = provider_attempts
             update_message_meta(
-                assistant_message_id,
+                active_assistant_message_id,
                 {
                     **raw_for_meta,
                     "image_status": "running",
@@ -5192,8 +7521,25 @@ async def run_chat_task(
                 },
                 planner_response_id,
             )
-            db.update_task(task_id, progress=84, stage=f"正在通过 {provider['name']} 提取和保存图片")
-            bucket = task_image_folder(task_id, conversation_title)
+            persist_task_checkpoint(
+                task_id,
+                mode="chat",
+                step="image_running",
+                progress=72,
+                stage=f"正在通过 {provider['name']} 生成图片",
+                can_resume=True,
+                assistant_message_id=active_assistant_message_id,
+                planner_response_id=planner_response_id,
+                plan=plan,
+                raw_for_meta=raw_for_meta,
+                image_prompt=image_prompt,
+                image_name=image_name,
+                resolved_action=action,
+                completed_count=len(images_out),
+                total_count=total_images_hint,
+                provider_attempts=provider_attempts,
+            )
+            bucket = str(checkpoint.get("bucket") or "").strip() or task_image_folder(task_id, conversation_title)
             image_items = extract_images_from_responses(image_response, params.output_format, folder=bucket)
             raw_for_meta["image_response"] = sanitize_response(image_response)
             if not image_items:
@@ -5212,9 +7558,27 @@ async def run_chat_task(
             raw_for_meta["image_error"] = exc.detail
             raw_for_meta["provider_attempts"] = provider_attempts
             update_message_meta(
-                assistant_message_id,
+                active_assistant_message_id,
                 raw_for_meta,
                 planner_response_id or previous_response_id,
+            )
+            persist_task_checkpoint(
+                task_id,
+                mode="chat",
+                step="image_waiting",
+                progress=52,
+                stage="本次生图失败，可按当前进度重试",
+                can_resume=True,
+                assistant_message_id=active_assistant_message_id,
+                planner_response_id=planner_response_id,
+                plan=plan,
+                raw_for_meta=raw_for_meta,
+                image_prompt=image_prompt,
+                image_name=image_name,
+                resolved_action=action,
+                completed_count=len(images_out),
+                total_count=max(total_images_hint, len(images_out), 1),
+                provider_attempts=provider_attempts,
             )
             with db.connect() as conn:
                 conn.execute(
@@ -5223,22 +7587,60 @@ async def run_chat_task(
                 )
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
-        images_out: list[dict[str, Any]] = []
-        total_images = max(len(image_items), 1)
-        for index, item in enumerate(image_items, start=1):
+        total_images = max(len(image_items), len(images_out), 1)
+        for index, item in enumerate(image_items[len(images_out) :], start=len(images_out) + 1):
             resolved_title = build_sequenced_title(image_name, index, total_images)
             renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
             images_out.append(
                 public_task_image(
                     renamed,
                     conversation_id=conversation_id,
-                    message_id=assistant_message_id,
+                    message_id=active_assistant_message_id,
                     task_id=task_id,
                     title=resolved_title,
                     bucket=bucket,
                 )
             )
+            persist_task_checkpoint(
+                task_id,
+                mode="chat",
+                step="image_saved",
+                progress=min(84 + int(len(images_out) / max(total_images, 1) * 8), 92),
+                stage=f"已保存第 {len(images_out)}/{total_images} 张图片",
+                can_resume=len(images_out) < total_images,
+                assistant_message_id=active_assistant_message_id,
+                planner_response_id=planner_response_id,
+                plan=plan,
+                raw_for_meta=raw_for_meta,
+                image_prompt=image_prompt,
+                image_name=image_name,
+                resolved_action=action,
+                completed_count=len(images_out),
+                total_count=total_images,
+                provider_attempts=provider_attempts,
+                bucket=bucket,
+            )
+
         raw_for_meta["image_status"] = "done"
+        raw_for_meta["provider_attempts"] = provider_attempts
+        persist_task_checkpoint(
+            task_id,
+            mode="chat",
+            step="finalizing",
+            progress=96,
+            stage="正在写入对话历史",
+            can_resume=False,
+            assistant_message_id=active_assistant_message_id,
+            planner_response_id=planner_response_id,
+            plan=plan,
+            raw_for_meta=raw_for_meta,
+            image_prompt=image_prompt,
+            image_name=image_name,
+            resolved_action=action,
+            completed_count=len(images_out),
+            total_count=total_images,
+            provider_attempts=provider_attempts,
+        )
         with db.connect() as conn:
             conn.execute(
                 "update messages set meta_json = ?, response_id = ?, updated_at = ? where id = ?",
@@ -5246,7 +7648,7 @@ async def run_chat_task(
                     db.json_dumps(raw_for_meta),
                     image_response.get("id") or planner_response_id,
                     db.now_iso(),
-                    assistant_message_id,
+                    active_assistant_message_id,
                 ),
             )
             conn.execute(
@@ -5256,13 +7658,13 @@ async def run_chat_task(
 
         raw_for_task = {
             "user_message_id": user_message_id,
-            "assistant_message_id": assistant_message_id,
+            "assistant_message_id": active_assistant_message_id,
             "text": plan["reply"],
             "images": images_out,
             "fallback": False,
             "raw": raw_for_meta,
         }
-        db.update_task(task_id, assistant_message_id=assistant_message_id, progress=96, stage="正在写入对话历史")
+        db.update_task(task_id, assistant_message_id=active_assistant_message_id, progress=96, stage="正在写入对话历史")
         db.finish_task(task_id, raw_for_task)
     await run_with_slot(task_id, worker)
 
@@ -5286,7 +7688,16 @@ def resolve_tenant_media_file(kind: str, relative_path: str) -> Path:
 
 @app.get("/media/{kind}/{relative_path:path}")
 def serve_media(kind: str, relative_path: str):
-    return FileResponse(resolve_tenant_media_file(kind, relative_path))
+    target = resolve_tenant_media_file(kind, relative_path)
+    accel_prefix = get_env("MEDIA_ACCEL_REDIRECT_PREFIX", "").strip().rstrip("/")
+    if accel_prefix:
+        response = Response(media_type=guess_mime(target))
+        response.headers["X-Accel-Redirect"] = f"{accel_prefix}/media/{kind}/{relative_path}"
+    else:
+        response = FileResponse(target)
+    response.headers["Cache-Control"] = IMMUTABLE_PRIVATE_CACHE_CONTROL
+    add_vary_cookie(response)
+    return response
 
 
 @app.get("/favicon.svg", include_in_schema=False)
@@ -5313,7 +7724,9 @@ if FRONTEND_DIST.exists():
 def frontend(path: str):
     index_path = FRONTEND_DIST / "index.html"
     if index_path.exists():
-        return FileResponse(index_path)
+        response = FileResponse(index_path)
+        response.headers["Cache-Control"] = NO_STORE_CACHE_CONTROL
+        return response
     return HTMLResponse(
         """
         <html><body style="font-family:sans-serif;padding:32px">

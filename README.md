@@ -87,6 +87,8 @@ cd ~/generate-image
 bash scripts/update_project.sh
 ```
 
+如果前面挂了 Nginx，可把静态资源和媒体文件交给 Nginx 直出，并设置 `MEDIA_ACCEL_REDIRECT_PREFIX` 让后端鉴权后走 `X-Accel-Redirect`。
+
 ## 配置说明
 
 - `IMAGE_API_BASE_URL`：OpenAI 或兼容服务地址，例如 `https://api.openai.com` 或你的中转地址。
@@ -99,5 +101,6 @@ bash scripts/update_project.sh
 - `IMAGE_STABLE_RETRY_QUALITY`：稳定重试使用的清晰度，默认 `medium`。
 - `DATABASE_PATH`：SQLite 数据库位置。
 - `STORAGE_DIR`：上传和输出图片目录。
+- `MEDIA_ACCEL_REDIRECT_PREFIX`：可选，启用后把媒体文件交给 Nginx 直出。
 
 前端配置面板中的提供商、模型和图片参数会保存到 SQLite 数据库，不依赖浏览器本地存储。
