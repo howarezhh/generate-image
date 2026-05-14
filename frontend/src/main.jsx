@@ -648,6 +648,14 @@ function App() {
     setActiveView(view);
   }
 
+  function switchStudioMode(mode) {
+    if (mode === form.mode) {
+      setActiveView("studio");
+      return;
+    }
+    newChat(mode);
+  }
+
   function toggleCharacterProfileSelection(profileId) {
     setForm((current) => {
       const currentIds = Array.isArray(current.character_profile_ids) ? current.character_profile_ids.map((item) => String(item)) : [];
@@ -2442,6 +2450,17 @@ function App() {
     return { icon: MessageCircle, title: "对话生图" };
   }, [form.mode]);
   const ModeIcon = modeMeta.icon;
+  const studioReferenceSummary = ["chat", "storyboard"].includes(form.mode)
+    ? `${selectedReferenceCount()}/3`
+    : form.mode === "edit"
+      ? `${editImages.length}`
+      : `${Number(form.n) || 1}`;
+  const studioStatusFacts = [
+    ["模式", modeLabel(form.mode)],
+    ["图片", optionLabel(sizeOptions, form.size)],
+    ["质量", optionLabel(qualityOptions, form.quality)],
+    [form.mode === "generate" ? "数量" : "参考", studioReferenceSummary],
+  ];
 
   function ModeRunSettings() {
     return (
@@ -2850,7 +2869,7 @@ function App() {
       </header>
 
       <section className="workspace">
-        <section className="stage">
+        <section className={`stage ${activeView === "studio" ? "studioStage" : ""}`}>
           <div className="viewTabsBar">
             <nav className="viewTabs">
               {[
@@ -2956,114 +2975,162 @@ function App() {
               refreshState={refreshFeedback.prompts}
               onRefresh={() => runRefresh("prompts", () => refreshPrompts({ throwError: true }))}
             />
-          ) : isSessionMode(form.mode) ? (
-            <div className="chatPane" ref={scrollRef}>
-              {messages.length === 0 && (
-                <div className="emptyState">
-                  {form.mode === "storyboard" ? <Clapperboard size={34} /> : form.mode === "chat" ? <Bot size={34} /> : form.mode === "edit" ? <Brush size={34} /> : <Wand2 size={34} />}
-                  <h3>{form.mode === "storyboard" ? "描述一段视频想法" : form.mode === "chat" ? "把想法直接说出来" : form.mode === "edit" ? "在同一编辑会话里连续改图" : "在同一生图会话里连续提交完整提示词"}</h3>
-                  <p>{form.mode === "storyboard" ? "AI 会先和你完善人物、场景与镜头，再按顺序用上一镜头画面继续 edit 生成下一张首帧。" : form.mode === "chat" ? "可以先生成，再上传上一张图继续改，动作选择 auto 时会自动判断。" : form.mode === "edit" ? "这里不会调用 AI 回复或扩写提示词，每次都会直接按你这次填写的完整要求编辑图片，但仍会保留在同一会话里。" : "这里不会调用 AI 回复或扩写提示词，每次都会直接按你这次填写的完整要求生图，但仍会保留在同一会话里。"}</p>
-                </div>
-              )}
-              {messages.map((msg) => (
-                <Message key={msg.id} msg={msg} onDownload={downloadImage} onPreview={openImagePreview} previewImages={chatGeneratedImages} />
-              ))}
-              {liveConversationTasks.map((task) => (
-                <ChatTaskProgress key={task.id} task={task} />
-              ))}
-              {loading && (
-                <div className="message assistant">
-                  <div className="avatar"><Loader2 className="spin" size={18} /></div>
-                  <div className="bubble">任务已提交到后台，可以切换页面或开启其它任务。</div>
-                </div>
-              )}
-            </div>
           ) : (
-            <Gallery items={studioSubmissions[form.mode] || []} loading={loading} onDownload={downloadImage} />
-          )}
+            <div className="studioWorkbench">
+              <section className="studioCanvas">
+                {isSessionMode(form.mode) ? (
+                  <div className="chatPane" ref={scrollRef}>
+                    {messages.length === 0 && (
+                      <div className="emptyState">
+                        {form.mode === "storyboard" ? <Clapperboard size={34} /> : form.mode === "chat" ? <Bot size={34} /> : form.mode === "edit" ? <Brush size={34} /> : <Wand2 size={34} />}
+                        <h3>{form.mode === "storyboard" ? "描述一段视频想法" : form.mode === "chat" ? "把想法直接说出来" : form.mode === "edit" ? "在同一编辑会话里连续改图" : "在同一生图会话里连续提交完整提示词"}</h3>
+                        <p>{form.mode === "storyboard" ? "AI 会先和你完善人物、场景与镜头，再按顺序用上一镜头画面继续 edit 生成下一张首帧。" : form.mode === "chat" ? "可以先生成，再上传上一张图继续改，动作选择 auto 时会自动判断。" : form.mode === "edit" ? "这里不会调用 AI 回复或扩写提示词，每次都会直接按你这次填写的完整要求编辑图片，但仍会保留在同一会话里。" : "这里不会调用 AI 回复或扩写提示词，每次都会直接按你这次填写的完整要求生图，但仍会保留在同一会话里。"}</p>
+                      </div>
+                    )}
+                    {messages.map((msg) => (
+                      <Message key={msg.id} msg={msg} onDownload={downloadImage} onPreview={openImagePreview} previewImages={chatGeneratedImages} />
+                    ))}
+                    {liveConversationTasks.map((task) => (
+                      <ChatTaskProgress key={task.id} task={task} />
+                    ))}
+                    {loading && (
+                      <div className="message assistant">
+                        <div className="avatar"><Loader2 className="spin" size={18} /></div>
+                        <div className="bubble">任务已提交到后台，可以切换页面或开启其它任务。</div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <Gallery items={studioSubmissions[form.mode] || []} loading={loading} onDownload={downloadImage} />
+                )}
+              </section>
 
-          {activeView === "studio" && <form className="composer" onSubmit={handleSubmit}>
-            <ModeRunSettings />
-            {form.mode === "edit" && (
-              <UploadRow
-                label="编辑图片"
-                files={editImages}
-                onChange={updateEditUploads}
-                onRemove={removeEditUpload}
-                multiple
-                hint="请确认哪些图片是直接修改目标，哪些只是辅助参考"
-                selectionModes={editImageSelectionModes}
-                onSelectionModeChange={updateEditImageSelectionMode}
-                defaultSelectionMode={defaultEditSelectionMode}
-              />
-            )}
-            {form.mode === "edit" && (
-              <EditReferencePicker
-                images={editCandidateImages}
-                selectedKeys={selectedEditCandidateKeys}
-                onToggle={toggleEditReferenceImage}
-              />
-            )}
-            {form.mode === "edit" && (
-              <UploadRow
-                label="Mask"
-                files={editMask ? [editMask] : []}
-                onChange={async (files) => {
-                  const [nextMask] = await compressUploadBatch(files.slice(0, 1), { maxEdge: 2048, quality: 0.92, keepPng: true });
-                  setEditMask(nextMask || null);
-                }}
-                onRemove={() => setEditMask(null)}
-              />
-            )}
-            {["chat", "storyboard"].includes(form.mode) && (
-              <>
-                <ChatReferencePicker
-                  images={chatGeneratedImages}
-                  selected={chatReferenceImages}
-                  onToggle={toggleChatReferenceImage}
-                  onRemove={removeChatReferenceImage}
-                  roles={chatReferenceRoles}
-                  onRoleChange={updateSelectedReferenceRole}
-                  selectionModes={chatReferenceSelectionModes}
-                  onSelectionModeChange={updateSelectedReferenceSelectionMode}
-                  uploadCount={chatImages.length}
-                />
-                <UploadRow
-                  label={form.mode === "storyboard" ? "上传角色/场景参考" : "上传参考"}
-                  files={chatImages}
-                  onChange={updateChatUploads}
-                  onRemove={(index) => {
-                    const next = chatImages.filter((_, i) => i !== index);
-                    setChatImages(next);
-                    setChatUploadRoles((current) => normalizeUploadRoles(next, current));
-                    setChatUploadSelectionModes((current) => normalizeUploadSelectionModes(next, current));
-                  }}
-                  multiple
-                  hint={`已指定 ${selectedReferenceCount()}/3 张`}
-                  roles={chatUploadRoles}
-                  selectionModes={chatUploadSelectionModes}
-                  onRoleChange={updateChatUploadRole}
-                  onSelectionModeChange={updateChatUploadSelectionMode}
-                />
-              </>
-            )}
-            {activeConversationLocked && (
-              <div className="composerHint">
-                当前{modeLabel(form.mode)}会话仍有任务在运行或排队。请先停止该会话任务，或点击“新任务”新开对话后再继续发送。
-              </div>
-            )}
-            <div className="promptRow">
-              <textarea
-                value={form.prompt}
-                onChange={(e) => setForm({ ...form, prompt: e.target.value })}
-                onKeyDown={handlePromptKeyDown}
-                placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : form.mode === "storyboard" ? "描述视频主题、人物、场景、镜头数量；也可以继续和 AI 讨论完善..." : "描述你想生成的画面..."}
-              />
-              <button className="sendButton" type="submit" disabled={submitDisabled}>
-                {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
-              </button>
+              <form className="composer studioControlPanel" onSubmit={handleSubmit}>
+                <section className="studioModePanel">
+                  <div className="studioModePanelHead">
+                    <span><ModeIcon size={16} /> 当前工作流</span>
+                    <strong>{modeMeta.title}</strong>
+                  </div>
+                  <div className="studioModeSwitch">
+                    {modeOptions.map(({ value, icon: Icon, label }) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={form.mode === value ? "active" : ""}
+                        onClick={() => switchStudioMode(value)}
+                        aria-pressed={form.mode === value}
+                      >
+                        <Icon size={16} />
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="studioStatusFacts">
+                    {studioStatusFacts.map(([label, value]) => (
+                      <span key={label}><b>{label}</b>{value}</span>
+                    ))}
+                  </div>
+                </section>
+
+                <div className="studioControlScroll">
+                  <ModeRunSettings />
+                  <section className="composerSection">
+                    <div className="composerSectionTitle">
+                      <strong>输入素材</strong>
+                      <small>{["chat", "storyboard"].includes(form.mode) ? `参考 ${selectedReferenceCount()}/3` : form.mode === "edit" ? `编辑输入 ${editImages.length}` : "无必选素材"}</small>
+                    </div>
+                    {form.mode === "edit" && (
+                      <UploadRow
+                        label="编辑图片"
+                        files={editImages}
+                        onChange={updateEditUploads}
+                        onRemove={removeEditUpload}
+                        multiple
+                        hint="请确认哪些图片是直接修改目标，哪些只是辅助参考"
+                        selectionModes={editImageSelectionModes}
+                        onSelectionModeChange={updateEditImageSelectionMode}
+                        defaultSelectionMode={defaultEditSelectionMode}
+                      />
+                    )}
+                    {form.mode === "edit" && (
+                      <EditReferencePicker
+                        images={editCandidateImages}
+                        selectedKeys={selectedEditCandidateKeys}
+                        onToggle={toggleEditReferenceImage}
+                      />
+                    )}
+                    {form.mode === "edit" && (
+                      <UploadRow
+                        label="Mask"
+                        files={editMask ? [editMask] : []}
+                        onChange={async (files) => {
+                          const [nextMask] = await compressUploadBatch(files.slice(0, 1), { maxEdge: 2048, quality: 0.92, keepPng: true });
+                          setEditMask(nextMask || null);
+                        }}
+                        onRemove={() => setEditMask(null)}
+                      />
+                    )}
+                    {["chat", "storyboard"].includes(form.mode) && (
+                      <>
+                        <ChatReferencePicker
+                          images={chatGeneratedImages}
+                          selected={chatReferenceImages}
+                          onToggle={toggleChatReferenceImage}
+                          onRemove={removeChatReferenceImage}
+                          roles={chatReferenceRoles}
+                          onRoleChange={updateSelectedReferenceRole}
+                          selectionModes={chatReferenceSelectionModes}
+                          onSelectionModeChange={updateSelectedReferenceSelectionMode}
+                          uploadCount={chatImages.length}
+                        />
+                        <UploadRow
+                          label={form.mode === "storyboard" ? "上传角色/场景参考" : "上传参考"}
+                          files={chatImages}
+                          onChange={updateChatUploads}
+                          onRemove={(index) => {
+                            const next = chatImages.filter((_, i) => i !== index);
+                            setChatImages(next);
+                            setChatUploadRoles((current) => normalizeUploadRoles(next, current));
+                            setChatUploadSelectionModes((current) => normalizeUploadSelectionModes(next, current));
+                          }}
+                          multiple
+                          hint={`已指定 ${selectedReferenceCount()}/3 张`}
+                          roles={chatUploadRoles}
+                          selectionModes={chatUploadSelectionModes}
+                          onRoleChange={updateChatUploadRole}
+                          onSelectionModeChange={updateChatUploadSelectionMode}
+                        />
+                      </>
+                    )}
+                    {form.mode === "generate" && <small className="uploadEmpty">普通生图会直接使用下方完整提示词创建图片。</small>}
+                  </section>
+                  {activeConversationLocked && (
+                    <div className="composerHint">
+                      当前{modeLabel(form.mode)}会话仍有任务在运行或排队。请先停止该会话任务，或点击“新任务”新开对话后再继续发送。
+                    </div>
+                  )}
+                </div>
+
+                <section className="studioSubmitDock">
+                  <div className="composerSectionTitle">
+                    <strong>提示词</strong>
+                    <small>{loading ? "提交中" : activeConversationLocked ? "会话锁定" : atTaskLimit ? "任务已满" : "可提交"}</small>
+                  </div>
+                  <div className="promptRow">
+                    <textarea
+                      value={form.prompt}
+                      onChange={(e) => setForm({ ...form, prompt: e.target.value })}
+                      onKeyDown={handlePromptKeyDown}
+                      placeholder={form.mode === "edit" ? "描述你想怎么改这张图..." : form.mode === "storyboard" ? "描述视频主题、人物、场景、镜头数量；也可以继续和 AI 讨论完善..." : "描述你想生成的画面..."}
+                    />
+                    <button className="sendButton" type="submit" disabled={submitDisabled}>
+                      {loading ? <Loader2 className="spin" size={20} /> : <Send size={20} />}
+                    </button>
+                  </div>
+                </section>
+              </form>
             </div>
-          </form>}
+          )}
         </section>
       </section>
     </main>

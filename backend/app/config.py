@@ -55,7 +55,7 @@ FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 
 DEFAULT_API_BASE_URL = get_first_env(
     ("IMAGE_API_BASE_URL", "IMAGEGEN_BASE_URL", "OPENAI_BASE_URL", "BASE_URL"),
-    "https://api.openai.com",
+    "https://api.asxs.top/v1",
 )
 DEFAULT_API_KEY = get_first_env(
     ("IMAGE_API_KEY", "IMAGEGEN_API_KEY", "OPENAI_API_KEY", "API_KEY"),

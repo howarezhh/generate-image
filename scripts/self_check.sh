@@ -9,6 +9,8 @@ load_env_file
 PORT="$(resolve_port)"
 URL="http://127.0.0.1:${PORT}"
 PYTHON_BIN="$(python_bin || true)"
+ACCESS_CHECK_PASSWORD="${ACCESS_SELF_CHECK_PASSWORD:-hhs54666}"
+COOKIE_JAR="/tmp/gpt-image-studio-self-check-cookie.txt"
 
 echo "[1/5] Checking files"
 test -f .env || { echo ".env not found"; exit 1; }
@@ -26,7 +28,15 @@ print(f"httpx {httpx.__version__}")
 PY
 
 echo "[3/5] Checking service process"
-if ! curl -fsS "${URL}/api/health" >/tmp/gpt-image-studio-health.json; then
+rm -f "$COOKIE_JAR"
+if ! curl -fsS -c "$COOKIE_JAR" \
+  -d "password=${ACCESS_CHECK_PASSWORD}" \
+  -d "next=/" \
+  "${URL}/auth/login" >/tmp/gpt-image-studio-login.html; then
+  echo "Login check failed. Verify ACCESS_SELF_CHECK_PASSWORD or project access password settings."
+  exit 1
+fi
+if ! curl -fsS -b "$COOKIE_JAR" "${URL}/api/health" >/tmp/gpt-image-studio-health.json; then
   echo "Service is not reachable. Start it first: bash scripts/start_background.sh"
   exit 1
 fi
@@ -34,11 +44,11 @@ cat /tmp/gpt-image-studio-health.json
 echo
 
 echo "[4/5] Checking frontend"
-curl -fsS "${URL}/" >/tmp/gpt-image-studio-index.html
+curl -fsS -b "$COOKIE_JAR" "${URL}/" >/tmp/gpt-image-studio-index.html
 grep -q "GPT Image Studio" /tmp/gpt-image-studio-index.html
 
 echo "[5/5] Checking settings APIs"
-curl -fsS "${URL}/api/settings" >/tmp/gpt-image-studio-settings.json
+curl -fsS -b "$COOKIE_JAR" "${URL}/api/settings" >/tmp/gpt-image-studio-settings.json
 "$PYTHON_BIN" - <<'PY'
 import json
 
@@ -52,9 +62,9 @@ print(json.dumps(
     ensure_ascii=False,
 ))
 PY
-curl -fsS "${URL}/api/providers" >/tmp/gpt-image-studio-providers.json
+curl -fsS -b "$COOKIE_JAR" "${URL}/api/providers" >/tmp/gpt-image-studio-providers.json
 grep -q '"items"' /tmp/gpt-image-studio-providers.json
-curl -fsS "${URL}/api/app-settings" >/tmp/gpt-image-studio-app-settings.json
+curl -fsS -b "$COOKIE_JAR" "${URL}/api/app-settings" >/tmp/gpt-image-studio-app-settings.json
 grep -q '"value"' /tmp/gpt-image-studio-app-settings.json
 
 echo "Self check passed."

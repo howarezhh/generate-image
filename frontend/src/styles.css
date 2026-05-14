@@ -33,9 +33,11 @@ button {
 }
 
 .app {
+  height: 100vh;
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .topbar {
@@ -589,6 +591,11 @@ textarea:focus {
   min-height: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+.studioStage {
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .viewTabsBar {
@@ -852,6 +859,203 @@ textarea:focus {
   background: rgba(245, 243, 234, 0.045);
   border-radius: 14px;
   padding: 16px;
+}
+
+.studioWorkbench {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 14px 22px 22px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
+  gap: 14px;
+}
+
+.studioCanvas {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  overflow: hidden;
+  border: 1px solid rgba(245, 243, 234, 0.13);
+  border-radius: 12px;
+  background:
+    linear-gradient(180deg, rgba(245, 243, 234, 0.055), rgba(245, 243, 234, 0.025)),
+    rgba(17, 19, 15, 0.48);
+}
+
+.studioCanvas .chatPane,
+.studioCanvas .galleryPane {
+  min-height: 0;
+  padding: 18px;
+}
+
+.studioControlPanel {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  border-radius: 12px;
+  background: rgba(17, 19, 15, 0.82);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
+}
+
+.studioModePanel,
+.studioSubmitDock {
+  padding: 12px;
+}
+
+.studioModePanel {
+  border-bottom: 1px solid rgba(245, 243, 234, 0.1);
+  display: grid;
+  gap: 10px;
+}
+
+.studioModePanelHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.studioModePanelHead span {
+  color: rgba(245, 243, 234, 0.62);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.studioModePanelHead strong {
+  font-size: 14px;
+  color: #f5f3ea;
+}
+
+.studioModeSwitch {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.studioModeSwitch button {
+  min-width: 0;
+  min-height: 42px;
+  padding: 0 8px;
+  border: 1px solid rgba(245, 243, 234, 0.14);
+  border-radius: 8px;
+  background: rgba(245, 243, 234, 0.055);
+  color: rgba(245, 243, 234, 0.72);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.studioModeSwitch button.active {
+  border-color: transparent;
+  background: #eecb70;
+  color: #11130f;
+}
+
+.studioStatusFacts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.studioStatusFacts span {
+  min-width: 0;
+  border: 1px solid rgba(245, 243, 234, 0.1);
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: rgba(245, 243, 234, 0.04);
+  color: rgba(245, 243, 234, 0.82);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studioStatusFacts b {
+  color: rgba(245, 243, 234, 0.52);
+  margin-right: 6px;
+}
+
+.studioControlScroll {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.studioSubmitDock {
+  border-top: 1px solid rgba(245, 243, 234, 0.1);
+  background: rgba(17, 19, 15, 0.9);
+  display: grid;
+  gap: 10px;
+}
+
+.composerSection {
+  border: 1px solid rgba(245, 243, 234, 0.12);
+  border-radius: 8px;
+  background: rgba(245, 243, 234, 0.035);
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.composerSectionTitle {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.composerSectionTitle strong {
+  color: #f5f3ea;
+  font-size: 13px;
+}
+
+.composerSectionTitle small {
+  color: rgba(245, 243, 234, 0.56);
+}
+
+.studioControlPanel .modeRunSettings {
+  margin: 0;
+  background: rgba(245, 243, 234, 0.035);
+}
+
+.studioControlPanel .modeRunSettingsHead {
+  display: grid;
+  gap: 10px;
+}
+
+.studioControlPanel .modeRunSettingsHead .ghostButton {
+  width: 100%;
+}
+
+.studioControlPanel .modeRunGrid,
+.studioControlPanel .modeRunInline,
+.studioControlPanel .uploadRow {
+  grid-template-columns: 1fr;
+}
+
+.studioControlPanel .selectedReferenceStrip {
+  grid-template-columns: 1fr;
+}
+
+.studioControlPanel .uploadRow,
+.studioControlPanel .referencePicker {
+  margin-bottom: 0;
+}
+
+.studioControlPanel .promptRow textarea {
+  min-height: 108px;
 }
 
 .modeRunSettings {
@@ -2689,7 +2893,39 @@ textarea {
   }
 }
 
+@media (max-width: 1180px) {
+  .studioStage {
+    overflow: auto;
+  }
+
+  .studioWorkbench {
+    grid-template-columns: 1fr;
+    overflow: visible;
+    padding: 14px;
+  }
+
+  .studioCanvas {
+    min-height: min(52dvh, 520px);
+  }
+
+  .studioControlPanel {
+    min-height: auto;
+    overflow: visible;
+    grid-template-rows: auto auto auto;
+  }
+
+  .studioControlScroll {
+    overflow: visible;
+  }
+}
+
 @media (max-width: 760px) {
+  .app {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
   .topbar {
     height: auto;
     padding: 12px;
@@ -2729,6 +2965,34 @@ textarea {
 
   .stage {
     min-height: calc(100dvh - 86px);
+    overflow: visible;
+  }
+
+  .studioStage {
+    min-height: calc(100dvh - 86px);
+  }
+
+  .studioWorkbench {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .studioCanvas {
+    min-height: min(58dvh, 500px);
+  }
+
+  .studioCanvas .chatPane,
+  .studioCanvas .galleryPane {
+    padding: 14px;
+  }
+
+  .studioControlPanel {
+    padding: 0;
+  }
+
+  .studioModeSwitch,
+  .studioStatusFacts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .stageHead {
@@ -3215,6 +3479,10 @@ textarea {
 
   .composer {
     padding: 12px 10px calc(10px + env(safe-area-inset-bottom));
+  }
+
+  .studioControlPanel {
+    padding: 0;
   }
 
   .modeRunSettings {

@@ -4013,6 +4013,7 @@ async def dispatch_scheduled_tasks_once() -> None:
     available_slots = max(provider_pool_capacity() - active_task_count(), 0)
     if available_slots <= 0:
         return
+    dispatched_conversation_ids: set[int] = set()
     with db.connect() as conn:
         rows = conn.execute(
             """
@@ -4031,7 +4032,10 @@ async def dispatch_scheduled_tasks_once() -> None:
         task_id = int(row["id"])
         task = task_with_images(task_id)
         conversation_id = int(task["conversation_id"]) if task.get("conversation_id") else None
-        if conversation_has_active_task(conversation_id, exclude_task_id=task_id):
+        if (
+            conversation_id in dispatched_conversation_ids
+            or conversation_has_active_task(conversation_id, exclude_task_id=task_id)
+        ):
             waiting_stage = scheduled_task_stage(
                 task.get("scheduled_for"),
                 queue_position=task.get("queue_position"),
@@ -4056,6 +4060,8 @@ async def dispatch_scheduled_tasks_once() -> None:
             )
             publish_task_snapshot(task_id)
             schedule_existing_task(task)
+            if conversation_id:
+                dispatched_conversation_ids.add(conversation_id)
             available_slots -= 1
         except HTTPException as exc:
             db.fail_task(task_id, compact_error_detail(exc.detail))
@@ -5391,6 +5397,8 @@ async def task_events(task_id: int, request: Request) -> StreamingResponse:
             yield sse_format("connected", {"task_id": task_id})
             for payload in TASK_EVENT_SNAPSHOTS.get(runtime_key, {}).values():
                 yield sse_format(str(payload["event"]), payload["data"])
+                if payload["event"] in {"done", "failed", "canceled"}:
+                    return
             publish_task_snapshot(task_id)
             while True:
                 if await request.is_disconnected():
