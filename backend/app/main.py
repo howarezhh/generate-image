@@ -1127,6 +1127,23 @@ def provider_attempt_entry(provider: dict[str, Any], detail: Any, *, action: str
     }
 
 
+def provider_attempts_from_error_detail(detail: Any) -> list[dict[str, Any]]:
+    if not isinstance(detail, dict):
+        return []
+    attempts = detail.get("provider_attempts")
+    if not isinstance(attempts, list):
+        return []
+    return [copy.deepcopy(item) for item in attempts if isinstance(item, dict)]
+
+
+def merge_provider_attempt_logs(existing: list[dict[str, Any]], detail: Any) -> list[dict[str, Any]]:
+    merged = copy.deepcopy(existing)
+    for item in provider_attempts_from_error_detail(detail):
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
 def provider_failure_error_detail(
     *,
     message: str,
@@ -1941,6 +1958,11 @@ def persist_task_checkpoint(
                 existing_checkpoint = {}
             if isinstance(existing_checkpoint, dict) and isinstance(existing_checkpoint.get("auto_retry"), dict):
                 data["auto_retry"] = copy.deepcopy(existing_checkpoint["auto_retry"])
+    runtime_fields: dict[str, Any] = {}
+    if progress is not None:
+        runtime_fields["progress"] = progress
+    if stage is not None:
+        runtime_fields["stage"] = stage
     checkpoint = compact_checkpoint_payload(
         {
             "version": 1,
@@ -1948,6 +1970,7 @@ def persist_task_checkpoint(
             "step": step,
             "can_resume": can_resume,
             "updated_at": db.now_iso(),
+            **runtime_fields,
             **data,
         }
     )
@@ -4949,13 +4972,14 @@ async def run_generate_task(
         provider_attempts: list[dict[str, Any]] = []
         last_provider: dict[str, Any] | None = None
         completed_count = min(max(int(checkpoint.get("completed_count") or len(saved_images)), 0), int(request.n))
+        resume_requested = bool(checkpoint.get("can_resume") or checkpoint.get("manual_retry_requested_at"))
         persist_task_checkpoint(
             task_id,
             mode="generate",
             step="prepared",
             progress=12,
-            stage=f"准备继续生成第 {completed_count + 1}/{request.n} 张" if completed_count else "准备开始生成图片",
-            can_resume=completed_count > 0,
+            stage=f"准备继续生成第 {completed_count + 1}/{request.n} 张" if completed_count or resume_requested else "准备开始生成图片",
+            can_resume=completed_count > 0 or resume_requested,
             base_title=base_title,
             bucket=bucket,
             completed_count=completed_count,
@@ -4964,48 +4988,95 @@ async def run_generate_task(
         if completed_count >= request.n and saved_images:
             db.update_task(task_id, progress=96, stage="已恢复全部已完成结果，正在整理任务结果")
         for index in range(completed_count, request.n):
-            response, provider, attempt_log = await execute_with_provider_failover(
-                task_id,
-                lambda _provider, provider_config: call_responses_image_generation(
-                    model=request.model,
-                    prompt=effective_prompt,
-                    image_model=request.image_model,
-                    size=request.size,
-                    quality=request.quality,
-                    output_format=request.output_format,
-                    background=request.background,
-                    output_compression=request.output_compression,
-                    moderation=request.moderation,
-                    action=request.action,
-                    partial_images=request.partial_images,
-                    config=provider_config,
-                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                    on_stream_event=lambda event: handle_image_stream_event(task_id, event),
-                ),
-                waiting_stage=lambda item, index=index: f"第 {index + 1}/{request.n} 张已分配到 {item['name']}，等待空闲通道",
-                running_stage=lambda item, index=index: f"正在使用 {item['name']} 生成第 {index + 1}/{request.n} 张",
-                retry_stage=lambda item, attempt, index=index: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续生成第 {index + 1}/{request.n} 张",
-                switch_stage=lambda item, index=index: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续生成第 {index + 1}/{request.n} 张",
-            )
-            last_provider = provider
-            if attempt_log:
-                provider_attempts.extend(attempt_log)
-            responses.append(sanitize_response(response))
-            image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
-            for item_offset, item in enumerate(image_items, start=1):
-                sequence_index = len(saved_images) + 1
-                resolved_title = build_sequenced_title(base_title, sequence_index, max(int(request.n), 1))
-                renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
-                saved_images.append(
-                    public_task_image(
-                        renamed,
-                        task_id=task_id,
-                        title=resolved_title,
-                        bucket=bucket,
-                        conversation_id=conversation_id,
-                        message_id=user_message_id,
-                    )
+            try:
+                response, provider, attempt_log = await execute_with_provider_failover(
+                    task_id,
+                    lambda _provider, provider_config: call_responses_image_generation(
+                        model=request.model,
+                        prompt=effective_prompt,
+                        image_model=request.image_model,
+                        size=request.size,
+                        quality=request.quality,
+                        output_format=request.output_format,
+                        background=request.background,
+                        output_compression=request.output_compression,
+                        moderation=request.moderation,
+                        action=request.action,
+                        partial_images=request.partial_images,
+                        config=provider_config,
+                        on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                        on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                    ),
+                    waiting_stage=lambda item, index=index: f"第 {index + 1}/{request.n} 张已分配到 {item['name']}，等待空闲通道",
+                    running_stage=lambda item, index=index: f"正在使用 {item['name']} 生成第 {index + 1}/{request.n} 张",
+                    retry_stage=lambda item, attempt, index=index: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续生成第 {index + 1}/{request.n} 张",
+                    switch_stage=lambda item, index=index: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续生成第 {index + 1}/{request.n} 张",
                 )
+                last_provider = provider
+                if attempt_log:
+                    provider_attempts.extend(attempt_log)
+                responses.append(sanitize_response(response))
+                image_items = extract_images_from_responses(response, request.output_format, folder=bucket)
+                if not image_items:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                            "endpoint": "responses",
+                            "upstream": sanitize_response(response),
+                            "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                            "provider_attempts": provider_attempts,
+                        },
+                    )
+                for item_offset, item in enumerate(image_items, start=1):
+                    sequence_index = len(saved_images) + 1
+                    resolved_title = build_sequenced_title(base_title, sequence_index, max(int(request.n), 1))
+                    renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
+                    saved_images.append(
+                        public_task_image(
+                            renamed,
+                            task_id=task_id,
+                            title=resolved_title,
+                            bucket=bucket,
+                            conversation_id=conversation_id,
+                            message_id=user_message_id,
+                        )
+                    )
+            except HTTPException as exc:
+                provider_attempts = merge_provider_attempt_logs(provider_attempts, exc.detail)
+                persist_task_checkpoint(
+                    task_id,
+                    mode="generate",
+                    step="image_waiting",
+                    progress=min(25 + int(index / max(request.n, 1) * 60), 90),
+                    stage=f"第 {index + 1}/{request.n} 张生成失败，可从这里继续",
+                    can_resume=True,
+                    base_title=base_title,
+                    bucket=bucket,
+                    completed_count=len(saved_images),
+                    total_count=request.n,
+                    current_image_index=index + 1,
+                    provider_attempts=provider_attempts,
+                    last_error=exc.detail,
+                )
+                raise
+            except Exception as exc:
+                persist_task_checkpoint(
+                    task_id,
+                    mode="generate",
+                    step="image_waiting",
+                    progress=min(25 + int(index / max(request.n, 1) * 60), 90),
+                    stage=f"第 {index + 1}/{request.n} 张生成失败，可从这里继续",
+                    can_resume=True,
+                    base_title=base_title,
+                    bucket=bucket,
+                    completed_count=len(saved_images),
+                    total_count=request.n,
+                    current_image_index=index + 1,
+                    provider_attempts=provider_attempts,
+                    last_error=str(exc),
+                )
+                raise
             progress = min(25 + int((index + 1) / max(request.n, 1) * 60), 90)
             persist_task_checkpoint(
                 task_id,
@@ -5018,6 +5089,7 @@ async def run_generate_task(
                 bucket=bucket,
                 completed_count=len(saved_images),
                 total_count=request.n,
+                provider_attempts=provider_attempts,
             )
         if not saved_images:
             raise HTTPException(
@@ -5041,6 +5113,7 @@ async def run_generate_task(
             bucket=bucket,
             completed_count=len(saved_images),
             total_count=request.n,
+            provider_attempts=provider_attempts,
         )
         raw = {
             "endpoint": "/v1/responses",
@@ -5243,13 +5316,14 @@ async def run_edit_task(
             params.get("upload_selection_modes") if isinstance(params.get("upload_selection_modes"), list) else None,
         )
         completed_count = min(max(int(checkpoint.get("completed_count") or len(saved_output_images)), 0), count)
+        resume_requested = bool(checkpoint.get("can_resume") or checkpoint.get("manual_retry_requested_at"))
         persist_task_checkpoint(
             task_id,
             mode="edit",
             step="prepared",
             progress=12,
-            stage=f"准备继续编辑第 {completed_count + 1}/{count} 张" if completed_count else "准备开始编辑图片",
-            can_resume=completed_count > 0,
+            stage=f"准备继续编辑第 {completed_count + 1}/{count} 张" if completed_count or resume_requested else "准备开始编辑图片",
+            can_resume=completed_count > 0 or resume_requested,
             base_title=base_title,
             bucket=bucket,
             completed_count=completed_count,
@@ -5258,52 +5332,99 @@ async def run_edit_task(
         if completed_count >= count and saved_output_images:
             db.update_task(task_id, progress=96, stage="已恢复全部已完成编辑结果，正在整理任务结果")
         for index in range(completed_count, count):
-            response, provider, attempt_log = await execute_with_provider_failover(
-                task_id,
-                lambda _provider, client_config: call_responses_image_generation(
-                    model=str(params.get("model", "gpt-5.4")),
-                    prompt=effective_prompt,
-                    image_model=str(params.get("image_model", "gpt-image-2")),
-                    size=str(params.get("size", "2560x1440")),
-                    quality=str(params.get("quality", "high")),
-                    output_format=output_format,
-                    background=params.get("background", "auto"),
-                    output_compression=params.get("output_compression"),
-                    moderation=params.get("moderation", "auto"),
-                    action="edit",
-                    partial_images=params.get("partial_images"),
-                    config=client_config,
-                    uploaded=edit_inputs,
-                    mask=saved_mask,
-                    input_fidelity=str(params.get("input_fidelity", "auto")),
-                    input_image_notes=input_image_notes,
-                    on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
-                    on_stream_event=lambda event: handle_image_stream_event(task_id, event),
-                ),
-                waiting_stage=lambda item, index=index: f"第 {index + 1}/{count} 张已分配到 {item['name']}，等待空闲通道",
-                running_stage=lambda item, index=index: f"正在使用 {item['name']} 编辑第 {index + 1}/{count} 张",
-                retry_stage=lambda item, attempt, index=index: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续编辑第 {index + 1}/{count} 张",
-                switch_stage=lambda item, index=index: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续编辑第 {index + 1}/{count} 张",
-            )
-            last_provider = provider
-            if attempt_log:
-                provider_attempts.extend(attempt_log)
-            responses.append(sanitize_response(response))
-            image_items = extract_images_from_responses(response, output_format, folder=bucket)
-            for item in image_items:
-                sequence_index = len(saved_output_images) + 1
-                resolved_title = build_sequenced_title(base_title, sequence_index, max(count, 1))
-                renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
-                saved_output_images.append(
-                    public_task_image(
-                        renamed,
-                        task_id=task_id,
-                        title=resolved_title,
-                        bucket=bucket,
-                        conversation_id=conversation_id,
-                        message_id=user_message_id,
-                    )
+            try:
+                response, provider, attempt_log = await execute_with_provider_failover(
+                    task_id,
+                    lambda _provider, client_config: call_responses_image_generation(
+                        model=str(params.get("model", "gpt-5.4")),
+                        prompt=effective_prompt,
+                        image_model=str(params.get("image_model", "gpt-image-2")),
+                        size=str(params.get("size", "2560x1440")),
+                        quality=str(params.get("quality", "high")),
+                        output_format=output_format,
+                        background=params.get("background", "auto"),
+                        output_compression=params.get("output_compression"),
+                        moderation=params.get("moderation", "auto"),
+                        action="edit",
+                        partial_images=params.get("partial_images"),
+                        config=client_config,
+                        uploaded=edit_inputs,
+                        mask=saved_mask,
+                        input_fidelity=str(params.get("input_fidelity", "auto")),
+                        input_image_notes=input_image_notes,
+                        on_stable_retry=lambda quality: update_timeout_retry_stage(task_id, quality),
+                        on_stream_event=lambda event: handle_image_stream_event(task_id, event),
+                    ),
+                    waiting_stage=lambda item, index=index: f"第 {index + 1}/{count} 张已分配到 {item['name']}，等待空闲通道",
+                    running_stage=lambda item, index=index: f"正在使用 {item['name']} 编辑第 {index + 1}/{count} 张",
+                    retry_stage=lambda item, attempt, index=index: f"{item['name']} 暂不可用，正在重试第 {attempt}/{PROVIDER_UNAVAILABLE_RETRY_COUNT + 1} 次并继续编辑第 {index + 1}/{count} 张",
+                    switch_stage=lambda item, index=index: f"{item['name']} 连续不可用，正在切换下一个最佳提供商继续编辑第 {index + 1}/{count} 张",
                 )
+                last_provider = provider
+                if attempt_log:
+                    provider_attempts.extend(attempt_log)
+                responses.append(sanitize_response(response))
+                image_items = extract_images_from_responses(response, output_format, folder=bucket)
+                if not image_items:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "message": "Responses API 已返回，但没有找到 image_generation_call.result 图片数据。",
+                            "endpoint": "responses",
+                            "upstream": sanitize_response(response),
+                            "suggestion": "请确认当前模型组合支持 image_generation 工具，或更换外层模型/图片工具模型后重试。",
+                            "provider_attempts": provider_attempts,
+                        },
+                    )
+                for item in image_items:
+                    sequence_index = len(saved_output_images) + 1
+                    resolved_title = build_sequenced_title(base_title, sequence_index, max(count, 1))
+                    renamed = rename_output_image(item, resolved_title, fallback_stem=f"task-{task_id}")
+                    saved_output_images.append(
+                        public_task_image(
+                            renamed,
+                            task_id=task_id,
+                            title=resolved_title,
+                            bucket=bucket,
+                            conversation_id=conversation_id,
+                            message_id=user_message_id,
+                        )
+                    )
+            except HTTPException as exc:
+                provider_attempts = merge_provider_attempt_logs(provider_attempts, exc.detail)
+                persist_task_checkpoint(
+                    task_id,
+                    mode="edit",
+                    step="image_waiting",
+                    progress=min(25 + int(index / max(count, 1) * 60), 90),
+                    stage=f"第 {index + 1}/{count} 张编辑失败，可从这里继续",
+                    can_resume=True,
+                    base_title=base_title,
+                    bucket=bucket,
+                    completed_count=len(saved_output_images),
+                    total_count=count,
+                    current_image_index=index + 1,
+                    provider_attempts=provider_attempts,
+                    last_error=exc.detail,
+                )
+                raise
+            except Exception as exc:
+                persist_task_checkpoint(
+                    task_id,
+                    mode="edit",
+                    step="image_waiting",
+                    progress=min(25 + int(index / max(count, 1) * 60), 90),
+                    stage=f"第 {index + 1}/{count} 张编辑失败，可从这里继续",
+                    can_resume=True,
+                    base_title=base_title,
+                    bucket=bucket,
+                    completed_count=len(saved_output_images),
+                    total_count=count,
+                    current_image_index=index + 1,
+                    provider_attempts=provider_attempts,
+                    last_error=str(exc),
+                )
+                raise
             progress = min(25 + int((index + 1) / max(count, 1) * 60), 90)
             persist_task_checkpoint(
                 task_id,
@@ -5316,6 +5437,7 @@ async def run_edit_task(
                 bucket=bucket,
                 completed_count=len(saved_output_images),
                 total_count=count,
+                provider_attempts=provider_attempts,
             )
         if not saved_output_images:
             raise HTTPException(
@@ -5339,6 +5461,7 @@ async def run_edit_task(
             bucket=bucket,
             completed_count=len(saved_output_images),
             total_count=count,
+            provider_attempts=provider_attempts,
         )
         raw = {
             "endpoint": "/v1/responses",

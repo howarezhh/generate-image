@@ -4407,10 +4407,12 @@ function ImageCard({ image, onDownload, onUseImage, onPreview, onToggleFavorite,
             {image.favorite ? "已收藏" : "收藏"}
           </button>
         )}
-        <button type="button" onClick={onPreview || (() => window.open(imageOriginalUrl(image), "_blank", "noreferrer"))}>
-          <ExternalLink size={14} />
-          预览
-        </button>
+        {onPreview && (
+          <button type="button" onClick={onPreview}>
+            <ExternalLink size={14} />
+            预览
+          </button>
+        )}
         <button type="button" onClick={() => onDownload(image)}>
           <Download size={14} />
           下载
